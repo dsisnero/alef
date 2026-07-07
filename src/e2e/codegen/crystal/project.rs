@@ -315,27 +315,15 @@ fn render_assertion(a: &crate::e2e::fixture::Assertion, result_var: &str) -> Str
         },
         "is_empty" => format!("      {acc}.to_s.should be_empty\n"),
         "starts_with" => {
-            let val = a
-                .value
-                .as_ref()
-                .map(crystal_lit)
-                .unwrap_or_else(|| "\"\"".into());
+            let val = a.value.as_ref().map(crystal_lit).unwrap_or_else(|| "\"\"".into());
             format!("      {acc}.to_s.should start_with({val})\n")
         }
         "ends_with" => {
-            let val = a
-                .value
-                .as_ref()
-                .map(crystal_lit)
-                .unwrap_or_else(|| "\"\"".into());
+            let val = a.value.as_ref().map(crystal_lit).unwrap_or_else(|| "\"\"".into());
             format!("      {acc}.to_s.should end_with({val})\n")
         }
         "matches_regex" => {
-            let val = a
-                .value
-                .as_ref()
-                .map(crystal_lit)
-                .unwrap_or_else(|| "\"\"".into());
+            let val = a.value.as_ref().map(crystal_lit).unwrap_or_else(|| "\"\"".into());
             format!("      {acc}.to_s.should match({val})\n")
         }
         "greater_than" => {

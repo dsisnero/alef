@@ -226,9 +226,6 @@ fn binding_excluded_functions_are_skipped() {
 
 #[test]
 fn configured_trait_bridge_fails_loudly_instead_of_mis_generating() {
-    // Plugin-style / registry trait bridges (via `register_fn`) are not yet
-    // implemented for Crystal. Configuring one must fail with a clear error rather
-    // than silently emit a wrong binding. (Visitor-style bridges are supported.)
     let toml = r#"
 [workspace]
 languages = ["crystal"]
@@ -259,6 +256,105 @@ register_fn = "register_renderer"
     assert!(
         msg.contains("Renderer"),
         "error should name the configured trait: {msg}"
+    );
+}
+
+#[test]
+fn supported_plugin_bridge_generates_plugin_file() {
+    use alef::core::config::TraitBridgeConfig;
+    use alef::core::ir::{MethodDef, TypeDef};
+
+    let renderer = TypeDef {
+        name: "Renderer".into(),
+        is_trait: true,
+        methods: vec![MethodDef {
+            name: "render".into(),
+            params: vec![make_param("text", TypeRef::String)],
+            return_type: TypeRef::String,
+            ..MethodDef::default()
+        }],
+        ..TypeDef::default()
+    };
+
+    let mut config = make_config();
+    config.trait_bridges = vec![TraitBridgeConfig {
+        trait_name: "Renderer".to_string(),
+        register_fn: Some("register_renderer".to_string()),
+        unregister_fn: Some("unregister_renderer".to_string()),
+        ..TraitBridgeConfig::default()
+    }];
+
+    let mut api = api_with(vec![make_fn("noop", vec![], TypeRef::Unit, None)]);
+    api.types = vec![renderer];
+
+    let files = CrystalBackend
+        .generate_bindings(&api, &config)
+        .expect("supported plugin bridge should generate successfully");
+
+    let plugin_filename = files
+        .iter()
+        .map(|f| f.path.display().to_string())
+        .find(|p| p.contains("plugin.cr"))
+        .expect("plugin.cr file should be emitted for supported plugin bridge");
+
+    assert!(
+        plugin_filename.contains("demo_renderer_plugin.cr"),
+        "expected plugin file, got: {plugin_filename}"
+    );
+
+    let plugin_content = files
+        .iter()
+        .find(|f| f.path.display().to_string().contains("plugin.cr"))
+        .map(|f| &f.content)
+        .expect("plugin content");
+
+    assert!(
+        plugin_content.contains("struct RendererVTable"),
+        "should contain vtable struct: {plugin_content}"
+    );
+    assert!(
+        plugin_content.contains("def self.register"),
+        "should contain register method: {plugin_content}"
+    );
+    assert!(
+        plugin_content.contains("fun register_renderer = demo_register_renderer"),
+        "should contain register fun: {plugin_content}"
+    );
+}
+
+#[test]
+fn plugin_bridge_with_unsupported_method_still_rejected() {
+    use alef::core::config::TraitBridgeConfig;
+    use alef::core::ir::{MethodDef, TypeDef};
+
+    let renderer = TypeDef {
+        name: "Renderer".into(),
+        is_trait: true,
+        methods: vec![MethodDef {
+            name: "render".into(),
+            params: vec![make_param("text", TypeRef::Unit)], // Unit params unsupported
+            return_type: TypeRef::Unit,
+            ..MethodDef::default()
+        }],
+        ..TypeDef::default()
+    };
+
+    let mut config = make_config();
+    config.trait_bridges = vec![TraitBridgeConfig {
+        trait_name: "Renderer".to_string(),
+        register_fn: Some("register_renderer".to_string()),
+        ..TraitBridgeConfig::default()
+    }];
+
+    let mut api = api_with(vec![make_fn("noop", vec![], TypeRef::Unit, None)]);
+    api.types = vec![renderer];
+
+    let err = CrystalBackend
+        .generate_bindings(&api, &config)
+        .expect_err("unsupported plugin bridge should be rejected");
+    assert!(
+        err.to_string().contains("Renderer"),
+        "error should name the trait: {err}"
     );
 }
 

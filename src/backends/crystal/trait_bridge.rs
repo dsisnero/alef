@@ -1498,4 +1498,113 @@ mod tests {
         assert_eq!(ret, "Int32");
         assert_eq!(out, vec!["LibC::Char**", "LibC::Char**"]);
     }
+
+    // ── is_supported_plugin_bridge ─────────────────────────────────────
+
+    fn plugin_bridge(trait_name: &str, register_fn: Option<&str>) -> TraitBridgeConfig {
+        TraitBridgeConfig {
+            trait_name: trait_name.to_string(),
+            register_fn: register_fn.map(|s| s.to_string()),
+            unregister_fn: Some("unregister".to_string()),
+            ..TraitBridgeConfig::default()
+        }
+    }
+
+    fn plugin_api(trait_type: Option<TypeDef>) -> ApiSurface {
+        let mut types = vec![];
+        if let Some(t) = trait_type {
+            types.push(t);
+        }
+        ApiSurface {
+            crate_name: "test".into(),
+            version: "0.1.0".into(),
+            types,
+            functions: vec![],
+            enums: vec![],
+            errors: vec![],
+            excluded_type_paths: std::collections::HashMap::new(),
+            excluded_trait_names: std::collections::HashSet::new(),
+            services: vec![],
+            handler_contracts: vec![],
+            unsupported_public_items: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn plugin_bridge_missing_register_fn_not_supported() {
+        let bridge = plugin_bridge("Worker", None);
+        let api = plugin_api(Some(TypeDef {
+            name: "Worker".into(),
+            is_trait: true,
+            methods: vec![MethodDef {
+                name: "do_work".into(),
+                params: vec![ParamDef {
+                    name: "input".into(),
+                    ty: TypeRef::String,
+                    ..ParamDef::default()
+                }],
+                return_type: TypeRef::String,
+                ..MethodDef::default()
+            }],
+            ..TypeDef::default()
+        }));
+        assert!(!is_supported_plugin_bridge(&api, &bridge));
+    }
+
+    #[test]
+    fn plugin_bridge_missing_trait_not_supported() {
+        let bridge = plugin_bridge("Worker", Some("register_worker"));
+        let api = plugin_api(None);
+        assert!(!is_supported_plugin_bridge(&api, &bridge));
+    }
+
+    #[test]
+    fn plugin_bridge_with_unsupported_param_not_supported() {
+        let bridge = plugin_bridge("Worker", Some("register_worker"));
+        let api = plugin_api(Some(TypeDef {
+            name: "Worker".into(),
+            is_trait: true,
+            methods: vec![MethodDef {
+                name: "do_work".into(),
+                params: vec![ParamDef {
+                    name: "input".into(),
+                    ty: TypeRef::Unit,
+                    ..ParamDef::default()
+                }],
+                return_type: TypeRef::Unit,
+                ..MethodDef::default()
+            }],
+            ..TypeDef::default()
+        }));
+        assert!(!is_supported_plugin_bridge(&api, &bridge));
+    }
+
+    #[test]
+    fn plugin_bridge_with_all_supported_methods_is_supported() {
+        let bridge = plugin_bridge("Worker", Some("register_worker"));
+        let api = plugin_api(Some(TypeDef {
+            name: "Worker".into(),
+            is_trait: true,
+            methods: vec![
+                MethodDef {
+                    name: "greet".into(),
+                    params: vec![ParamDef {
+                        name: "name".into(),
+                        ty: TypeRef::String,
+                        ..ParamDef::default()
+                    }],
+                    return_type: TypeRef::String,
+                    ..MethodDef::default()
+                },
+                MethodDef {
+                    name: "ping".into(),
+                    params: vec![],
+                    return_type: TypeRef::Unit,
+                    ..MethodDef::default()
+                },
+            ],
+            ..TypeDef::default()
+        }));
+        assert!(is_supported_plugin_bridge(&api, &bridge));
+    }
 }
