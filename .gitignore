@@ -5,6 +5,8 @@ crates/
 *.swo
 *~
 .DS_Store
+# macOS AppleDouble metadata (created on non-HFS/exFAT volumes)
+._*
 .idea/
 .vscode/
 .rumdl_cache/
