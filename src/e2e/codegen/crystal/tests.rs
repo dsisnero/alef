@@ -299,3 +299,56 @@ fn error_assertion_wraps_call_in_expect_raises() {
         "error path must not assign result: {spec}"
     );
 }
+
+fn assertion_values(kind: &str, field: Option<&str>, values: Vec<serde_json::Value>) -> crate::e2e::fixture::Assertion {
+    crate::e2e::fixture::Assertion {
+        assertion_type: kind.to_string(),
+        field: field.map(|s| s.to_string()),
+        value: None,
+        values: Some(values),
+        method: None,
+        check: None,
+        args: None,
+        return_type: None,
+    }
+}
+
+#[test]
+fn contains_all_and_any_assertions() {
+    let mut fx = fixture("membership");
+    fx.input = serde_json::json!("x");
+    fx.assertions = vec![
+        assertion_values(
+            "contains_all",
+            None,
+            vec![serde_json::json!("a"), serde_json::json!("b")],
+        ),
+        assertion_values(
+            "contains_any",
+            Some("tags"),
+            vec![serde_json::json!("x"), serde_json::json!("y")],
+        ),
+    ];
+    let groups = vec![FixtureGroup {
+        category: "smoke".to_string(),
+        fixtures: vec![fx],
+    }];
+    let files = CrystalE2eCodegen
+        .generate(&groups, &e2e_config(), &crate_config(), &[], &[])
+        .unwrap();
+    let spec = file(&files, "spec/smoke_spec.cr").unwrap();
+    // contains_all → one `contain` expectation per value.
+    assert!(
+        spec.contains("__result.should contain(\"a\")"),
+        "contains_all a: {spec}"
+    );
+    assert!(
+        spec.contains("__result.should contain(\"b\")"),
+        "contains_all b: {spec}"
+    );
+    // contains_any → a single boolean any-of expectation on the field.
+    assert!(
+        spec.contains("(__result.tags.includes?(\"x\") || __result.tags.includes?(\"y\")).should be_true"),
+        "contains_any: {spec}"
+    );
+}

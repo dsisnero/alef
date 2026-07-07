@@ -104,6 +104,24 @@ fn render_assertion(a: &crate::e2e::fixture::Assertion) -> String {
         },
         // `error` is handled at the block level (expect_raises).
         "error" => String::new(),
+        "contains_all" => match &a.values {
+            Some(values) if !values.is_empty() => values
+                .iter()
+                .map(|v| format!("      {acc}.should contain({})\n", crystal_lit(v)))
+                .collect(),
+            _ => "      # contains_all assertion requires values\n".to_string(),
+        },
+        "contains_any" => match &a.values {
+            Some(values) if !values.is_empty() => {
+                let checks = values
+                    .iter()
+                    .map(|v| format!("{acc}.includes?({})", crystal_lit(v)))
+                    .collect::<Vec<_>>()
+                    .join(" || ");
+                format!("      ({checks}).should be_true\n")
+            }
+            _ => "      # contains_any assertion requires values\n".to_string(),
+        },
         other => format!("      # TODO: unsupported assertion `{other}`\n"),
     }
 }
