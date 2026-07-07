@@ -352,3 +352,45 @@ fn contains_all_and_any_assertions() {
         "contains_any: {spec}"
     );
 }
+
+#[test]
+fn method_result_assertions() {
+    use crate::e2e::fixture::Assertion;
+    let mk = |method: &str, check: &str, value: Option<serde_json::Value>, args: Option<serde_json::Value>| Assertion {
+        assertion_type: "method_result".to_string(),
+        field: None,
+        value,
+        values: None,
+        method: Some(method.to_string()),
+        check: Some(check.to_string()),
+        args,
+        return_type: None,
+    };
+    let mut fx = fixture("methods");
+    fx.input = serde_json::json!("x");
+    fx.assertions = vec![
+        mk("name", "equals", Some(serde_json::json!("Ada")), None),
+        mk("valid?", "is_true", None, None),
+        mk("score", "greater_than_or_equal", Some(serde_json::json!(10)), None),
+        mk("tags", "count_min", Some(serde_json::json!(2)), None),
+        mk(
+            "at",
+            "equals",
+            Some(serde_json::json!("z")),
+            Some(serde_json::json!([0])),
+        ),
+    ];
+    let groups = vec![FixtureGroup {
+        category: "smoke".to_string(),
+        fixtures: vec![fx],
+    }];
+    let files = CrystalE2eCodegen
+        .generate(&groups, &e2e_config(), &crate_config(), &[], &[])
+        .unwrap();
+    let spec = file(&files, "spec/smoke_spec.cr").unwrap();
+    assert!(spec.contains("__result.name.should eq(\"Ada\")"), "equals: {spec}");
+    assert!(spec.contains("__result.valid?.should be_true"), "is_true: {spec}");
+    assert!(spec.contains("__result.score.should be >= 10"), "gte: {spec}");
+    assert!(spec.contains("__result.tags.size.should be >= 2"), "count_min: {spec}");
+    assert!(spec.contains("__result.at(0).should eq(\"z\")"), "method args: {spec}");
+}

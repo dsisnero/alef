@@ -122,6 +122,31 @@ fn render_assertion(a: &crate::e2e::fixture::Assertion) -> String {
             }
             _ => "      # contains_any assertion requires values\n".to_string(),
         },
+        "method_result" => {
+            let method = a.method.as_deref().unwrap_or("(missing_method)");
+            let method_args = build_method_args(a.args.as_ref());
+            let call = format!("{acc}.{method}{method_args}");
+            match a.check.as_deref() {
+                Some("equals") => {
+                    let val = a.value.as_ref().map(|v| crystal_lit(v)).unwrap_or_else(|| "nil".into());
+                    format!("      {call}.should eq({val})\n")
+                }
+                Some("is_true") => format!("      {call}.should be_true\n"),
+                Some("is_false") => format!("      {call}.should be_false\n"),
+                Some("greater_than_or_equal") => {
+                    let val = a.value.as_ref().map(|v| v.to_string()).unwrap_or_else(|| "0".into());
+                    format!("      {call}.should be >= {val}\n")
+                }
+                Some("count_min") => {
+                    let val = a.value.as_ref().map(|v| v.to_string()).unwrap_or_else(|| "0".into());
+                    format!("      {call}.size.should be >= {val}\n")
+                }
+                _ => format!(
+                    "      # TODO: unsupported method_result check `{}`\n",
+                    a.check.as_deref().unwrap_or("(none)")
+                ),
+            }
+        }
         other => format!("      # TODO: unsupported assertion `{other}`\n"),
     }
 }
@@ -155,7 +180,18 @@ fn crystal_lit(v: &serde_json::Value) -> String {
     }
 }
 
-/// Render a Crystal double-quoted string literal with minimal escaping.
+/// Build a parenthesised Crystal method-call argument list from a JSON array,
+/// or empty string for no/non-array args.
+fn build_method_args(args: Option<&serde_json::Value>) -> String {
+    match args {
+        Some(serde_json::Value::Array(arr)) if !arr.is_empty() => {
+            let rendered: Vec<String> = arr.iter().map(crystal_lit).collect();
+            format!("({})", rendered.join(", "))
+        }
+        _ => String::new(),
+    }
+}
+
 fn string_lit(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
