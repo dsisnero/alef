@@ -134,12 +134,13 @@ commands to one configured crate.
 | Dart / Flutter | flutter_rust_bridge package |
 | Swift | Swift package with Rust bridge support |
 | Zig | Zig package over the generated C ABI |
+| Crystal | Crystal shard binding the generated C FFI (Ruby-style naming, `Array(T)`/`Hash(K,V)` generics, fiber/`Channel` concurrency) |
 | Gleam | Gleam package backed by Rustler |
 | C FFI | C ABI, header, and shared-library glue |
 | JNI | Rust JNI shim crate exercised by both kotlin_android (Android AAR) and host-JVM tests |
 
 Canonical language slugs are `python`, `node`, `wasm`, `ruby`, `php`, `elixir`, `r`, `go`,
-`java`, `csharp`, `kotlin`, `kotlin_android`, `swift`, `dart`, `gleam`, `zig`, `ffi`, and `jni`.
+`java`, `csharp`, `kotlin`, `kotlin_android`, `swift`, `dart`, `gleam`, `zig`, `crystal`, `ffi`, and `jni`.
 
 ## Configuration Model
 
