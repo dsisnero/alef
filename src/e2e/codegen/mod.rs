@@ -21,6 +21,7 @@ pub mod assertion_recipes;
 pub mod brew;
 pub mod c;
 pub mod client;
+pub mod crystal;
 pub mod csharp;
 pub mod dart;
 mod dart_visitors;
@@ -219,6 +220,7 @@ pub fn all_generators() -> Vec<Box<dyn E2eCodegen>> {
         Box::new(wasm::WasmCodegen),
         Box::new(c::CCodegen),
         Box::new(zig::ZigE2eCodegen),
+        Box::new(crystal::CrystalE2eCodegen),
         Box::new(dart::DartE2eCodegen),
         Box::new(swift::SwiftE2eCodegen),
         Box::new(brew::BrewCodegen),
@@ -425,6 +427,7 @@ pub fn emit_test_backend(
         "r" => r::emit_test_backend(trait_bridge, methods, fixture),
         "c" => c::emit_test_backend(trait_bridge, methods, fixture),
         "zig" => zig::emit_test_backend(trait_bridge, methods, fixture),
+        "crystal" => crystal::emit_test_backend(trait_bridge, methods, fixture),
         "dart" => dart::emit_test_backend(trait_bridge, methods, fixture, &[]),
         "swift" => swift::emit_test_backend(trait_bridge, methods, fixture, &[]),
         "brew" => brew::emit_test_backend(trait_bridge, methods, fixture),

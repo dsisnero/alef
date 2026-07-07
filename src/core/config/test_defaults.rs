@@ -261,11 +261,15 @@ pub(crate) fn default_test_config(lang: Language, output_dir: &str, ctx: &LangCo
         }
         Language::Crystal => {
             let cmd = wrap(format!("cd {output_dir} && crystal spec"), ctx.run_wrapper);
+            let e2e_cmd = wrap(
+                "cd e2e/crystal && shards install && crystal spec".to_string(),
+                ctx.run_wrapper,
+            );
             TestConfig {
                 precondition: Some(require_tool("crystal")),
                 before: None,
                 command: Some(StringOrVec::Single(cmd.clone())),
-                e2e: None,
+                e2e: Some(StringOrVec::Single(e2e_cmd)),
                 coverage: Some(StringOrVec::Single(cmd)),
             }
         }
