@@ -1,3 +1,4 @@
+mod crystal;
 mod csharp;
 mod dart;
 mod elixir;
@@ -17,6 +18,7 @@ mod swift;
 mod wasm;
 mod zig;
 
+pub(crate) use crystal::scaffold_crystal;
 pub use csharp::render_csharp_csproj;
 pub(crate) use csharp::scaffold_csharp;
 pub(crate) use dart::scaffold_dart;

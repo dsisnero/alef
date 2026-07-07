@@ -512,6 +512,58 @@ fn test_scaffold_zig() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// `[scaffold.cargo]` workspace `.cargo/config.toml` rendering tests.
-// ---------------------------------------------------------------------------
+#[test]
+fn test_scaffold_crystal() {
+    let config = test_config();
+    let api = test_api();
+    let all_files = scaffold(&api, &config, &[Language::Crystal]).unwrap();
+    let files = language_files(&all_files);
+    // shard.yml + .gitignore + .editorconfig + README.md + examples/example.cr
+    // + spec/spec_helper.cr + spec/<shard>_spec.cr
+    assert_eq!(files.len(), 7, "Expected 7 files for Crystal scaffold");
+
+    let shard = files
+        .iter()
+        .find(|f| f.path == PathBuf::from("packages/crystal/shard.yml"))
+        .expect("shard.yml must be emitted");
+    assert!(
+        shard.content.contains("name: my_lib"),
+        "shard name should be snake_cased: {}",
+        shard.content
+    );
+    assert!(shard.content.contains("crystal: \">= 1.0.0\""));
+    assert!(shard.content.contains("license: MIT"));
+
+    let gitignore = files
+        .iter()
+        .find(|f| f.path == PathBuf::from("packages/crystal/.gitignore"))
+        .expect(".gitignore must be emitted");
+    assert!(gitignore.content.contains("/lib/"));
+
+    let readme = files
+        .iter()
+        .find(|f| f.path == PathBuf::from("packages/crystal/README.md"))
+        .expect("README.md must be emitted");
+    assert!(readme.content.contains("shards install"));
+    // Configured repository should drive the shard dependency ref.
+    assert!(
+        readme.content.contains("github: test/my-lib"),
+        "README dep ref: {}",
+        readme.content
+    );
+
+    let smoke = files
+        .iter()
+        .find(|f| f.path == PathBuf::from("packages/crystal/spec/my_lib_spec.cr"))
+        .expect("smoke spec must be emitted");
+    assert!(
+        smoke.content.contains("describe MyLib"),
+        "smoke spec: {}",
+        smoke.content
+    );
+
+    assert!(
+        files.iter().all(|f| !f.path.starts_with(".github/workflows")),
+        "Crystal scaffold must not emit GitHub workflows"
+    );
+}
