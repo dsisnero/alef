@@ -239,3 +239,63 @@ fn fixture_with_assertions_emits_real_example() {
         "should not be pending: {spec}"
     );
 }
+
+fn assertion(kind: &str, field: Option<&str>, value: Option<serde_json::Value>) -> crate::e2e::fixture::Assertion {
+    crate::e2e::fixture::Assertion {
+        assertion_type: kind.to_string(),
+        field: field.map(|s| s.to_string()),
+        value,
+        values: None,
+        method: None,
+        check: None,
+        args: None,
+        return_type: None,
+    }
+}
+
+#[test]
+fn field_path_assertion_accesses_nested_getter() {
+    let mut fx = fixture("has_name");
+    fx.input = serde_json::json!("x");
+    fx.assertions = vec![
+        assertion("equals", Some("name"), Some(serde_json::json!("Ada"))),
+        assertion("not_empty", Some("meta.title"), None),
+    ];
+    let groups = vec![FixtureGroup {
+        category: "smoke".to_string(),
+        fixtures: vec![fx],
+    }];
+    let files = CrystalE2eCodegen
+        .generate(&groups, &e2e_config(), &crate_config(), &[], &[])
+        .unwrap();
+    let spec = file(&files, "spec/smoke_spec.cr").unwrap();
+    assert!(
+        spec.contains("__result.name.should eq(\"Ada\")"),
+        "field equals: {spec}"
+    );
+    assert!(
+        spec.contains("__result.meta.title.to_s.should_not be_empty"),
+        "nested not_empty: {spec}"
+    );
+}
+
+#[test]
+fn error_assertion_wraps_call_in_expect_raises() {
+    let mut fx = fixture("fails");
+    fx.input = serde_json::json!("bad");
+    fx.assertions = vec![assertion("error", None, None)];
+    let groups = vec![FixtureGroup {
+        category: "smoke".to_string(),
+        fixtures: vec![fx],
+    }];
+    let files = CrystalE2eCodegen
+        .generate(&groups, &e2e_config(), &crate_config(), &[], &[])
+        .unwrap();
+    let spec = file(&files, "spec/smoke_spec.cr").unwrap();
+    assert!(spec.contains("expect_raises(Exception) do"), "error wrap: {spec}");
+    assert!(spec.contains("Demo.convert(\"bad\")"), "error call: {spec}");
+    assert!(
+        !spec.contains("__result ="),
+        "error path must not assign result: {spec}"
+    );
+}

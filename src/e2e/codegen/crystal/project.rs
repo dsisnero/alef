@@ -60,9 +60,17 @@ pub(super) fn render_category_spec(
         }
         out.push_str(&format!("    it {desc:?} do\n"));
         let args = call_args(&fixture.input);
-        out.push_str(&format!("      __result = {module_name}.{function_name}({args})\n"));
-        for a in &fixture.assertions {
-            out.push_str(&render_assertion(a));
+        let call = format!("{module_name}.{function_name}({args})");
+        // A fixture with an `error` assertion expects the call itself to raise.
+        if fixture.assertions.iter().any(|a| a.assertion_type == "error") {
+            out.push_str("      expect_raises(Exception) do\n");
+            out.push_str(&format!("        {call}\n"));
+            out.push_str("      end\n");
+        } else {
+            out.push_str(&format!("      __result = {call}\n"));
+            for a in &fixture.assertions {
+                out.push_str(&render_assertion(a));
+            }
         }
         out.push_str("    end\n");
     }
@@ -83,17 +91,37 @@ fn call_args(input: &serde_json::Value) -> String {
 
 /// Render one assertion as a Crystal `should` expectation on `__result`.
 fn render_assertion(a: &crate::e2e::fixture::Assertion) -> String {
+    let acc = field_accessor(a.field.as_deref());
     match a.assertion_type.as_str() {
         "equals" => match &a.value {
-            Some(v) => format!("      __result.should eq({})\n", crystal_lit(v)),
+            Some(v) => format!("      {acc}.should eq({})\n", crystal_lit(v)),
             None => "      # equals assertion missing value\n".to_string(),
         },
-        "not_empty" => "      __result.to_s.should_not be_empty\n".to_string(),
+        "not_empty" => format!("      {acc}.to_s.should_not be_empty\n"),
         "contains" => match &a.value {
-            Some(serde_json::Value::String(s)) => format!("      __result.to_s.should contain({})\n", string_lit(s)),
+            Some(serde_json::Value::String(s)) => format!("      {acc}.to_s.should contain({})\n", string_lit(s)),
             _ => "      # contains assertion requires a string value\n".to_string(),
         },
+        // `error` is handled at the block level (expect_raises).
+        "error" => String::new(),
         other => format!("      # TODO: unsupported assertion `{other}`\n"),
+    }
+}
+
+/// Build the Crystal accessor for an assertion's optional dot-path field.
+/// `None` → `__result`; `"meta.title"` → `__result.meta.title` (snake_cased).
+fn field_accessor(field: Option<&str>) -> String {
+    use heck::ToSnakeCase;
+    match field {
+        None => "__result".to_string(),
+        Some(path) => {
+            let mut acc = String::from("__result");
+            for seg in path.split('.').filter(|s| !s.is_empty()) {
+                acc.push('.');
+                acc.push_str(&seg.to_snake_case());
+            }
+            acc
+        }
     }
 }
 
