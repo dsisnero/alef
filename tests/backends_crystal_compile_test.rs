@@ -2138,3 +2138,174 @@ void demo_free_string(char* ptr) { free(ptr); }
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A plugin-style trait bridge (`register_fn` + `Plugin` super-trait): a Crystal
+/// object registered into a Rust registry, implementing a Rust trait through a
+/// `#[repr(C)]` vtable. This is the registry pattern (distinct from visitor bridges).
+fn plugin_bridge_api() -> ApiSurface {
+    let store = TypeDef {
+        name: "Store".into(),
+        rust_path: "demo::Store".into(),
+        original_rust_path: String::new(),
+        fields: vec![],
+        methods: vec![MethodDef {
+            name: "fetch".into(),
+            params: vec![make_param("key", TypeRef::String)],
+            return_type: TypeRef::String,
+            is_async: false,
+            is_static: false,
+            error_type: Some("StoreError".into()),
+            doc: "Fetch a value by key.".into(),
+            receiver: Some(ReceiverKind::Ref),
+            sanitized: false,
+            trait_source: None,
+            returns_ref: false,
+            returns_cow: false,
+            return_newtype_wrapper: None,
+            has_default_impl: false,
+            binding_excluded: false,
+            binding_exclusion_reason: None,
+            version: Default::default(),
+        }],
+        is_opaque: false,
+        is_clone: false,
+        is_copy: false,
+        doc: "A pluggable key-value store.".into(),
+        cfg: None,
+        is_trait: true,
+        has_default: false,
+        has_stripped_cfg_fields: false,
+        is_return_type: false,
+        serde_rename_all: None,
+        has_serde: false,
+        super_traits: vec![],
+        binding_excluded: false,
+        binding_exclusion_reason: None,
+        is_variant_wrapper: false,
+        has_lifetime_params: false,
+        has_private_fields: false,
+        version: Default::default(),
+    };
+    ApiSurface {
+        crate_name: "demo".into(),
+        version: "0.1.0".into(),
+        types: vec![store],
+        functions: vec![],
+        enums: vec![],
+        errors: vec![],
+        excluded_type_paths: ::std::collections::HashMap::new(),
+        excluded_trait_names: ::std::collections::HashSet::new(),
+        services: vec![],
+        handler_contracts: vec![],
+        unsupported_public_items: Vec::new(),
+    }
+}
+
+fn plugin_bridge_config() -> ResolvedCrateConfig {
+    let toml = r#"
+[workspace]
+languages = ["crystal"]
+
+[[crates]]
+name = "demo"
+sources = ["src/lib.rs"]
+
+[crates.ffi]
+prefix = "demo"
+
+[[crates.trait_bridges]]
+trait_name = "Store"
+super_trait = "Plugin"
+register_fn = "register_store"
+unregister_fn = "unregister_store"
+registry_getter = "store_registry"
+"#;
+    let cfg: NewAlefConfig = toml::from_str(toml).expect("test config must parse");
+    cfg.resolve().expect("test config must resolve").remove(0)
+}
+
+#[test]
+fn plugin_bridge_emits_registry_api() {
+    let files = CrystalBackend
+        .generate_bindings(&plugin_bridge_api(), &plugin_bridge_config())
+        .expect("plugin bridge should be supported");
+    let content: String = files.iter().map(|f| f.content.clone()).collect::<Vec<_>>().join("\n");
+    let content = &content;
+    // VTable lib struct with the fetch fn-pointer + free_string/free_user_data.
+    assert!(
+        content.contains("struct StoreVTable"),
+        "missing vtable struct: {content}"
+    );
+    assert!(content.contains("free_string :"), "vtable needs free_string: {content}");
+    assert!(
+        content.contains("free_user_data :"),
+        "vtable needs free_user_data: {content}"
+    );
+    // register / unregister lib symbols.
+    assert!(
+        content.contains("fun register_store = demo_register_store"),
+        "missing register symbol: {content}"
+    );
+    assert!(
+        content.contains("= demo_unregister_store"),
+        "missing unregister symbol: {content}"
+    );
+    // High-level abstract class + registry API.
+    assert!(
+        content.contains("abstract class Store"),
+        "missing abstract class: {content}"
+    );
+    assert!(
+        content.contains("def fetch(key : String) : String"),
+        "missing trait method: {content}"
+    );
+    assert!(
+        content.contains("def self.register_store(name : String, impl : Store)"),
+        "missing register API: {content}"
+    );
+    assert!(
+        content.contains("def self.unregister_store(name : String)"),
+        "missing unregister API: {content}"
+    );
+}
+
+#[test]
+fn plugin_bridge_typechecks() {
+    if Command::new("crystal").arg("--version").output().is_err() {
+        eprintln!("skipping: `crystal` compiler not found on PATH");
+        return;
+    }
+    let files = CrystalBackend
+        .generate_bindings(&plugin_bridge_api(), &plugin_bridge_config())
+        .unwrap();
+    let mut src = String::new();
+    for f in &files {
+        src.push_str(&f.content);
+        src.push_str("\n\n");
+    }
+    src.push_str(
+        "class MyStore < Demo::Store\n\
+         \x20 def fetch(key : String) : String\n\
+         \x20   \"value-for-\" + key\n\
+         \x20 end\n\
+         end\n\n\
+         Demo.register_store(\"test\", MyStore.new)\n\
+         Demo.unregister_store(\"test\")\n",
+    );
+    let dir = std::env::temp_dir().join(format!("alef_crystal_plugin_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let path = dir.join("demo.cr");
+    std::fs::write(&path, &src).expect("write source");
+    let output = Command::new("crystal")
+        .arg("build")
+        .arg("--no-codegen")
+        .arg(&path)
+        .output()
+        .expect("run crystal build");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "plugin bridge failed to type-check:\n{src}\n---\n{stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

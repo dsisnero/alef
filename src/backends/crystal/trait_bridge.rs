@@ -34,7 +34,7 @@ use crate::codegen::visitor_result::visitor_result_metadata;
 use crate::core::config::TraitBridgeConfig;
 use crate::core::ir::{ApiSurface, MethodDef, PrimitiveType, TypeDef, TypeRef};
 
-use super::type_map::crystal_type_name;
+use super::type_map::{crystal_type, crystal_type_name};
 
 /// One resolved callback parameter (beyond the shared ctx/user_data/out prefix).
 struct CbParam {
@@ -403,4 +403,366 @@ pub(crate) fn is_supported_visitor_bridge(api: &ApiSurface, bridge: &TraitBridge
         let is_string_payload = v.is_tuple && v.fields.len() == 1 && matches!(v.fields[0].ty, TypeRef::String);
         is_unit || is_string_payload
     })
+}
+
+// ===========================================================================
+// Plugin-style trait bridges (register_fn / registry pattern)
+// ===========================================================================
+
+/// The Crystal `lib` C type for a plugin-bridge parameter/field, matching the
+/// FFI `prim_to_c` + JSON conventions (bool → i32, complex → JSON `char*`).
+fn plugin_c_type(ty: &TypeRef) -> Option<&'static str> {
+    Some(match ty {
+        TypeRef::String | TypeRef::Char | TypeRef::Path | TypeRef::Json => "LibC::Char*",
+        TypeRef::Named(_) | TypeRef::Vec(_) | TypeRef::Map(_, _) => "LibC::Char*",
+        TypeRef::Primitive(PrimitiveType::Bool) => "Int32",
+        TypeRef::Primitive(PrimitiveType::U8) => "UInt8",
+        TypeRef::Primitive(PrimitiveType::U16) => "UInt16",
+        TypeRef::Primitive(PrimitiveType::U32) => "UInt32",
+        TypeRef::Primitive(PrimitiveType::U64) => "UInt64",
+        TypeRef::Primitive(PrimitiveType::I8) => "Int8",
+        TypeRef::Primitive(PrimitiveType::I16) => "Int16",
+        TypeRef::Primitive(PrimitiveType::I32) => "Int32",
+        TypeRef::Primitive(PrimitiveType::I64) => "Int64",
+        TypeRef::Primitive(PrimitiveType::F32) => "Float32",
+        TypeRef::Primitive(PrimitiveType::F64) => "Float64",
+        TypeRef::Primitive(PrimitiveType::Usize) => "LibC::SizeT",
+        TypeRef::Primitive(PrimitiveType::Isize) => "LibC::SSizeT",
+        TypeRef::Duration => "UInt64",
+        _ => return None, // Bytes / Optional / Unit params unsupported for now
+    })
+}
+
+/// Whether a plugin (registry) trait bridge is fully emittable.
+pub(crate) fn is_supported_plugin_bridge(api: &ApiSurface, bridge: &TraitBridgeConfig) -> bool {
+    if bridge.register_fn.is_none() {
+        return false;
+    }
+    let Some(trait_def) = api.types.iter().find(|t| t.is_trait && t.name == bridge.trait_name) else {
+        return false;
+    };
+    trait_def
+        .methods
+        .iter()
+        .filter(|m| m.trait_source.is_none() && !m.binding_excluded)
+        .all(plugin_method_supported)
+}
+
+/// A method is supported when all params map to a C type and the return shape is
+/// one we can marshal (Unit, String-ish, JSON-able, or infallible scalar).
+fn plugin_method_supported(m: &MethodDef) -> bool {
+    if m.params.iter().any(|p| plugin_c_type(&p.ty).is_none()) {
+        return false;
+    }
+    match &m.return_type {
+        TypeRef::Unit
+        | TypeRef::String
+        | TypeRef::Char
+        | TypeRef::Path
+        | TypeRef::Json
+        | TypeRef::Named(_)
+        | TypeRef::Vec(_)
+        | TypeRef::Map(_, _) => true,
+        // Infallible scalar returns pass by value; fallible scalars have no result channel.
+        TypeRef::Primitive(_) | TypeRef::Duration => m.error_type.is_none(),
+        _ => false,
+    }
+}
+
+/// Return `true` when a return type crosses the ABI as a JSON `out_result` string
+/// (as opposed to a raw string or a by-value scalar).
+fn plugin_returns_json(ty: &TypeRef) -> bool {
+    matches!(ty, TypeRef::Named(_) | TypeRef::Vec(_) | TypeRef::Map(_, _))
+}
+
+fn plugin_returns_string(ty: &TypeRef) -> bool {
+    matches!(ty, TypeRef::String | TypeRef::Char | TypeRef::Path | TypeRef::Json)
+}
+
+/// Generate the `<trait>_plugin.cr` file for a plugin-style trait bridge, or
+/// `None` when the bridge is not a supported plugin bridge.
+pub(crate) fn gen_plugin_file(
+    api: &ApiSurface,
+    bridge: &TraitBridgeConfig,
+    ffi_prefix: &str,
+    lib_name: &str,
+    module_name: &str,
+) -> Option<String> {
+    if !is_supported_plugin_bridge(api, bridge) {
+        return None;
+    }
+    let trait_def = api.types.iter().find(|t| t.is_trait && t.name == bridge.trait_name)?;
+    let trait_name = crystal_type_name(&bridge.trait_name);
+    let trait_snake = public_host_identifier(
+        crate::core::config::Language::Crystal,
+        PublicIdentifierKind::Function,
+        &bridge.trait_name,
+    );
+    let vtable_ty = format!("{trait_name}VTable");
+    let has_super = bridge.super_trait.is_some();
+    let register_fn = bridge.register_fn.as_deref()?;
+    let plugins_var = format!("@@{trait_snake}_plugins");
+
+    let own_methods: Vec<&MethodDef> = trait_def
+        .methods
+        .iter()
+        .filter(|m| m.trait_source.is_none() && !m.binding_excluded)
+        .collect();
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "# Plugin trait bridge for `{}` — a Crystal object registered into the Rust\n# `{}` registry, implementing the trait across the C-ABI vtable.\nrequire \"json\"\n\n",
+        bridge.trait_name, bridge.trait_name
+    ));
+
+    // ---- lib layer ---------------------------------------------------------
+    out.push_str(&format!("lib {lib_name}\n"));
+    out.push_str(&format!("  struct {vtable_ty}\n"));
+    if has_super {
+        out.push_str("    name_fn : (Void*, LibC::Char**, LibC::Char**) -> Int32\n");
+        out.push_str("    version_fn : (Void*, LibC::Char**, LibC::Char**) -> Int32\n");
+        out.push_str("    initialize_fn : (Void*, LibC::Char**) -> Int32\n");
+        out.push_str("    shutdown_fn : (Void*, LibC::Char**) -> Int32\n");
+    }
+    for m in &own_methods {
+        let field = public_host_identifier(
+            crate::core::config::Language::Crystal,
+            PublicIdentifierKind::Function,
+            &m.name,
+        );
+        let mut params = vec!["Void*".to_string()];
+        for p in &m.params {
+            params.push(plugin_c_type(&p.ty)?.to_string());
+        }
+        let (ret, out_ps) = plugin_vtable_return(&m.return_type, m.error_type.is_some());
+        params.extend(out_ps.iter().map(|s| s.to_string()));
+        out.push_str(&format!("    {field} : ({}) -> {ret}\n", params.join(", ")));
+    }
+    out.push_str("    free_string : (LibC::Char*) -> Void\n");
+    out.push_str("    free_user_data : (Void*) -> Void\n");
+    out.push_str("  end\n\n");
+    out.push_str(&format!(
+        "  fun register_{trait_snake} = {ffi_prefix}_{register_fn}(name : LibC::Char*, vtable : {vtable_ty}*, user_data : Void*, out_error : LibC::Char**) : Int32\n"
+    ));
+    out.push_str(&format!(
+        "  fun unregister_{trait_snake} = {ffi_prefix}_unregister_{trait_snake}(name : LibC::Char*, out_error : LibC::Char**) : Int32\n"
+    ));
+    out.push_str("end\n\n");
+
+    // ---- high-level module -------------------------------------------------
+    out.push_str(&format!("module {module_name}\n"));
+    // Keep boxed impls alive for the registration lifetime (conservative GC scans this).
+    out.push_str(&format!("  {plugins_var} = {{}} of String => Void*\n"));
+
+    // Abstract base class.
+    out.push_str(&format!(
+        "\n  # Subclass and override the trait methods to implement `{}`.\n  abstract class {trait_name}\n",
+        bridge.trait_name
+    ));
+    if has_super {
+        out.push_str("    def name : String\n      \"\"\n    end\n");
+        out.push_str("    def version : String\n      \"0.0.0\"\n    end\n");
+        out.push_str("    def initialize_plugin : Nil\n    end\n");
+        out.push_str("    def shutdown : Nil\n    end\n");
+    }
+    for m in &own_methods {
+        let method = public_host_identifier(
+            crate::core::config::Language::Crystal,
+            PublicIdentifierKind::Function,
+            &m.name,
+        );
+        let sig_params = m
+            .params
+            .iter()
+            .map(|p| {
+                let n = public_host_identifier(
+                    crate::core::config::Language::Crystal,
+                    PublicIdentifierKind::Parameter,
+                    &p.name,
+                );
+                format!("{n} : {}", crystal_type(&p.ty))
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let ret_hi = if matches!(m.return_type, TypeRef::Unit) {
+            "Nil".to_string()
+        } else {
+            crystal_type(&m.return_type).into_owned()
+        };
+        let params_decl = if sig_params.is_empty() {
+            String::new()
+        } else {
+            format!("({sig_params})")
+        };
+        if !m.doc.is_empty() {
+            out.push_str(&format!("    # {}\n", m.doc.lines().next().unwrap_or_default().trim()));
+        }
+        out.push_str(&format!(
+            "    def {method}{params_decl} : {ret_hi}\n      raise \"not implemented: {method}\"\n    end\n"
+        ));
+    }
+    out.push_str("  end\n");
+
+    // C-string dup helper (idempotent redefinition across bridge files is fine).
+    out.push_str(
+        "\n  # Copy a Crystal String to a malloc'd NUL-terminated C string (Rust frees it via free_string).\n  def self.__alef_dup_cstr(s : String) : LibC::Char*\n    bytes = s.to_slice\n    buf = LibC.malloc(bytes.size + 1).as(UInt8*)\n    buf.copy_from(bytes.to_unsafe, bytes.size)\n    buf[bytes.size] = 0_u8\n    buf.as(LibC::Char*)\n  end\n",
+    );
+
+    // register_<trait>(name, impl)
+    out.push_str(&format!(
+        "\n  # Register a Crystal `{trait_name}` implementation into the Rust registry.\n  def self.register_{trait_snake}(name : String, impl : {trait_name}) : Bool\n"
+    ));
+    out.push_str("    ud = Box.box(impl)\n");
+    out.push_str(&format!("    {plugins_var}[name] = ud\n"));
+    out.push_str(&format!("    vtable = {lib_name}::{vtable_ty}.new\n"));
+    if has_super {
+        out.push_str(&format!("    vtable.name_fn = ->(user_data : Void*, out_name : LibC::Char**, out_error : LibC::Char**) do\n      out_name.value = {module_name}.__alef_dup_cstr(Box({trait_name}).unbox(user_data).name)\n      0\n    end\n"));
+        out.push_str(&format!("    vtable.version_fn = ->(user_data : Void*, out_version : LibC::Char**, out_error : LibC::Char**) do\n      out_version.value = {module_name}.__alef_dup_cstr(Box({trait_name}).unbox(user_data).version)\n      0\n    end\n"));
+        out.push_str(&format!("    vtable.initialize_fn = ->(user_data : Void*, out_error : LibC::Char**) do\n      Box({trait_name}).unbox(user_data).initialize_plugin\n      0\n    end\n"));
+        out.push_str(&format!("    vtable.shutdown_fn = ->(user_data : Void*, out_error : LibC::Char**) do\n      Box({trait_name}).unbox(user_data).shutdown\n      0\n    end\n"));
+    }
+    for m in &own_methods {
+        out.push_str(&gen_plugin_method_trampoline(m, &trait_name, module_name));
+    }
+    out.push_str("    vtable.free_string = ->(p : LibC::Char*) { LibC.free(p.as(Void*)) }\n");
+    out.push_str("    out_error = Pointer(LibC::Char).null\n");
+    out.push_str(&format!(
+        "    {lib_name}.register_{trait_snake}(name, pointerof(vtable), ud, pointerof(out_error)) == 0\n"
+    ));
+    out.push_str("  end\n");
+
+    // unregister_<trait>(name)
+    out.push_str(&format!(
+        "\n  # Unregister a previously registered `{trait_name}` implementation.\n  def self.unregister_{trait_snake}(name : String) : Bool\n    out_error = Pointer(LibC::Char).null\n    ok = {lib_name}.unregister_{trait_snake}(name, pointerof(out_error)) == 0\n    {plugins_var}.delete(name)\n    ok\n  end\n"
+    ));
+
+    out.push_str("end\n");
+    Some(out)
+}
+
+/// The Crystal vtable fn-pointer return type + trailing out-params for a method.
+fn plugin_vtable_return(ty: &TypeRef, has_error: bool) -> (&'static str, Vec<&'static str>) {
+    if plugin_returns_string(ty) || plugin_returns_json(ty) {
+        return ("Int32", vec!["LibC::Char**", "LibC::Char**"]); // out_result, out_error
+    }
+    match ty {
+        TypeRef::Unit => {
+            if has_error {
+                ("Int32", vec!["LibC::Char**"]) // out_error
+            } else {
+                ("Void", vec![])
+            }
+        }
+        TypeRef::Primitive(p) => (prim_ret(p), vec![]),
+        TypeRef::Duration => ("UInt64", vec![]),
+        _ => ("Int32", vec!["LibC::Char**", "LibC::Char**"]),
+    }
+}
+
+fn prim_ret(p: &PrimitiveType) -> &'static str {
+    match p {
+        PrimitiveType::Bool => "Int32",
+        PrimitiveType::U8 => "UInt8",
+        PrimitiveType::U16 => "UInt16",
+        PrimitiveType::U32 => "UInt32",
+        PrimitiveType::U64 => "UInt64",
+        PrimitiveType::I8 => "Int8",
+        PrimitiveType::I16 => "Int16",
+        PrimitiveType::I32 => "Int32",
+        PrimitiveType::I64 => "Int64",
+        PrimitiveType::F32 => "Float32",
+        PrimitiveType::F64 => "Float64",
+        PrimitiveType::Usize => "LibC::SizeT",
+        PrimitiveType::Isize => "LibC::SSizeT",
+    }
+}
+
+/// Emit one own-method trampoline assigned to the vtable field.
+fn gen_plugin_method_trampoline(m: &MethodDef, trait_name: &str, module_name: &str) -> String {
+    let field = public_host_identifier(
+        crate::core::config::Language::Crystal,
+        PublicIdentifierKind::Function,
+        &m.name,
+    );
+    // fn-pointer parameter list.
+    let mut lam = vec!["user_data : Void*".to_string()];
+    let mut decoded: Vec<String> = Vec::new();
+    let mut call_args: Vec<String> = Vec::new();
+    for p in &m.params {
+        let n = public_host_identifier(
+            crate::core::config::Language::Crystal,
+            PublicIdentifierKind::Parameter,
+            &p.name,
+        );
+        let c = plugin_c_type(&p.ty).unwrap_or("LibC::Char*");
+        lam.push(format!("{n} : {c}"));
+        let (val, expr) = plugin_decode_param(&p.ty, &n);
+        decoded.push(format!("      {val} = {expr}\n"));
+        call_args.push(val);
+    }
+    let (_, out_ps) = plugin_vtable_return(&m.return_type, m.error_type.is_some());
+    let has_out_result =
+        out_ps.len() == 2 || plugin_returns_string(&m.return_type) || plugin_returns_json(&m.return_type);
+    let has_out_error =
+        out_ps.contains(&"LibC::Char**") && (out_ps.len() == 2 || matches!(m.return_type, TypeRef::Unit));
+    if has_out_result {
+        lam.push("out_result : LibC::Char**".to_string());
+        lam.push("out_error : LibC::Char**".to_string());
+    } else if has_out_error {
+        lam.push("out_error : LibC::Char**".to_string());
+    }
+
+    let call = format!("Box({trait_name}).unbox(user_data).{field}({})", call_args.join(", "));
+    let mut body = String::new();
+    for d in &decoded {
+        body.push_str(d);
+    }
+
+    // Result epilogue.
+    if plugin_returns_string(&m.return_type) {
+        body.push_str("      begin\n");
+        body.push_str(&format!(
+            "        out_result.value = {module_name}.__alef_dup_cstr({call})\n        0\n"
+        ));
+        body.push_str("      rescue __ex\n        out_error.value = ");
+        body.push_str(&format!(
+            "{module_name}.__alef_dup_cstr(__ex.message || \"error\")\n        1\n      end\n"
+        ));
+    } else if plugin_returns_json(&m.return_type) {
+        body.push_str("      begin\n");
+        body.push_str(&format!(
+            "        out_result.value = {module_name}.__alef_dup_cstr(({call}).to_json)\n        0\n"
+        ));
+        body.push_str(&format!("      rescue __ex\n        out_error.value = {module_name}.__alef_dup_cstr(__ex.message || \"error\")\n        1\n      end\n"));
+    } else if matches!(m.return_type, TypeRef::Unit) {
+        if m.error_type.is_some() {
+            body.push_str(&format!("      begin\n        {call}\n        0\n      rescue __ex\n        out_error.value = {module_name}.__alef_dup_cstr(__ex.message || \"error\")\n        1\n      end\n"));
+        } else {
+            body.push_str(&format!("      {call}\n"));
+        }
+    } else {
+        // Infallible scalar: return the value directly (Bool → Int32).
+        if matches!(m.return_type, TypeRef::Primitive(PrimitiveType::Bool)) {
+            body.push_str(&format!("      ({call}) ? 1 : 0\n"));
+        } else {
+            body.push_str(&format!("      {call}\n"));
+        }
+    }
+
+    format!("    vtable.{field} = ->({}) do\n{body}    end\n", lam.join(", "))
+}
+
+/// Decode a vtable param (raw string / JSON / scalar) into a Crystal value.
+fn plugin_decode_param(ty: &TypeRef, name: &str) -> (String, String) {
+    let val = format!("__{name}");
+    let expr = match ty {
+        TypeRef::String | TypeRef::Char | TypeRef::Path => format!("String.new({name})"),
+        TypeRef::Json => format!("JSON.parse(String.new({name}))"),
+        TypeRef::Named(_) | TypeRef::Vec(_) | TypeRef::Map(_, _) => {
+            format!("{}.from_json(String.new({name}))", crystal_type(ty))
+        }
+        TypeRef::Primitive(PrimitiveType::Bool) => format!("({name} != 0)"),
+        _ => name.to_string(),
+    };
+    (val, expr)
 }

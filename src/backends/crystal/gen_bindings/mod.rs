@@ -1210,7 +1210,10 @@ impl Backend for CrystalBackend {
         let unsupported_bridges: Vec<&str> = config
             .trait_bridges
             .iter()
-            .filter(|b| !super::trait_bridge::is_supported_visitor_bridge(api, b))
+            .filter(|b| {
+                !super::trait_bridge::is_supported_visitor_bridge(api, b)
+                    && !super::trait_bridge::is_supported_plugin_bridge(api, b)
+            })
             .map(|b| b.trait_name.as_str())
             .collect();
         if !unsupported_bridges.is_empty() {
@@ -1272,17 +1275,27 @@ impl Backend for CrystalBackend {
         let lib_name = Self::lib_name(&ffi_prefix);
         let module_name = Self::module_name(&api.crate_name);
         for bridge in &config.trait_bridges {
+            let bridge_snake = crate::codegen::naming::public_host_identifier(
+                Language::Crystal,
+                PublicIdentifierKind::Function,
+                &bridge.trait_name,
+            );
             if let Some(visitor_src) =
                 super::trait_bridge::gen_visitor_file(api, bridge, &ffi_prefix, &lib_name, &module_name)
             {
-                let bridge_snake = crate::codegen::naming::public_host_identifier(
-                    Language::Crystal,
-                    PublicIdentifierKind::Function,
-                    &bridge.trait_name,
-                );
                 files.push(GeneratedFile {
                     path: PathBuf::from(format!("{output_dir}src/{shard_name}_{bridge_snake}_visitor.cr")),
                     content: visitor_src,
+                    generated_header: true,
+                });
+            }
+            // Plugin-style (registry) trait bridges → a `plugin.cr` per bridge.
+            if let Some(plugin_src) =
+                super::trait_bridge::gen_plugin_file(api, bridge, &ffi_prefix, &lib_name, &module_name)
+            {
+                files.push(GeneratedFile {
+                    path: PathBuf::from(format!("{output_dir}src/{shard_name}_{bridge_snake}_plugin.cr")),
+                    content: plugin_src,
                     generated_header: true,
                 });
             }
