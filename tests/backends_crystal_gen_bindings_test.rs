@@ -444,3 +444,93 @@ fn make_field_string() -> alef::core::ir::FieldDef {
         original_type: None,
     }
 }
+
+#[test]
+fn duration_params_and_returns_pass_as_u64_scalar() {
+    let api = api_with(vec![make_fn(
+        "delay",
+        vec![make_param("ms", TypeRef::Duration)],
+        TypeRef::Duration,
+        None,
+    )]);
+    let content = &CrystalBackend.generate_bindings(&api, &make_config()).unwrap()[0].content;
+
+    assert!(content.contains("lib LibDemo"), "missing lib block: {content}");
+    assert!(
+        content.contains("fun delay = demo_delay(ms : UInt64) : UInt64"),
+        "Duration param and return must use UInt64 in lib fun, got: {content}"
+    );
+    assert!(
+        content.contains("def self.delay(ms : Int64) : Int64"),
+        "wrapper must use Int64 for Duration, got: {content}"
+    );
+    assert!(
+        content.contains("LibDemo.delay(ms)"),
+        "Duration param must pass directly (not JSON-encoded), got: {content}"
+    );
+}
+
+#[test]
+fn duration_with_error_still_returns_c_string() {
+    let api = api_with(vec![make_fn(
+        "risky_delay",
+        vec![make_param("ms", TypeRef::Duration)],
+        TypeRef::Duration,
+        Some("E"),
+    )]);
+    let content = &CrystalBackend.generate_bindings(&api, &make_config()).unwrap()[0].content;
+
+    assert!(
+        content.contains("fun risky_delay = demo_risky_delay(ms : UInt64) : LibC::Char*"),
+        "Duration param is scalar, error return is C string: {content}"
+    );
+}
+
+#[test]
+fn bytes_passes_as_raw_string_not_json() {
+    let api = api_with(vec![make_fn(
+        "get_data",
+        vec![make_param("payload", TypeRef::Bytes)],
+        TypeRef::Bytes,
+        None,
+    )]);
+    let content = &CrystalBackend.generate_bindings(&api, &make_config()).unwrap()[0].content;
+
+    assert!(content.contains("lib LibDemo"), "missing lib block: {content}");
+    assert!(
+        content.contains("fun get_data = demo_get_data(payload : LibC::Char*) : LibC::Char*"),
+        "Bytes param/return must use LibC::Char* in lib fun: {content}"
+    );
+    assert!(
+        content.contains("def self.get_data(payload : Bytes) : Bytes"),
+        "wrapper must use Bytes for Bytes, got: {content}"
+    );
+    assert!(
+        content.contains("LibDemo.get_data(payload.to_a.to_json)"),
+        "Bytes param must be JSON-serialized via to_a.to_json, got: {content}"
+    );
+    assert!(
+        content.contains("Array(UInt8).from_json(__json)"),
+        "Bytes return must parse JSON via Array(UInt8), got: {content}"
+    );
+    assert!(
+        content.contains("Bytes.new(__arr.size)"),
+        "Bytes return must copy via Bytes.new, got: {content}"
+    );
+}
+
+#[test]
+fn bytes_fallible_returns_raw_c_string() {
+    let api = api_with(vec![make_fn(
+        "fetch_bytes",
+        vec![make_param("key", TypeRef::String)],
+        TypeRef::Bytes,
+        Some("E"),
+    )]);
+    let content = &CrystalBackend.generate_bindings(&api, &make_config()).unwrap()[0].content;
+
+    assert!(
+        content.contains("fun fetch_bytes = demo_fetch_bytes(key : LibC::Char*) : LibC::Char*"),
+        "fallible Bytes return still uses LibC::Char*: {content}"
+    );
+}

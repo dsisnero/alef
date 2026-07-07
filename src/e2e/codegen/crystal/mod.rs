@@ -20,6 +20,7 @@ use std::path::PathBuf;
 
 use super::E2eCodegen;
 
+mod http;
 mod project;
 mod stubs;
 #[cfg(test)]
@@ -44,15 +45,6 @@ impl E2eCodegen for CrystalE2eCodegen {
 
         let shard_name = config.name.to_snake_case();
         let module_name = config.name.to_pascal_case();
-
-        // Resolve the function to call (with an optional crystal override).
-        let call = &e2e_config.call;
-        let function_name = call
-            .overrides
-            .get(lang)
-            .and_then(|o| o.function.as_ref())
-            .cloned()
-            .unwrap_or_else(|| call.function.clone());
 
         // Resolve the path to the generated Crystal binding package.
         let pkg = e2e_config.resolve_package("crystal");
@@ -88,7 +80,14 @@ impl E2eCodegen for CrystalE2eCodegen {
             let filename = format!("{}_spec.cr", sanitize_filename(&group.category));
             files.push(GeneratedFile {
                 path: output_base.join("spec").join(filename),
-                content: project::render_category_spec(&group.category, &active, &module_name, &function_name),
+                content: project::render_category_spec(
+                    &group.category,
+                    &active,
+                    &module_name,
+                    e2e_config,
+                    &config.trait_bridges,
+                    _type_defs,
+                ),
                 generated_header: true,
             });
         }

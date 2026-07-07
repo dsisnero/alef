@@ -16,7 +16,9 @@ pub const MODULE_PLACEHOLDER: &str = "__ALEF_MODULE__";
 
 /// Default Crystal literal for a stubbed method return type.
 fn default_value(ty: &crate::core::ir::TypeRef) -> String {
+    use crate::codegen::type_mapper::TypeMapper;
     use crate::core::ir::{PrimitiveType, TypeRef};
+    let mapper = crate::backends::crystal::type_map::CrystalMapper;
     match ty {
         TypeRef::Unit => "nil".to_string(),
         TypeRef::String | TypeRef::Char | TypeRef::Path => "\"\"".to_string(),
@@ -26,7 +28,9 @@ fn default_value(ty: &crate::core::ir::TypeRef) -> String {
         TypeRef::Primitive(_) | TypeRef::Duration => "0".to_string(),
         TypeRef::Optional(_) => "nil".to_string(),
         TypeRef::Vec(_) => "[] of typeof(nil)".to_string(),
-        _ => "raise \"stub\"".to_string(),
+        TypeRef::Bytes => "Bytes.empty".to_string(),
+        TypeRef::Map(k, v) => format!("{{}} of {} => {}", mapper.map_type(k), mapper.map_type(v)),
+        _ => format!("raise \"stub\" /* {:?} */", ty),
     }
 }
 
@@ -98,5 +102,88 @@ pub fn emit_test_backend(
         arg_expr,
         type_imports: Vec::new(),
         teardown_block: teardown,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::ir::{PrimitiveType, TypeRef};
+
+    #[test]
+    fn default_unit_returns_nil() {
+        assert_eq!(default_value(&TypeRef::Unit), "nil");
+    }
+
+    #[test]
+    fn default_string_returns_empty_quote() {
+        assert_eq!(default_value(&TypeRef::String), "\"\"");
+    }
+
+    #[test]
+    fn default_char_returns_empty_quote() {
+        assert_eq!(default_value(&TypeRef::Char), "\"\"");
+    }
+
+    #[test]
+    fn default_path_returns_empty_quote() {
+        assert_eq!(default_value(&TypeRef::Path), "\"\"");
+    }
+
+    #[test]
+    fn default_json_returns_any_new_nil() {
+        assert_eq!(default_value(&TypeRef::Json), "JSON::Any.new(nil)");
+    }
+
+    #[test]
+    fn default_bool_returns_false() {
+        assert_eq!(default_value(&TypeRef::Primitive(PrimitiveType::Bool)), "false");
+    }
+
+    #[test]
+    fn default_f32_returns_zero_point_zero() {
+        assert_eq!(default_value(&TypeRef::Primitive(PrimitiveType::F32)), "0.0");
+    }
+
+    #[test]
+    fn default_f64_returns_zero_point_zero() {
+        assert_eq!(default_value(&TypeRef::Primitive(PrimitiveType::F64)), "0.0");
+    }
+
+    #[test]
+    fn default_i32_returns_zero() {
+        assert_eq!(default_value(&TypeRef::Primitive(PrimitiveType::I32)), "0");
+    }
+
+    #[test]
+    fn default_duration_returns_zero() {
+        assert_eq!(default_value(&TypeRef::Duration), "0");
+    }
+
+    #[test]
+    fn default_optional_returns_nil() {
+        assert_eq!(default_value(&TypeRef::Optional(Box::new(TypeRef::String))), "nil");
+    }
+
+    #[test]
+    fn default_vec_returns_empty_array() {
+        assert_eq!(
+            default_value(&TypeRef::Vec(Box::new(TypeRef::String))),
+            "[] of typeof(nil)"
+        );
+    }
+
+    #[test]
+    fn default_bytes_returns_bytes_empty() {
+        assert_eq!(default_value(&TypeRef::Bytes), "Bytes.empty");
+    }
+
+    #[test]
+    fn default_map_returns_empty_hash() {
+        let map = TypeRef::Map(
+            Box::new(TypeRef::String),
+            Box::new(TypeRef::Primitive(PrimitiveType::I32)),
+        );
+        assert_eq!(default_value(&map), "{} of String => Int32");
     }
 }

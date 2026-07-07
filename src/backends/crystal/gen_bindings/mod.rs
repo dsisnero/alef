@@ -1027,9 +1027,15 @@ impl CrystalBackend {
         match return_type {
             TypeRef::Unit => b.push_str("    nil\n"),
             TypeRef::String | TypeRef::Path | TypeRef::Char => b.push_str("    __json\n"),
+            TypeRef::Bytes => {
+                b.push_str("    __arr = Array(UInt8).from_json(__json)\n    Bytes.new(__arr.size) { |i| __arr[i] }\n")
+            }
             TypeRef::Json => b.push_str("    JSON.parse(__json)\n"),
             TypeRef::Optional(inner) => match inner.as_ref() {
                 TypeRef::String | TypeRef::Path | TypeRef::Char => b.push_str("    __json\n"),
+                TypeRef::Bytes => b.push_str(
+                    "    __arr = Array(UInt8).from_json(__json)\n    Bytes.new(__arr.size) { |i| __arr[i] }\n",
+                ),
                 TypeRef::Json => b.push_str("    JSON.parse(__json)\n"),
                 other => {
                     let ty = crystal_type(other);
@@ -1047,7 +1053,7 @@ impl CrystalBackend {
 
 /// Scalar types pass across the C ABI by value (no JSON marshalling).
 fn is_scalar(ty: &TypeRef) -> bool {
-    matches!(ty, TypeRef::Primitive(_) | TypeRef::Unit)
+    matches!(ty, TypeRef::Primitive(_) | TypeRef::Duration | TypeRef::Unit)
 }
 
 /// The Crystal expression passing a parameter across the C ABI: scalars pass
@@ -1070,6 +1076,8 @@ fn marshal_value(name: &str, ty: &TypeRef, opaque: &HashSet<String>) -> String {
             // The FFI receives string params as raw `char*` (Crystal auto-converts
             // a String to a NUL-terminated pointer); JSON-encoding would double-quote.
             TypeRef::String | TypeRef::Char | TypeRef::Path => name.to_string(),
+            // Bytes (Slice) has no FFI auto-conversion; serialize via Array first.
+            TypeRef::Bytes => format!("{name}.to_a.to_json"),
             _ => format!("{name}.to_json"),
         }
     }

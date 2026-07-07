@@ -117,13 +117,13 @@ pub fn crystal_c_type(ty: &TypeRef) -> Cow<'static, str> {
             PrimitiveType::Isize => "LibC::SSizeT",
         }),
         TypeRef::Unit => Cow::Borrowed("Void"),
+        TypeRef::Duration => Cow::Borrowed("UInt64"),
         // Every non-scalar type crosses the C ABI as a NUL-terminated JSON string.
         TypeRef::String
         | TypeRef::Char
         | TypeRef::Path
         | TypeRef::Json
         | TypeRef::Bytes
-        | TypeRef::Duration
         | TypeRef::Optional(_)
         | TypeRef::Vec(_)
         | TypeRef::Map(_, _)

@@ -414,7 +414,8 @@ pub(crate) fn is_supported_visitor_bridge(api: &ApiSurface, bridge: &TraitBridge
 fn plugin_c_type(ty: &TypeRef) -> Option<&'static str> {
     Some(match ty {
         TypeRef::String | TypeRef::Char | TypeRef::Path | TypeRef::Json => "LibC::Char*",
-        TypeRef::Named(_) | TypeRef::Vec(_) | TypeRef::Map(_, _) => "LibC::Char*",
+        TypeRef::Named(_) | TypeRef::Vec(_) | TypeRef::Map(_, _) | TypeRef::Bytes => "LibC::Char*",
+        TypeRef::Optional(_) => "LibC::Char*",
         TypeRef::Primitive(PrimitiveType::Bool) => "Int32",
         TypeRef::Primitive(PrimitiveType::U8) => "UInt8",
         TypeRef::Primitive(PrimitiveType::U16) => "UInt16",
@@ -429,7 +430,7 @@ fn plugin_c_type(ty: &TypeRef) -> Option<&'static str> {
         TypeRef::Primitive(PrimitiveType::Usize) => "LibC::SizeT",
         TypeRef::Primitive(PrimitiveType::Isize) => "LibC::SSizeT",
         TypeRef::Duration => "UInt64",
-        _ => return None, // Bytes / Optional / Unit params unsupported for now
+        _ => return None, // Unit params unsupported for now
     })
 }
 
@@ -460,19 +461,22 @@ fn plugin_method_supported(m: &MethodDef) -> bool {
         | TypeRef::Char
         | TypeRef::Path
         | TypeRef::Json
+        | TypeRef::Bytes
         | TypeRef::Named(_)
         | TypeRef::Vec(_)
         | TypeRef::Map(_, _) => true,
-        // Infallible scalar returns pass by value; fallible scalars have no result channel.
+        TypeRef::Optional(inner) => !matches!(inner.as_ref(), TypeRef::Unit | TypeRef::Optional(_)),
         TypeRef::Primitive(_) | TypeRef::Duration => m.error_type.is_none(),
-        _ => false,
     }
 }
 
 /// Return `true` when a return type crosses the ABI as a JSON `out_result` string
 /// (as opposed to a raw string or a by-value scalar).
 fn plugin_returns_json(ty: &TypeRef) -> bool {
-    matches!(ty, TypeRef::Named(_) | TypeRef::Vec(_) | TypeRef::Map(_, _))
+    matches!(
+        ty,
+        TypeRef::Named(_) | TypeRef::Vec(_) | TypeRef::Map(_, _) | TypeRef::Bytes
+    )
 }
 
 fn plugin_returns_string(ty: &TypeRef) -> bool {
@@ -728,6 +732,12 @@ fn gen_plugin_method_trampoline(m: &MethodDef, trait_name: &str, module_name: &s
         body.push_str(&format!(
             "{module_name}.__alef_dup_cstr(__ex.message || \"error\")\n        1\n      end\n"
         ));
+    } else if matches!(m.return_type, TypeRef::Bytes) {
+        body.push_str("      begin\n");
+        body.push_str(&format!(
+            "        out_result.value = {module_name}.__alef_dup_cstr(({call}).to_a.to_json)\n        0\n"
+        ));
+        body.push_str(&format!("      rescue __ex\n        out_error.value = {module_name}.__alef_dup_cstr(__ex.message || \"error\")\n        1\n      end\n"));
     } else if plugin_returns_json(&m.return_type) {
         body.push_str("      begin\n");
         body.push_str(&format!(
@@ -761,8 +771,731 @@ fn plugin_decode_param(ty: &TypeRef, name: &str) -> (String, String) {
         TypeRef::Named(_) | TypeRef::Vec(_) | TypeRef::Map(_, _) => {
             format!("{}.from_json(String.new({name}))", crystal_type(ty))
         }
+        TypeRef::Bytes => {
+            format!("Array(UInt8).from_json(String.new({name})).to_slice")
+        }
+        TypeRef::Optional(inner) => {
+            let (_, inner_expr) = plugin_decode_param(inner, name);
+            format!("{name}.null? ? nil : ({inner_expr})")
+        }
         TypeRef::Primitive(PrimitiveType::Bool) => format!("({name} != 0)"),
         _ => name.to_string(),
     };
     (val, expr)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::ir::{MethodDef, ParamDef, PrimitiveType, TypeRef};
+
+    fn method_with_param(ty: TypeRef) -> MethodDef {
+        MethodDef {
+            name: "do_work".to_string(),
+            params: vec![ParamDef {
+                name: "input".to_string(),
+                ty,
+                ..ParamDef::default()
+            }],
+            return_type: TypeRef::Unit,
+            ..MethodDef::default()
+        }
+    }
+
+    // ── plugin_c_type ─────────────────────────────────────────────────
+
+    #[test]
+    fn optional_string_param_has_c_type() {
+        let ctype = plugin_c_type(&TypeRef::Optional(Box::new(TypeRef::String)));
+        assert_eq!(ctype, Some("LibC::Char*"));
+    }
+
+    #[test]
+    fn optional_named_param_has_c_type() {
+        let ctype = plugin_c_type(&TypeRef::Optional(Box::new(TypeRef::Named("Foo".to_string()))));
+        assert_eq!(ctype, Some("LibC::Char*"));
+    }
+
+    #[test]
+    fn optional_vec_param_has_c_type() {
+        let ctype = plugin_c_type(&TypeRef::Optional(Box::new(TypeRef::Vec(Box::new(TypeRef::String)))));
+        assert_eq!(ctype, Some("LibC::Char*"));
+    }
+
+    #[test]
+    fn optional_scalar_param_has_c_type() {
+        let ctype = plugin_c_type(&TypeRef::Optional(Box::new(TypeRef::Primitive(PrimitiveType::I32))));
+        assert_eq!(ctype, Some("LibC::Char*"));
+    }
+
+    // ── plugin_method_supported ────────────────────────────────────────
+
+    #[test]
+    fn method_with_optional_string_param_is_supported() {
+        let m = method_with_param(TypeRef::Optional(Box::new(TypeRef::String)));
+        assert!(plugin_method_supported(&m));
+    }
+
+    #[test]
+    fn method_with_optional_named_param_is_supported() {
+        let m = method_with_param(TypeRef::Optional(Box::new(TypeRef::Named("Foo".to_string()))));
+        assert!(plugin_method_supported(&m));
+    }
+
+    #[test]
+    fn bytes_params_are_supported() {
+        let m = method_with_param(TypeRef::Bytes);
+        assert!(plugin_method_supported(&m));
+    }
+
+    #[test]
+    fn bytes_return_type_is_supported() {
+        let m = MethodDef {
+            name: "get_data".to_string(),
+            return_type: TypeRef::Bytes,
+            ..MethodDef::default()
+        };
+        assert!(plugin_method_supported(&m));
+    }
+
+    #[test]
+    fn decode_optional_string_emits_null_check() {
+        let (val, expr) = plugin_decode_param(&TypeRef::Optional(Box::new(TypeRef::String)), "data");
+        assert_eq!(val, "__data");
+        assert!(expr.contains("data.null? ? nil"), "expr: {expr}");
+        assert!(expr.contains("String.new(data)"), "expr: {expr}");
+    }
+
+    #[test]
+    fn decode_optional_named_emits_null_check_with_from_json() {
+        let (val, expr) = plugin_decode_param(&TypeRef::Optional(Box::new(TypeRef::Named("Foo".to_string()))), "cfg");
+        assert_eq!(val, "__cfg");
+        assert!(expr.contains("cfg.null? ? nil"), "expr: {expr}");
+        assert!(expr.contains("Foo.from_json"), "expr: {expr}");
+    }
+
+    // ── plugin_c_type base types ───────────────────────────────────────
+
+    #[test]
+    fn string_base_type_has_c_type() {
+        assert_eq!(plugin_c_type(&TypeRef::String), Some("LibC::Char*"));
+    }
+
+    #[test]
+    fn char_base_type_has_c_type() {
+        assert_eq!(plugin_c_type(&TypeRef::Char), Some("LibC::Char*"));
+    }
+
+    #[test]
+    fn path_base_type_has_c_type() {
+        assert_eq!(plugin_c_type(&TypeRef::Path), Some("LibC::Char*"));
+    }
+
+    #[test]
+    fn json_base_type_has_c_type() {
+        assert_eq!(plugin_c_type(&TypeRef::Json), Some("LibC::Char*"));
+    }
+
+    #[test]
+    fn named_base_type_has_c_type() {
+        assert_eq!(plugin_c_type(&TypeRef::Named("Foo".to_string())), Some("LibC::Char*"));
+    }
+
+    #[test]
+    fn vec_base_type_has_c_type() {
+        assert_eq!(
+            plugin_c_type(&TypeRef::Vec(Box::new(TypeRef::String))),
+            Some("LibC::Char*")
+        );
+    }
+
+    #[test]
+    fn map_base_type_has_c_type() {
+        assert_eq!(
+            plugin_c_type(&TypeRef::Map(
+                Box::new(TypeRef::String),
+                Box::new(TypeRef::Primitive(PrimitiveType::I32))
+            )),
+            Some("LibC::Char*")
+        );
+    }
+
+    #[test]
+    fn bytes_base_type_has_c_type() {
+        assert_eq!(plugin_c_type(&TypeRef::Bytes), Some("LibC::Char*"));
+    }
+
+    #[test]
+    fn duration_has_u64_c_type() {
+        assert_eq!(plugin_c_type(&TypeRef::Duration), Some("UInt64"));
+    }
+
+    #[test]
+    fn all_primitive_types_have_c_type() {
+        let cases: Vec<(TypeRef, &str)> = vec![
+            (TypeRef::Primitive(PrimitiveType::Bool), "Int32"),
+            (TypeRef::Primitive(PrimitiveType::U8), "UInt8"),
+            (TypeRef::Primitive(PrimitiveType::U16), "UInt16"),
+            (TypeRef::Primitive(PrimitiveType::U32), "UInt32"),
+            (TypeRef::Primitive(PrimitiveType::U64), "UInt64"),
+            (TypeRef::Primitive(PrimitiveType::I8), "Int8"),
+            (TypeRef::Primitive(PrimitiveType::I16), "Int16"),
+            (TypeRef::Primitive(PrimitiveType::I32), "Int32"),
+            (TypeRef::Primitive(PrimitiveType::I64), "Int64"),
+            (TypeRef::Primitive(PrimitiveType::F32), "Float32"),
+            (TypeRef::Primitive(PrimitiveType::F64), "Float64"),
+            (TypeRef::Primitive(PrimitiveType::Usize), "LibC::SizeT"),
+            (TypeRef::Primitive(PrimitiveType::Isize), "LibC::SSizeT"),
+        ];
+        for (ty, expected) in &cases {
+            assert_eq!(plugin_c_type(ty), Some(*expected), "plugin_c_type for {ty:?}");
+        }
+    }
+
+    #[test]
+    fn unit_param_returns_none() {
+        assert_eq!(plugin_c_type(&TypeRef::Unit), None);
+    }
+
+    // ── plugin_returns_json / plugin_returns_string ────────────────────
+
+    #[test]
+    fn named_returns_json() {
+        assert!(plugin_returns_json(&TypeRef::Named("Foo".to_string())));
+    }
+
+    #[test]
+    fn vec_returns_json() {
+        assert!(plugin_returns_json(&TypeRef::Vec(Box::new(TypeRef::String))));
+    }
+
+    #[test]
+    fn map_returns_json() {
+        assert!(plugin_returns_json(&TypeRef::Map(
+            Box::new(TypeRef::String),
+            Box::new(TypeRef::Primitive(PrimitiveType::I32))
+        )));
+    }
+
+    #[test]
+    fn bytes_returns_json() {
+        assert!(plugin_returns_json(&TypeRef::Bytes));
+    }
+
+    #[test]
+    fn string_does_not_return_json() {
+        assert!(!plugin_returns_json(&TypeRef::String));
+    }
+
+    #[test]
+    fn scalar_does_not_return_json() {
+        assert!(!plugin_returns_json(&TypeRef::Primitive(PrimitiveType::I32)));
+    }
+
+    #[test]
+    fn string_returns_string() {
+        assert!(plugin_returns_string(&TypeRef::String));
+    }
+
+    #[test]
+    fn char_returns_string() {
+        assert!(plugin_returns_string(&TypeRef::Char));
+    }
+
+    #[test]
+    fn path_returns_string() {
+        assert!(plugin_returns_string(&TypeRef::Path));
+    }
+
+    #[test]
+    fn json_returns_string() {
+        assert!(plugin_returns_string(&TypeRef::Json));
+    }
+
+    #[test]
+    fn named_does_not_return_string() {
+        assert!(!plugin_returns_string(&TypeRef::Named("Foo".to_string())));
+    }
+
+    #[test]
+    fn scalar_does_not_return_string() {
+        assert!(!plugin_returns_string(&TypeRef::Primitive(PrimitiveType::I32)));
+    }
+
+    // ── plugin_method_supported return types ────────────────────────────
+
+    #[test]
+    fn unit_return_is_supported() {
+        let m = MethodDef {
+            name: "nothing".to_string(),
+            return_type: TypeRef::Unit,
+            ..MethodDef::default()
+        };
+        assert!(plugin_method_supported(&m));
+    }
+
+    #[test]
+    fn string_return_is_supported() {
+        let m = MethodDef {
+            name: "greet".to_string(),
+            return_type: TypeRef::String,
+            ..MethodDef::default()
+        };
+        assert!(plugin_method_supported(&m));
+    }
+
+    #[test]
+    fn optional_string_return_is_supported() {
+        let m = MethodDef {
+            name: "maybe".to_string(),
+            return_type: TypeRef::Optional(Box::new(TypeRef::String)),
+            ..MethodDef::default()
+        };
+        assert!(plugin_method_supported(&m));
+    }
+
+    #[test]
+    fn optional_unit_return_is_not_supported() {
+        let m = MethodDef {
+            name: "maybe_nil".to_string(),
+            return_type: TypeRef::Optional(Box::new(TypeRef::Unit)),
+            ..MethodDef::default()
+        };
+        assert!(!plugin_method_supported(&m));
+    }
+
+    #[test]
+    fn double_optional_return_is_not_supported() {
+        let m = MethodDef {
+            name: "nested".to_string(),
+            return_type: TypeRef::Optional(Box::new(TypeRef::Optional(Box::new(TypeRef::String)))),
+            ..MethodDef::default()
+        };
+        assert!(!plugin_method_supported(&m));
+    }
+
+    #[test]
+    fn primitive_return_with_error_is_not_supported() {
+        let m = MethodDef {
+            name: "risky".to_string(),
+            return_type: TypeRef::Primitive(PrimitiveType::I32),
+            error_type: Some("E".to_string()),
+            ..MethodDef::default()
+        };
+        assert!(!plugin_method_supported(&m));
+    }
+
+    #[test]
+    fn vec_return_is_supported() {
+        let m = MethodDef {
+            name: "items".to_string(),
+            return_type: TypeRef::Vec(Box::new(TypeRef::String)),
+            ..MethodDef::default()
+        };
+        assert!(plugin_method_supported(&m));
+    }
+
+    #[test]
+    fn map_return_is_supported() {
+        let m = MethodDef {
+            name: "dict".to_string(),
+            return_type: TypeRef::Map(
+                Box::new(TypeRef::String),
+                Box::new(TypeRef::Primitive(PrimitiveType::I32)),
+            ),
+            ..MethodDef::default()
+        };
+        assert!(plugin_method_supported(&m));
+    }
+
+    #[test]
+    fn named_return_is_supported() {
+        let m = MethodDef {
+            name: "config".to_string(),
+            return_type: TypeRef::Named("MyConfig".to_string()),
+            ..MethodDef::default()
+        };
+        assert!(plugin_method_supported(&m));
+    }
+
+    // ── plugin_decode_param base types ─────────────────────────────────
+
+    #[test]
+    fn decode_string_param() {
+        let (val, expr) = plugin_decode_param(&TypeRef::String, "text");
+        assert_eq!(val, "__text");
+        assert_eq!(expr, "String.new(text)");
+    }
+
+    #[test]
+    fn decode_json_param() {
+        let (val, expr) = plugin_decode_param(&TypeRef::Json, "payload");
+        assert_eq!(val, "__payload");
+        assert_eq!(expr, "JSON.parse(String.new(payload))");
+    }
+
+    #[test]
+    fn decode_named_param() {
+        let (val, expr) = plugin_decode_param(&TypeRef::Named("Foo".to_string()), "obj");
+        assert_eq!(val, "__obj");
+        assert_eq!(expr, "Foo.from_json(String.new(obj))");
+    }
+
+    #[test]
+    fn decode_vec_param() {
+        let (val, expr) = plugin_decode_param(&TypeRef::Vec(Box::new(TypeRef::String)), "items");
+        assert_eq!(val, "__items");
+        assert_eq!(expr, "Array(String).from_json(String.new(items))");
+    }
+
+    #[test]
+    fn decode_map_param() {
+        let (val, expr) = plugin_decode_param(
+            &TypeRef::Map(
+                Box::new(TypeRef::String),
+                Box::new(TypeRef::Primitive(PrimitiveType::I32)),
+            ),
+            "mapping",
+        );
+        assert_eq!(val, "__mapping");
+        assert_eq!(expr, "Hash(String, Int32).from_json(String.new(mapping))");
+    }
+
+    #[test]
+    fn decode_bytes_param() {
+        let (val, expr) = plugin_decode_param(&TypeRef::Bytes, "data");
+        assert_eq!(val, "__data");
+        assert_eq!(expr, "Array(UInt8).from_json(String.new(data)).to_slice");
+    }
+
+    #[test]
+    fn decode_bool_param() {
+        let (val, expr) = plugin_decode_param(&TypeRef::Primitive(PrimitiveType::Bool), "flag");
+        assert_eq!(val, "__flag");
+        assert_eq!(expr, "(flag != 0)");
+    }
+
+    #[test]
+    fn decode_duration_param() {
+        let (val, expr) = plugin_decode_param(&TypeRef::Duration, "timeout");
+        assert_eq!(val, "__timeout");
+        assert_eq!(expr, "timeout");
+    }
+
+    #[test]
+    fn decode_i32_param() {
+        let (val, expr) = plugin_decode_param(&TypeRef::Primitive(PrimitiveType::I32), "n");
+        assert_eq!(val, "__n");
+        assert_eq!(expr, "n");
+    }
+
+    // ── crystal_scalar ─────────────────────────────────────────────────
+
+    #[test]
+    fn scalar_bool() {
+        assert_eq!(crystal_scalar(&PrimitiveType::Bool), ("Int32", "Bool"));
+    }
+
+    #[test]
+    fn scalar_u8() {
+        assert_eq!(crystal_scalar(&PrimitiveType::U8), ("UInt8", "UInt8"));
+    }
+
+    #[test]
+    fn scalar_i64() {
+        assert_eq!(crystal_scalar(&PrimitiveType::I64), ("Int64", "Int64"));
+    }
+
+    #[test]
+    fn scalar_usize() {
+        assert_eq!(crystal_scalar(&PrimitiveType::Usize), ("LibC::SizeT", "LibC::SizeT"));
+    }
+
+    #[test]
+    fn scalar_f32() {
+        assert_eq!(crystal_scalar(&PrimitiveType::F32), ("Float32", "Float32"));
+    }
+
+    // ── resolve_callback ───────────────────────────────────────────────
+
+    fn tracer_method(name: &str, params: Vec<ParamDef>, return_type: TypeRef) -> MethodDef {
+        MethodDef {
+            name: name.to_string(),
+            params,
+            return_type,
+            ..MethodDef::default()
+        }
+    }
+
+    #[test]
+    fn callback_with_trait_source_is_skipped() {
+        let mut m = tracer_method(
+            "visit",
+            vec![
+                ParamDef {
+                    name: "ctx".into(),
+                    ty: TypeRef::Named("Ctx".into()),
+                    ..Default::default()
+                },
+                ParamDef {
+                    name: "_text".into(),
+                    ty: TypeRef::String,
+                    ..Default::default()
+                },
+            ],
+            TypeRef::Named("Decision".into()),
+        );
+        m.trait_source = Some("SuperTrait".into());
+        assert!(resolve_callback(&m, "Ctx", "Decision").is_none());
+    }
+
+    #[test]
+    fn callback_with_wrong_return_type_is_skipped() {
+        let m = tracer_method(
+            "visit",
+            vec![
+                ParamDef {
+                    name: "ctx".into(),
+                    ty: TypeRef::Named("Ctx".into()),
+                    ..Default::default()
+                },
+                ParamDef {
+                    name: "_text".into(),
+                    ty: TypeRef::String,
+                    ..Default::default()
+                },
+            ],
+            TypeRef::Named("WrongType".into()),
+        );
+        assert!(resolve_callback(&m, "Ctx", "Decision").is_none());
+    }
+
+    #[test]
+    fn callback_without_context_param_is_skipped() {
+        let m = tracer_method(
+            "visit",
+            vec![ParamDef {
+                name: "_text".into(),
+                ty: TypeRef::String,
+                ..Default::default()
+            }],
+            TypeRef::Named("Decision".into()),
+        );
+        assert!(resolve_callback(&m, "Ctx", "Decision").is_none());
+    }
+
+    #[test]
+    fn callback_with_unsupported_param_type_is_skipped() {
+        let m = tracer_method(
+            "visit",
+            vec![
+                ParamDef {
+                    name: "ctx".into(),
+                    ty: TypeRef::Named("Ctx".into()),
+                    ..Default::default()
+                },
+                ParamDef {
+                    name: "_data".into(),
+                    ty: TypeRef::Bytes,
+                    ..Default::default()
+                },
+            ],
+            TypeRef::Named("Decision".into()),
+        );
+        assert!(resolve_callback(&m, "Ctx", "Decision").is_none());
+    }
+
+    #[test]
+    fn callback_with_string_param_resolves() {
+        let m = tracer_method(
+            "visit_text",
+            vec![
+                ParamDef {
+                    name: "ctx".into(),
+                    ty: TypeRef::Named("Ctx".into()),
+                    ..Default::default()
+                },
+                ParamDef {
+                    name: "_text".into(),
+                    ty: TypeRef::String,
+                    ..Default::default()
+                },
+            ],
+            TypeRef::Named("Decision".into()),
+        );
+        let cb = resolve_callback(&m, "Ctx", "Decision").expect("should resolve");
+        assert_eq!(cb.method, "visit_text");
+        assert_eq!(cb.params.len(), 1);
+        assert_eq!(cb.params[0].name, "text");
+        assert_eq!(cb.params[0].c_type, "LibC::Char*");
+        assert_eq!(cb.params[0].hi_type, "String");
+        assert!(cb.params[0].decode.contains("String.new(text)"));
+    }
+
+    #[test]
+    fn callback_with_optional_string_resolves() {
+        let m = tracer_method(
+            "visit",
+            vec![
+                ParamDef {
+                    name: "ctx".into(),
+                    ty: TypeRef::Named("Ctx".into()),
+                    ..Default::default()
+                },
+                ParamDef {
+                    name: "_label".into(),
+                    ty: TypeRef::String,
+                    optional: true,
+                    ..Default::default()
+                },
+            ],
+            TypeRef::Named("Decision".into()),
+        );
+        let cb = resolve_callback(&m, "Ctx", "Decision").expect("should resolve");
+        assert_eq!(cb.params.len(), 1);
+        assert_eq!(cb.params[0].name, "label");
+        assert_eq!(cb.params[0].hi_type, "String?");
+        assert!(
+            cb.params[0].decode.contains("nil"),
+            "decode should handle nil: {}",
+            cb.params[0].decode
+        );
+    }
+
+    #[test]
+    fn callback_with_bool_param_resolves() {
+        let m = tracer_method(
+            "visit",
+            vec![
+                ParamDef {
+                    name: "ctx".into(),
+                    ty: TypeRef::Named("Ctx".into()),
+                    ..Default::default()
+                },
+                ParamDef {
+                    name: "_flag".into(),
+                    ty: TypeRef::Primitive(PrimitiveType::Bool),
+                    ..Default::default()
+                },
+            ],
+            TypeRef::Named("Decision".into()),
+        );
+        let cb = resolve_callback(&m, "Ctx", "Decision").expect("should resolve");
+        assert_eq!(cb.params.len(), 1);
+        assert_eq!(cb.params[0].name, "flag");
+        assert_eq!(cb.params[0].c_type, "Int32");
+        assert_eq!(cb.params[0].hi_type, "Bool");
+        assert_eq!(cb.params[0].decode, "flag != 0");
+    }
+
+    #[test]
+    fn callback_with_only_context_param_resolves_empty_params() {
+        let m = tracer_method(
+            "simple",
+            vec![ParamDef {
+                name: "ctx".into(),
+                ty: TypeRef::Named("Ctx".into()),
+                ..Default::default()
+            }],
+            TypeRef::Named("Decision".into()),
+        );
+        let cb = resolve_callback(&m, "Ctx", "Decision").expect("should resolve");
+        assert!(cb.params.is_empty(), "no non-context params expected");
+    }
+
+    #[test]
+    fn callback_uses_first_doc_line() {
+        let mut m = tracer_method(
+            "inspect",
+            vec![ParamDef {
+                name: "ctx".into(),
+                ty: TypeRef::Named("Ctx".into()),
+                ..Default::default()
+            }],
+            TypeRef::Named("Decision".into()),
+        );
+        m.doc = "First line.\nSecond line.".into();
+        let cb = resolve_callback(&m, "Ctx", "Decision").expect("should resolve");
+        assert_eq!(cb.doc, "First line.");
+    }
+
+    // ── prim_ret ───────────────────────────────────────────────────────
+
+    #[test]
+    fn prim_ret_bool() {
+        assert_eq!(prim_ret(&PrimitiveType::Bool), "Int32");
+    }
+
+    #[test]
+    fn prim_ret_u32() {
+        assert_eq!(prim_ret(&PrimitiveType::U32), "UInt32");
+    }
+
+    #[test]
+    fn prim_ret_f64() {
+        assert_eq!(prim_ret(&PrimitiveType::F64), "Float64");
+    }
+
+    #[test]
+    fn prim_ret_usize() {
+        assert_eq!(prim_ret(&PrimitiveType::Usize), "LibC::SizeT");
+    }
+
+    // ── plugin_vtable_return ────────────────────────────────────────────
+
+    #[test]
+    fn vtable_return_unit_no_error() {
+        let (ret, out) = plugin_vtable_return(&TypeRef::Unit, false);
+        assert_eq!(ret, "Void");
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn vtable_return_unit_with_error() {
+        let (ret, out) = plugin_vtable_return(&TypeRef::Unit, true);
+        assert_eq!(ret, "Int32");
+        assert_eq!(out, vec!["LibC::Char**"]);
+    }
+
+    #[test]
+    fn vtable_return_primitive_bool() {
+        let (ret, out) = plugin_vtable_return(&TypeRef::Primitive(PrimitiveType::Bool), false);
+        assert_eq!(ret, "Int32");
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn vtable_return_duration() {
+        let (ret, out) = plugin_vtable_return(&TypeRef::Duration, false);
+        assert_eq!(ret, "UInt64");
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn vtable_return_string_json_channel() {
+        let (ret, out) = plugin_vtable_return(&TypeRef::String, false);
+        assert_eq!(ret, "Int32");
+        assert_eq!(out, vec!["LibC::Char**", "LibC::Char**"]);
+    }
+
+    #[test]
+    fn vtable_return_named_json_channel() {
+        let (ret, out) = plugin_vtable_return(&TypeRef::Named("Foo".into()), false);
+        assert_eq!(ret, "Int32");
+        assert_eq!(out, vec!["LibC::Char**", "LibC::Char**"]);
+    }
+
+    #[test]
+    fn vtable_return_bytes_json_channel() {
+        let (ret, out) = plugin_vtable_return(&TypeRef::Bytes, false);
+        assert_eq!(ret, "Int32");
+        assert_eq!(out, vec!["LibC::Char**", "LibC::Char**"]);
+    }
+
+    #[test]
+    fn vtable_return_optional_named_falls_back_to_out_result() {
+        let (ret, out) = plugin_vtable_return(&TypeRef::Optional(Box::new(TypeRef::Named("Foo".into()))), false);
+        assert_eq!(ret, "Int32");
+        assert_eq!(out, vec!["LibC::Char**", "LibC::Char**"]);
+    }
 }
