@@ -145,7 +145,12 @@ impl CrystalBackend {
             let item_snake = public_host_identifier(Language::Crystal, PublicIdentifierKind::Function, &spec.item);
             let base = format!("{owner_snake}_{method_snake}");
             let c_base = format!("{}_{}", abi_symbol(ffi_prefix, &spec.owner), method_snake);
-            let mut start_params = vec!["handle : Void*".to_string()];
+            // Opaque-owner streams pass the handle receiver; free (owner-less) streams do not.
+            let mut start_params = if opaque.contains(&spec.owner) {
+                vec!["handle : Void*".to_string()]
+            } else {
+                Vec::new()
+            };
             for (pname, pty) in &spec.params {
                 let pn = public_host_identifier(Language::Crystal, PublicIdentifierKind::Parameter, pname);
                 start_params.push(format!("{pn} : {}", c_type_of(pty, opaque)));
@@ -199,6 +204,14 @@ impl CrystalBackend {
                 continue;
             }
             out.push_str(&Self::gen_wrapper_method(func, &lib_name, opaque));
+        }
+
+        // Free (owner-less) streaming methods — owners that are not opaque handles
+        // become module-level functions. Opaque-owned streams are emitted as methods
+        // on their handle class by `gen_opaque`.
+        for spec in streaming.iter().filter(|s| !opaque.contains(&s.owner)) {
+            let owner_snake = public_host_identifier(Language::Crystal, PublicIdentifierKind::Function, &spec.owner);
+            out.push_str(&Self::gen_stream_method(spec, &owner_snake, &lib_name, None));
         }
 
         out.push_str("end\n");
@@ -312,7 +325,7 @@ impl CrystalBackend {
 
         // Streaming methods owned by this type → fiber-fed channels.
         for spec in streaming.iter().filter(|s| s.owner == ty.name) {
-            out.push_str(&Self::gen_stream_method(spec, &type_snake, lib_name));
+            out.push_str(&Self::gen_stream_method(spec, &type_snake, lib_name, Some("@handle")));
         }
 
         out.push_str("  end\n");
@@ -322,7 +335,7 @@ impl CrystalBackend {
     /// Emit a streaming method returning a `Channel(Item)` fed by a fiber that
     /// drives the FFI iterator (`_start`/`_next`/`_free`) — Crystal's idiomatic
     /// concurrency: `spawn` + `Channel`.
-    fn gen_stream_method(spec: &StreamSpec, type_snake: &str, lib_name: &str) -> String {
+    fn gen_stream_method(spec: &StreamSpec, type_snake: &str, lib_name: &str, receiver: Option<&str>) -> String {
         let method = public_host_identifier(Language::Crystal, PublicIdentifierKind::Function, &spec.method);
         let item = crystal_type_name(&spec.item);
         let item_snake = public_host_identifier(Language::Crystal, PublicIdentifierKind::Function, &spec.item);
@@ -337,12 +350,19 @@ impl CrystalBackend {
             })
             .collect::<Vec<_>>()
             .join(", ");
-        let sig = if sig_params.is_empty() {
-            format!("def {method} : Channel({item})")
+        // Instance method on an opaque handle (receiver = "@handle"), or a free
+        // module-level function (`def self.…`, no receiver).
+        let decl = if receiver.is_some() {
+            method.clone()
         } else {
-            format!("def {method}({sig_params}) : Channel({item})")
+            format!("self.{method}")
         };
-        let mut start_args = vec!["@handle".to_string()];
+        let sig = if sig_params.is_empty() {
+            format!("def {decl} : Channel({item})")
+        } else {
+            format!("def {decl}({sig_params}) : Channel({item})")
+        };
+        let mut start_args: Vec<String> = receiver.map(|r| r.to_string()).into_iter().collect();
         for (n, ty) in &spec.params {
             let pn = public_host_identifier(Language::Crystal, PublicIdentifierKind::Parameter, n);
             if is_scalar(ty) {

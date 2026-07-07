@@ -1893,3 +1893,122 @@ fn streaming_method_with_params_typechecks() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A free-function stream (owner is not an opaque handle) → a module-level
+/// `self.<method>` returning a Channel, with no receiver handle in `_start`.
+fn free_stream_api() -> ApiSurface {
+    let event = TypeDef {
+        name: "Event".into(),
+        rust_path: "demo::Event".into(),
+        original_rust_path: String::new(),
+        fields: vec![make_field("kind", TypeRef::String)],
+        methods: vec![],
+        is_opaque: false,
+        is_clone: true,
+        is_copy: false,
+        doc: "A streamed event.".into(),
+        cfg: None,
+        is_trait: false,
+        has_default: false,
+        has_stripped_cfg_fields: false,
+        is_return_type: false,
+        serde_rename_all: None,
+        has_serde: true,
+        super_traits: vec![],
+        binding_excluded: false,
+        binding_exclusion_reason: None,
+        is_variant_wrapper: false,
+        has_lifetime_params: false,
+        has_private_fields: false,
+        version: Default::default(),
+    };
+    ApiSurface {
+        crate_name: "demo".into(),
+        version: "0.1.0".into(),
+        types: vec![event],
+        functions: vec![],
+        enums: vec![],
+        errors: vec![],
+        excluded_type_paths: ::std::collections::HashMap::new(),
+        excluded_trait_names: ::std::collections::HashSet::new(),
+        services: vec![],
+        handler_contracts: vec![],
+        unsupported_public_items: Vec::new(),
+    }
+}
+
+fn free_stream_config() -> ResolvedCrateConfig {
+    let toml = r#"
+[workspace]
+languages = ["crystal"]
+
+[[crates]]
+name = "demo"
+sources = ["src/lib.rs"]
+
+[crates.ffi]
+prefix = "demo"
+
+[[crates.adapters]]
+name = "poll"
+pattern = "streaming"
+core_path = "demo::Feed::poll"
+owner_type = "Feed"
+item_type = "Event"
+"#;
+    let cfg: NewAlefConfig = toml::from_str(toml).expect("test config must parse");
+    cfg.resolve().expect("test config must resolve").remove(0)
+}
+
+#[test]
+fn free_function_stream_emits_module_method() {
+    let content = &CrystalBackend
+        .generate_bindings(&free_stream_api(), &free_stream_config())
+        .unwrap()[0]
+        .content;
+    assert!(
+        content.contains("def self.poll : Channel(Event)"),
+        "free stream should be a module method: {content}"
+    );
+    assert!(
+        content.contains("fun feed_poll_start = demo_feed_poll_start() : Void*"),
+        "free stream _start takes no handle: {content}"
+    );
+}
+
+#[test]
+fn free_function_stream_typechecks() {
+    if Command::new("crystal").arg("--version").output().is_err() {
+        eprintln!("skipping: `crystal` compiler not found on PATH");
+        return;
+    }
+    let content = &CrystalBackend
+        .generate_bindings(&free_stream_api(), &free_stream_config())
+        .unwrap()[0]
+        .content;
+    let harness = format!(
+        "{content}\n\n\
+         ch = Demo.poll\n\
+         spawn do\n\
+         \x20 while ev = ch.receive?\n\
+         \x20   puts ev.kind\n\
+         \x20 end\n\
+         end\n"
+    );
+    let dir = std::env::temp_dir().join(format!("alef_crystal_freestream_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let path = dir.join("demo.cr");
+    std::fs::write(&path, &harness).expect("write source");
+    let output = Command::new("crystal")
+        .arg("build")
+        .arg("--no-codegen")
+        .arg(&path)
+        .output()
+        .expect("run crystal build");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "free stream failed to type-check:\n{harness}\n---\n{stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
