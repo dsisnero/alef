@@ -2309,3 +2309,154 @@ fn plugin_bridge_typechecks() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn plugin_bridge_link_and_run_against_c_oracle() {
+    let have_cc = Command::new("cc").arg("--version").output().is_ok();
+    let have_crystal = Command::new("crystal").arg("--version").output().is_ok();
+    if !have_cc || !have_crystal {
+        eprintln!("skipping: need both `cc` and `crystal`");
+        return;
+    }
+
+    // Generate all binding files (main + plugin bridge) and concatenate them.
+    let files = CrystalBackend
+        .generate_bindings(&plugin_bridge_api(), &plugin_bridge_config())
+        .unwrap();
+    let mut binding = String::new();
+    for f in &files {
+        binding.push_str(&f.content);
+        binding.push_str("\n\n");
+    }
+
+    let dir = std::env::temp_dir().join(format!("alef_crystal_plink_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+
+    // C oracle: a registry that stores the vtable + user_data, plus probes that
+    // invoke the registered plugin's callbacks (simulating Rust calling in).
+    // The StoreVTable layout MUST match the generated `#[repr(C)]` order.
+    let shim = r#"#include <stdint.h>
+#include <stddef.h>
+#include <stdlib.h>
+typedef struct {
+    int32_t (*name_fn)(const void*, char**, char**);
+    int32_t (*version_fn)(const void*, char**, char**);
+    int32_t (*initialize_fn)(const void*, char**);
+    int32_t (*shutdown_fn)(const void*, char**);
+    int32_t (*fetch)(const void*, const char*, char**, char**);
+    void (*free_string)(char*);
+    void (*free_user_data)(void*);
+} StoreVTable;
+static StoreVTable g_vt;
+static const void* g_ud = 0;
+static int g_reg = 0;
+int32_t demo_register_store(const char* name, const StoreVTable* vt, const void* ud, char** out_err) {
+    (void)name; (void)out_err; g_vt = *vt; g_ud = ud; g_reg = 1; return 0;
+}
+int32_t demo_unregister_store(const char* name, char** out_err) { (void)name; (void)out_err; g_reg = 0; return 0; }
+void demo_free_string(char* p) { free(p); }
+static void copy_out(char* out, size_t cap, char* result) {
+    size_t i = 0;
+    if (result) { for (; result[i] && i + 1 < cap; i++) out[i] = result[i]; }
+    out[i] = 0;
+}
+int32_t demo_probe_fetch(const char* key, char* out, size_t cap) {
+    if (!g_reg || !g_vt.fetch) return -1;
+    char* result = 0; char* err = 0;
+    int32_t st = g_vt.fetch(g_ud, key, &result, &err);
+    if (st != 0) { if (err && g_vt.free_string) g_vt.free_string(err); return st; }
+    copy_out(out, cap, result);
+    if (result && g_vt.free_string) g_vt.free_string(result);
+    return 0;
+}
+int32_t demo_probe_name(char* out, size_t cap) {
+    if (!g_reg || !g_vt.name_fn) return -1;
+    char* result = 0; char* err = 0;
+    int32_t st = g_vt.name_fn(g_ud, &result, &err);
+    if (st != 0) return st;
+    copy_out(out, cap, result);
+    if (result && g_vt.free_string) g_vt.free_string(result);
+    return 0;
+}
+"#;
+    std::fs::write(dir.join("shim.c"), shim).expect("write shim.c");
+
+    let lib_file = if cfg!(target_os = "macos") {
+        "libdemo_ffi.dylib"
+    } else {
+        "libdemo_ffi.so"
+    };
+    let mut cc = Command::new("cc");
+    cc.current_dir(&dir);
+    if cfg!(target_os = "macos") {
+        cc.args(["-dynamiclib", "-o", lib_file, "shim.c"]);
+    } else {
+        cc.args(["-shared", "-fPIC", "-o", lib_file, "shim.c"]);
+    }
+    let cc_out = cc.output().expect("run cc");
+    assert!(
+        cc_out.status.success(),
+        "cc failed: {}",
+        String::from_utf8_lossy(&cc_out.stderr)
+    );
+
+    // Program: register a Crystal Store impl, then probe it through the vtable.
+    let program = format!(
+        "{binding}\n\n\
+         lib LibDemo\n\
+         \x20 fun probe_fetch = demo_probe_fetch(key : LibC::Char*, out : LibC::Char*, cap : LibC::SizeT) : Int32\n\
+         \x20 fun probe_name = demo_probe_name(out : LibC::Char*, cap : LibC::SizeT) : Int32\n\
+         end\n\n\
+         class MyStore < Demo::Store\n\
+         \x20 def name : String\n\
+         \x20   \"test-store\"\n\
+         \x20 end\n\
+         \x20 def fetch(key : String) : String\n\
+         \x20   \"value:\" + key\n\
+         \x20 end\n\
+         end\n\n\
+         raise \"register failed\" unless Demo.register_store(\"test\", MyStore.new)\n\
+         buf = Bytes.new(256)\n\
+         st = LibDemo.probe_fetch(\"hello\", buf.to_unsafe.as(LibC::Char*), LibC::SizeT.new(256))\n\
+         raise \"fetch status #{{st}}\" unless st == 0\n\
+         got = String.new(buf.to_unsafe)\n\
+         raise \"fetch got #{{got}}\" unless got == \"value:hello\"\n\
+         nbuf = Bytes.new(64)\n\
+         LibDemo.probe_name(nbuf.to_unsafe.as(LibC::Char*), LibC::SizeT.new(64))\n\
+         raise \"name got #{{String.new(nbuf.to_unsafe)}}\" unless String.new(nbuf.to_unsafe) == \"test-store\"\n\
+         raise \"unregister failed\" unless Demo.unregister_store(\"test\")\n\
+         puts \"OK\"\n"
+    );
+    std::fs::write(dir.join("demo.cr"), &program).expect("write demo.cr");
+
+    let dir_str = dir.to_string_lossy().to_string();
+    let exe = dir.join("plugin_prog");
+    let build = Command::new("crystal")
+        .current_dir(&dir)
+        .args(["build", "demo.cr", "-o"])
+        .arg(&exe)
+        .arg("--link-flags")
+        .arg(format!("-L{dir_str} -Wl,-rpath,{dir_str}"))
+        .output()
+        .expect("run crystal build");
+    assert!(
+        build.status.success(),
+        "crystal build (plugin link) failed:\n--- program ---\n{program}\n--- stderr ---\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .env("DYLD_LIBRARY_PATH", &dir_str)
+        .env("LD_LIBRARY_PATH", &dir_str)
+        .output()
+        .expect("run plugin program");
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        run.status.success() && stdout.trim() == "OK",
+        "plugin program failed: status={:?} stdout={stdout:?} stderr={:?}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
