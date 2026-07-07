@@ -94,3 +94,98 @@ fn generates_runnable_crystal_spec_project() {
 fn language_name_is_crystal() {
     assert_eq!(CrystalE2eCodegen.language_name(), "crystal");
 }
+
+#[test]
+fn emit_test_backend_stub_subclasses_trait_and_registers() {
+    use crate::core::config::TraitBridgeConfig;
+    use crate::core::ir::{MethodDef, ParamDef, ReceiverKind, TypeRef};
+
+    let method = MethodDef {
+        name: "fetch".to_string(),
+        params: vec![ParamDef {
+            name: "key".to_string(),
+            ty: TypeRef::String,
+            optional: false,
+            default: None,
+            sanitized: false,
+            typed_default: None,
+            is_ref: false,
+            is_mut: false,
+            newtype_wrapper: None,
+            original_type: None,
+            map_is_ahash: false,
+            map_key_is_cow: false,
+            vec_inner_is_ref: false,
+            map_is_btree: false,
+            core_wrapper: crate::core::ir::CoreWrapper::None,
+        }],
+        return_type: TypeRef::String,
+        is_async: false,
+        is_static: false,
+        error_type: None,
+        doc: String::new(),
+        receiver: Some(ReceiverKind::Ref),
+        sanitized: false,
+        trait_source: None,
+        returns_ref: false,
+        returns_cow: false,
+        return_newtype_wrapper: None,
+        has_default_impl: false,
+        binding_excluded: false,
+        binding_exclusion_reason: None,
+        version: Default::default(),
+    };
+    let bridge = TraitBridgeConfig {
+        trait_name: "Store".to_string(),
+        super_trait: Some("Plugin".to_string()),
+        register_fn: Some("register_store".to_string()),
+        ..Default::default()
+    };
+    let fixture = Fixture {
+        id: "my_fixture".to_string(),
+        category: None,
+        description: "test".to_string(),
+        tags: vec![],
+        skip: None,
+        env: None,
+        setup: Vec::new(),
+        call: None,
+        input: serde_json::Value::Null,
+        mock_response: None,
+        source: String::new(),
+        http: None,
+        assertions: vec![],
+        visitor: None,
+        args: vec![],
+        assertion_recipes: vec![],
+    };
+    let methods = vec![&method];
+    let em = super::emit_test_backend(&bridge, &methods, &fixture);
+
+    assert!(
+        em.setup_block
+            .contains("class TestStubMyFixture < __ALEF_MODULE__::Store"),
+        "{}",
+        em.setup_block
+    );
+    assert!(
+        em.setup_block.contains("def name : String"),
+        "super-trait name stub: {}",
+        em.setup_block
+    );
+    assert!(
+        em.setup_block.contains("def fetch(key : String) : String"),
+        "method stub: {}",
+        em.setup_block
+    );
+    assert!(
+        em.arg_expr.contains("\"test\", stub_my_fixture"),
+        "arg_expr: {}",
+        em.arg_expr
+    );
+    assert!(
+        em.teardown_block.contains("__ALEF_MODULE__.unregister_store(\"test\")"),
+        "teardown: {}",
+        em.teardown_block
+    );
+}
