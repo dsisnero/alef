@@ -1,5 +1,6 @@
 //! Language-specific binding-generator backends.
 
+pub mod crystal;
 pub mod csharp;
 pub mod dart;
 pub mod extendr;

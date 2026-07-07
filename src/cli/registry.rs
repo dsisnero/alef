@@ -40,6 +40,7 @@ pub fn try_get_backend(lang: Language) -> Option<Box<dyn Backend>> {
         Language::Dart => Box::new(crate::backends::dart::DartBackend),
         Language::Gleam => Box::new(crate::backends::gleam::GleamBackend),
         Language::Zig => Box::new(crate::backends::zig::ZigBackend),
+        Language::Crystal => Box::new(crate::backends::crystal::CrystalBackend),
         Language::Jni => Box::new(crate::backends::jni::JniBackend),
     };
     Some(backend)

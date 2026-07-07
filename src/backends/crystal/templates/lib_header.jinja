@@ -1,0 +1,10 @@
+require "json"
+
+# Low-level binding to the generated C FFI layer ({{ ffi_header }}).
+#
+# Every non-scalar value crosses the C ABI as a NUL-terminated JSON string
+# (`LibC::Char*`); scalars pass by value. Strings returned by the library are
+# owned by Rust and must be released with `{{ ffi_prefix }}_free_string`.
+@[Link(ldflags: "-l{{ ffi_lib_name }}")]
+lib {{ lib_name }}
+  fun free_string = {{ ffi_prefix }}_free_string(ptr : LibC::Char*) : Void
