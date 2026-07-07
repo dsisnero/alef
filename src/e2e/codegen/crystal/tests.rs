@@ -189,3 +189,53 @@ fn emit_test_backend_stub_subclasses_trait_and_registers() {
         em.teardown_block
     );
 }
+
+#[test]
+fn fixture_with_assertions_emits_real_example() {
+    use crate::e2e::fixture::Assertion;
+    let mut fx = fixture("shouts");
+    fx.input = serde_json::json!("hi");
+    fx.assertions = vec![
+        Assertion {
+            assertion_type: "equals".to_string(),
+            field: None,
+            value: Some(serde_json::json!("HELLO")),
+            values: None,
+            method: None,
+            check: None,
+            args: None,
+            return_type: None,
+        },
+        Assertion {
+            assertion_type: "not_empty".to_string(),
+            field: None,
+            value: None,
+            values: None,
+            method: None,
+            check: None,
+            args: None,
+            return_type: None,
+        },
+    ];
+    let groups = vec![FixtureGroup {
+        category: "smoke".to_string(),
+        fixtures: vec![fx],
+    }];
+    let files = CrystalE2eCodegen
+        .generate(&groups, &e2e_config(), &crate_config(), &[], &[])
+        .expect("generate");
+    let spec = file(&files, "spec/smoke_spec.cr").expect("category spec emitted");
+
+    // Real example that calls the configured function with the input arg.
+    assert!(spec.contains("it \"fixture shouts\" do"), "spec: {spec}");
+    assert!(spec.contains("__result = Demo.convert(\"hi\")"), "call site: {spec}");
+    assert!(spec.contains("__result.should eq(\"HELLO\")"), "equals assert: {spec}");
+    assert!(
+        spec.contains("__result.to_s.should_not be_empty"),
+        "not_empty assert: {spec}"
+    );
+    assert!(
+        !spec.contains("pending \"fixture shouts\""),
+        "should not be pending: {spec}"
+    );
+}

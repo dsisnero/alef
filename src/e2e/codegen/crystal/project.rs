@@ -36,10 +36,15 @@ end
     )
 }
 
-/// Render a per-category spec file. Each fixture becomes an `it` example. Until
-/// the full fixture→assertion engine lands, examples are pending placeholders
-/// that document the fixture; the smoke spec guarantees the suite links + runs.
-pub(super) fn render_category_spec(category: &str, fixtures: &[&Fixture], module_name: &str) -> String {
+/// Render a per-category spec file. Fixtures with assertions become real
+/// examples that call the configured function and assert on the result; fixtures
+/// without assertions stay as `pending` placeholders.
+pub(super) fn render_category_spec(
+    category: &str,
+    fixtures: &[&Fixture],
+    module_name: &str,
+    function_name: &str,
+) -> String {
     let mut out = String::from("require \"./spec_helper\"\n\n");
     out.push_str(&format!("describe {module_name} do\n"));
     out.push_str(&format!("  describe {category:?} do\n"));
@@ -49,8 +54,75 @@ pub(super) fn render_category_spec(category: &str, fixtures: &[&Fixture], module
         } else {
             &fixture.description
         };
-        out.push_str(&format!("    pending {desc:?}\n"));
+        if fixture.assertions.is_empty() {
+            out.push_str(&format!("    pending {desc:?}\n"));
+            continue;
+        }
+        out.push_str(&format!("    it {desc:?} do\n"));
+        let args = call_args(&fixture.input);
+        out.push_str(&format!("      __result = {module_name}.{function_name}({args})\n"));
+        for a in &fixture.assertions {
+            out.push_str(&render_assertion(a));
+        }
+        out.push_str("    end\n");
     }
     out.push_str("  end\nend\n");
+    out
+}
+
+/// Build the Crystal call-argument list from a fixture's input. A bare string
+/// input becomes a single positional string arg; anything else is passed as-is
+/// (object/array as JSON via the DTO's `from_json`), and null becomes no args.
+fn call_args(input: &serde_json::Value) -> String {
+    match input {
+        serde_json::Value::Null => String::new(),
+        serde_json::Value::String(s) => crystal_lit(&serde_json::Value::String(s.clone())),
+        other => crystal_lit(other),
+    }
+}
+
+/// Render one assertion as a Crystal `should` expectation on `__result`.
+fn render_assertion(a: &crate::e2e::fixture::Assertion) -> String {
+    match a.assertion_type.as_str() {
+        "equals" => match &a.value {
+            Some(v) => format!("      __result.should eq({})\n", crystal_lit(v)),
+            None => "      # equals assertion missing value\n".to_string(),
+        },
+        "not_empty" => "      __result.to_s.should_not be_empty\n".to_string(),
+        "contains" => match &a.value {
+            Some(serde_json::Value::String(s)) => format!("      __result.to_s.should contain({})\n", string_lit(s)),
+            _ => "      # contains assertion requires a string value\n".to_string(),
+        },
+        other => format!("      # TODO: unsupported assertion `{other}`\n"),
+    }
+}
+
+/// Render a JSON value as a Crystal literal (string/number/bool/null only).
+fn crystal_lit(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => string_lit(s),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::Null => "nil".to_string(),
+        // Arrays/objects are passed as their JSON text for `from_json`-based DTO args.
+        other => string_lit(&other.to_string()),
+    }
+}
+
+/// Render a Crystal double-quoted string literal with minimal escaping.
+fn string_lit(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
     out
 }
