@@ -290,6 +290,13 @@ zig build test"#
             before: None,
             run: Some(StringOrVec::Single(format!("cd {test_apps_dir}/gleam && gleam test"))),
         },
+        Language::Crystal => TestAppRunConfig {
+            precondition: Some(require_tool("crystal")),
+            before: None,
+            run: Some(StringOrVec::Single(format!(
+                "cd {test_apps_dir}/crystal && shards install && crystal spec"
+            ))),
+        },
         Language::R => TestAppRunConfig {
             precondition: Some(require_tool("Rscript")),
             before: None,

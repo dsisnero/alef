@@ -137,7 +137,7 @@ impl ResolvedCrateConfig {
             Language::Swift => self.swift.as_ref().and_then(|c| c.run_wrapper.as_deref()),
             Language::Gleam => self.gleam.as_ref().and_then(|c| c.run_wrapper.as_deref()),
             Language::Zig => self.zig.as_ref().and_then(|c| c.run_wrapper.as_deref()),
-            Language::Ffi | Language::Rust | Language::C | Language::Jni => None,
+            Language::Ffi | Language::Rust | Language::C | Language::Jni | Language::Crystal => None,
         }
     }
 
@@ -188,7 +188,7 @@ impl ResolvedCrateConfig {
                 .map(|c| c.extra_lint_paths.as_slice())
                 .unwrap_or(&[]),
             Language::Zig => self.zig.as_ref().map(|c| c.extra_lint_paths.as_slice()).unwrap_or(&[]),
-            Language::Ffi | Language::Rust | Language::C | Language::Jni => &[],
+            Language::Ffi | Language::Rust | Language::C | Language::Jni | Language::Crystal => &[],
         }
     }
 
@@ -382,7 +382,7 @@ impl ResolvedCrateConfig {
             Language::Dart => self.dart.as_ref().and_then(|c| c.features.as_deref()),
             Language::Swift => self.swift.as_ref().and_then(|c| c.features.as_deref()),
             Language::Gleam => self.gleam.as_ref().and_then(|c| c.features.as_deref()),
-            Language::Rust | Language::C | Language::Jni => None,
+            Language::Rust | Language::C | Language::Jni | Language::Crystal => None,
         };
         override_features.unwrap_or(&self.features)
     }

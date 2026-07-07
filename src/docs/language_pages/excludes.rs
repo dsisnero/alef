@@ -36,7 +36,7 @@ pub(super) fn language_excludes(config: &ResolvedCrateConfig, lang: Language) ->
                 extend_excludes(&mut functions, &mut types, &c.exclude_functions, &c.exclude_types);
             }
         }
-        Language::Ffi | Language::C => {
+        Language::Ffi | Language::C | Language::Crystal => {
             if let Some(c) = &config.ffi {
                 extend_excludes(&mut functions, &mut types, &c.exclude_functions, &c.exclude_types);
             }

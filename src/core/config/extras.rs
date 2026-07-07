@@ -23,6 +23,9 @@ pub enum Language {
     Dart,
     Gleam,
     Zig,
+    /// Crystal binding over the C FFI layer. Ruby-style naming, Rust-like
+    /// generics, Go/Crystal fiber+channel concurrency for async/streaming.
+    Crystal,
     /// C consumer of the FFI layer — e2e test target, not a generated binding.
     C,
     /// Rust JNI shim crate emitter — paired with kotlin-android.
@@ -52,6 +55,7 @@ impl std::fmt::Display for Language {
             Self::Dart => write!(f, "dart"),
             Self::Gleam => write!(f, "gleam"),
             Self::Zig => write!(f, "zig"),
+            Self::Crystal => write!(f, "crystal"),
             Self::C => write!(f, "c"),
             Self::Jni => write!(f, "jni"),
         }
@@ -156,6 +160,7 @@ pub fn is_known_language(lang_str: &str) -> bool {
             | "dart"
             | "gleam"
             | "zig"
+            | "crystal"
             | "c"
             | "jni"
     )
@@ -212,6 +217,7 @@ mod tests {
             "dart",
             "gleam",
             "zig",
+            "crystal",
             "c",
             "jni",
         ] {

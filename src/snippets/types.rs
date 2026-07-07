@@ -7,6 +7,7 @@ use std::path::PathBuf;
 pub enum Language {
     Bash,
     C,
+    Crystal,
     Csharp,
     Dart,
     Docker,
@@ -38,6 +39,7 @@ impl Language {
         match tag.trim().to_lowercase().as_str() {
             "bash" | "sh" | "shell" | "zsh" | "console" => Self::Bash,
             "c" => Self::C,
+            "crystal" | "cr" => Self::Crystal,
             "csharp" | "c#" | "cs" => Self::Csharp,
             "dart" => Self::Dart,
             "docker" | "dockerfile" => Self::Docker,
@@ -69,6 +71,7 @@ impl Language {
         match ext.to_lowercase().as_str() {
             "sh" | "bash" => Self::Bash,
             "c" | "h" => Self::C,
+            "cr" => Self::Crystal,
             "cs" => Self::Csharp,
             "dart" => Self::Dart,
             "dockerfile" => Self::Docker,
@@ -96,6 +99,7 @@ impl Language {
             "bash" | "shell" => Self::Bash,
             "c" => Self::C,
             "csharp" | "c-sharp" | "dotnet" => Self::Csharp,
+            "crystal" => Self::Crystal,
             "dart" => Self::Dart,
             "docker" => Self::Docker,
             "elixir" => Self::Elixir,
@@ -122,6 +126,7 @@ impl fmt::Display for Language {
         match self {
             Self::Bash => write!(f, "bash"),
             Self::C => write!(f, "c"),
+            Self::Crystal => write!(f, "crystal"),
             Self::Csharp => write!(f, "csharp"),
             Self::Dart => write!(f, "dart"),
             Self::Docker => write!(f, "docker"),

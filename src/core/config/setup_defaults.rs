@@ -221,6 +221,13 @@ pub(crate) fn default_setup_config(lang: Language, output_dir: &str, ctx: &LangC
             timeout_seconds: 1800,
             workdir: default_setup_workdir(lang),
         },
+        Language::Crystal => SetupConfig {
+            precondition: Some(require_tool("shards")),
+            before: None,
+            install: Some(StringOrVec::Single(format!("cd {output_dir} && shards install"))),
+            timeout_seconds: 1800,
+            workdir: default_setup_workdir(lang),
+        },
     }
 }
 

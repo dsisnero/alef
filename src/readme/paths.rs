@@ -75,6 +75,7 @@ pub(super) fn lang_dir_name(lang: Language) -> &'static str {
         Language::Dart => "dart",
         Language::Gleam => "gleam",
         Language::Zig => "zig",
+        Language::Crystal => "crystal",
         Language::C | Language::Jni => "c",
     }
 }
@@ -100,6 +101,7 @@ pub(super) fn lang_code(lang: Language) -> &'static str {
         Language::Dart => "dart",
         Language::Gleam => "gleam",
         Language::Zig => "zig",
+        Language::Crystal => "crystal",
         Language::C | Language::Jni => "c",
     }
 }

@@ -297,6 +297,20 @@ pub fn default_lint_config(lang: Language, output_dir: &str, ctx: &LangContext) 
                 typecheck: None,
             }
         }
+        Language::Crystal => {
+            let format_cmd = wrap(format!("cd {output_dir} && crystal tool format"), ctx.run_wrapper);
+            let check_cmd = wrap(
+                format!("cd {output_dir} && crystal tool format --check"),
+                ctx.run_wrapper,
+            );
+            LintConfig {
+                precondition: Some(require_tool("crystal")),
+                before: None,
+                format: Some(StringOrVec::Single(format_cmd)),
+                check: Some(StringOrVec::Single(check_cmd)),
+                typecheck: None,
+            }
+        }
         Language::C => LintConfig {
             precondition: None,
             before: None,

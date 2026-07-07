@@ -220,6 +220,7 @@ fn streaming_return_type(
         Language::Dart => format!("Stream<{item}>"),
         Language::Ffi | Language::C | Language::Jni => streaming_c_handle_type(adapter, type_name_str, ffi_prefix),
         Language::Zig => streaming_zig_return_type_placeholder(item_type, ffi_prefix),
+        Language::Crystal => format!("Channel({item})"),
         Language::R | Language::Gleam => item,
     }
 }
@@ -341,6 +342,9 @@ fn streaming_example(
         Language::Zig => format!(
             "var stream = try instance.{method_name}(\"{{}}\");\ndefer stream.deinit();\nwhile (try stream.next()) |chunk| {{\n    _ = chunk;\n}}"
         ),
+        Language::Crystal => {
+            format!("stream = instance.{method_name}({req_value})\nwhile chunk = stream.receive?\n  puts chunk\nend")
+        }
         Language::R | Language::Gleam => {
             format!("stream <- instance.{method_name}({req_value})\n# Iterate over {item} chunks.")
         }
@@ -362,6 +366,7 @@ fn streaming_request_sample(method: &MethodDef, lang: Language, ffi_prefix: &str
                     format!("new {ty}()")
                 }
                 Language::Ruby => format!("{ty}.new"),
+                Language::Crystal => format!("{ty}.new"),
                 Language::Go => format!("{ty}{{}}"),
                 Language::Rust => format!("{ty}::default()"),
                 Language::Zig => "\"{}\"".to_string(),

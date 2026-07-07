@@ -53,6 +53,7 @@ impl CustomModulesConfig {
             | Language::Gleam
             | Language::Zig
             | Language::Jni
+            | Language::Crystal
             | Language::C => &[],
         }
     }

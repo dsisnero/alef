@@ -259,6 +259,16 @@ pub(crate) fn default_test_config(lang: Language, output_dir: &str, ctx: &LangCo
                 coverage: Some(StringOrVec::Single(cmd)),
             }
         }
+        Language::Crystal => {
+            let cmd = wrap(format!("cd {output_dir} && crystal spec"), ctx.run_wrapper);
+            TestConfig {
+                precondition: Some(require_tool("crystal")),
+                before: None,
+                command: Some(StringOrVec::Single(cmd.clone())),
+                e2e: None,
+                coverage: Some(StringOrVec::Single(cmd)),
+            }
+        }
         Language::Jni => TestConfig {
             precondition: None,
             before: None,

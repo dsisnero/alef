@@ -204,6 +204,18 @@ pub(crate) fn default_build_config(
                 ctx.run_wrapper,
             ))),
         },
+        Language::Crystal => BuildCommandConfig {
+            precondition: Some(require_tool("shards")),
+            before: None,
+            build: Some(StringOrVec::Single(wrap(
+                format!("cd {output_dir} && shards build"),
+                ctx.run_wrapper,
+            ))),
+            build_release: Some(StringOrVec::Single(wrap(
+                format!("cd {output_dir} && shards build --release"),
+                ctx.run_wrapper,
+            ))),
+        },
         Language::C => BuildCommandConfig {
             precondition: None,
             before: None,

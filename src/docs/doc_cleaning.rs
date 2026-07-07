@@ -391,7 +391,7 @@ pub(crate) fn replace_rust_terminology(doc: &str, lang: Language) -> String {
 
     // Replace `None` backtick references with the language-idiomatic null
     let none_replacement = match lang {
-        Language::Go | Language::Ruby | Language::Elixir => "`nil`",
+        Language::Go | Language::Ruby | Language::Elixir | Language::Crystal => "`nil`",
         Language::Java | Language::Node | Language::Wasm | Language::Csharp | Language::Php => "`null`",
         Language::Python | Language::Rust => "`None`", // keep as-is for Python and Rust
         Language::R | Language::Ffi | Language::C | Language::Jni => "`NULL`",
@@ -529,6 +529,7 @@ fn language_list_of_type(lang: Language, inner: &str) -> String {
             Language::Swift => "Array".to_string(),
             Language::Gleam => "List".to_string(),
             Language::Zig => "slice".to_string(),
+            Language::Crystal => "Array".to_string(),
             Language::Rust => "Vec<_>".to_string(),
         };
     }
@@ -546,6 +547,7 @@ fn language_list_of_type(lang: Language, inner: &str) -> String {
         Language::Swift => format!("[{inner}]"),
         Language::Gleam => format!("List({inner})"),
         Language::Zig => format!("[]const {inner}"),
+        Language::Crystal => format!("Array({inner})"),
         Language::Rust => format!("Vec<{inner}>"),
     }
 }
@@ -583,6 +585,7 @@ fn language_string_list_type(lang: Language) -> &'static str {
         Language::Swift => "[String]",
         Language::Gleam => "List(String)",
         Language::Zig => "[]const []const u8",
+        Language::Crystal => "Array(String)",
         Language::Rust => "Vec<String>",
     }
 }
@@ -603,6 +606,7 @@ fn language_nested_string_list_type(lang: Language) -> &'static str {
         Language::Swift => "[[String]]",
         Language::Gleam => "List(List(String))",
         Language::Zig => "[]const []const []const u8",
+        Language::Crystal => "Array(Array(String))",
         Language::Rust => "Vec<Vec<String>>",
     }
 }
@@ -624,6 +628,7 @@ fn language_string_map_type(lang: Language) -> &'static str {
         Language::Dart => "Map<String, String>",
         Language::Gleam => "Dict(String, String)",
         Language::Zig => "std.StringHashMap([]const u8)",
+        Language::Crystal => "Hash(String, String)",
         Language::Rust => "BTreeMap<String, String>",
     }
 }
@@ -645,6 +650,7 @@ fn language_bytes_type(lang: Language) -> &'static str {
         Language::Dart => "Uint8List",
         Language::Gleam => "BitArray",
         Language::Zig => "[]const u8",
+        Language::Crystal => "Bytes",
         Language::Rust => "Vec<u8>",
     }
 }

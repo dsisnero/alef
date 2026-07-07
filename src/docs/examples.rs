@@ -239,7 +239,7 @@ fn render_call_statement(
                 format!("{awaited};")
             }
         }
-        Language::Ruby => {
+        Language::Ruby | Language::Crystal => {
             if returns_value {
                 format!("result = {call}")
             } else {
@@ -403,7 +403,7 @@ fn sample_bytes_value(lang: Language) -> String {
         Language::Go => "[]byte(\"data\")".to_string(),
         Language::Java => "\"data\".getBytes()".to_string(),
         Language::Csharp => "System.Text.Encoding.UTF8.GetBytes(\"data\")".to_string(),
-        Language::Ruby | Language::Php => "\"data\"".to_string(),
+        Language::Ruby | Language::Php | Language::Crystal => "\"data\"".to_string(),
         Language::Elixir => "<<100, 97, 116, 97>>".to_string(),
         Language::R => "charToRaw(\"data\")".to_string(),
         Language::Rust => "b\"data\"".to_string(),
@@ -442,6 +442,7 @@ fn sample_named_value(name: &str, lang: Language, ffi_prefix: &str) -> String {
         Language::Ffi | Language::C | Language::Jni => "NULL".to_string(),
         Language::Gleam => "todo".to_string(),
         Language::Zig => ".{}".to_string(),
+        Language::Crystal => format!("{ty}.new"),
     }
 }
 
@@ -459,7 +460,7 @@ fn sample_duration_value(lang: Language) -> String {
         Language::Kotlin | Language::KotlinAndroid => "1.seconds".to_string(),
         Language::Swift => ".seconds(1)".to_string(),
         Language::Dart => "Duration(seconds: 1)".to_string(),
-        Language::Gleam | Language::Zig => "1000".to_string(),
+        Language::Gleam | Language::Zig | Language::Crystal => "1000".to_string(),
     }
 }
 
@@ -494,6 +495,7 @@ fn empty_map_literal(lang: Language) -> String {
         Language::Dart => "{}".to_string(),
         Language::Gleam => "dict.new()".to_string(),
         Language::Zig => ".{}".to_string(),
+        Language::Crystal => "{}".to_string(),
     }
 }
 

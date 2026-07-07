@@ -134,6 +134,7 @@ impl RustTarget {
             | Language::Dart
             | Language::Gleam
             | Language::C
+            | Language::Crystal
             | Language::Jni => self.triple.clone(),
         }
     }

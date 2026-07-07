@@ -21,6 +21,7 @@ pub(crate) fn lang_display_name(lang: Language) -> &'static str {
         Language::Dart => "Dart",
         Language::Gleam => "Gleam",
         Language::Zig => "Zig",
+        Language::Crystal => "Crystal",
     }
 }
 
@@ -45,6 +46,7 @@ pub(crate) fn lang_slug(lang: Language) -> &'static str {
         Language::Dart => "dart",
         Language::Gleam => "gleam",
         Language::Zig => "zig",
+        Language::Crystal => "crystal",
     }
 }
 
@@ -67,6 +69,7 @@ pub(crate) fn lang_code_fence(lang: Language) -> &'static str {
         Language::Dart => "dart",
         Language::Gleam => "gleam",
         Language::Zig => "zig",
+        Language::Crystal => "crystal",
     }
 }
 
@@ -91,7 +94,8 @@ pub(crate) fn type_name(name: &str, lang: Language, ffi_prefix: &str) -> String 
         | Language::Swift
         | Language::Dart
         | Language::Gleam
-        | Language::Zig => short.to_pascal_case(),
+        | Language::Zig
+        | Language::Crystal => short.to_pascal_case(),
         Language::Ffi | Language::C | Language::Jni => {
             // C: prefix with configured FFI prefix (PascalCase) and PascalCase type name
             format!("{}{}", ffi_prefix, short.to_pascal_case())
@@ -103,6 +107,7 @@ pub(crate) fn type_name(name: &str, lang: Language, ffi_prefix: &str) -> String 
 pub(crate) fn func_name(name: &str, lang: Language, ffi_prefix: &str) -> String {
     let base = match lang {
         Language::Python | Language::Ruby | Language::Elixir | Language::R | Language::Rust => name.to_snake_case(),
+        Language::Crystal => name.to_snake_case(),
         Language::Node | Language::Wasm | Language::Java | Language::Php => to_camel_case(name),
         Language::Csharp | Language::Go => name.to_pascal_case(),
         Language::Ffi | Language::C | Language::Jni => {
@@ -133,6 +138,7 @@ pub(crate) fn field_name(name: &str, lang: Language) -> String {
         | Language::Ffi
         | Language::Rust
         | Language::C
+        | Language::Crystal
         | Language::Jni => name.to_snake_case(),
         // Go and C# exported fields/properties are PascalCase
         Language::Go | Language::Csharp => name.to_pascal_case(),
@@ -181,6 +187,7 @@ pub(crate) fn enum_variant_name(name: &str, lang: Language, ffi_prefix: &str) ->
         | Language::Swift
         | Language::Dart
         | Language::Gleam
+        | Language::Crystal
         | Language::Zig => name.to_pascal_case(),
         Language::R => name.to_snake_case(),
         // Rust: PascalCase enum variants

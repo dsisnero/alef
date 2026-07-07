@@ -112,6 +112,14 @@ pub(crate) fn default_clean_config(lang: Language, output_dir: &str, _ctx: &Lang
             before: None,
             clean: Some(StringOrVec::Single("rm -rf build".to_string())),
         },
+        Language::Crystal => CleanConfig {
+            // Pure shell `rm` — shards installs into `lib/`, builds into `bin/`.
+            precondition: None,
+            before: None,
+            clean: Some(StringOrVec::Single(format!(
+                "cd {output_dir} && rm -rf lib bin .shards"
+            ))),
+        },
         Language::C => CleanConfig {
             precondition: None,
             before: None,

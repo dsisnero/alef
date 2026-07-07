@@ -11,6 +11,7 @@ pub(crate) fn render_function_signature(func: &FunctionDef, lang: Language, ffi_
         Language::Go => render_go_fn_sig(func, ffi_prefix),
         Language::Java => render_java_fn_sig(func, ffi_prefix),
         Language::Ruby => render_ruby_fn_sig(func),
+        Language::Crystal => render_crystal_fn_sig(func, ffi_prefix),
         Language::Ffi | Language::C | Language::Jni => render_c_fn_sig(func, ffi_prefix),
         Language::Php => render_php_fn_sig(func, ffi_prefix),
         Language::Elixir => render_elixir_fn_sig(func),
@@ -128,6 +129,29 @@ pub(crate) fn render_ruby_fn_sig(func: &FunctionDef) -> String {
         })
         .collect();
     format!("def self.{}({})", name, params.join(", "))
+}
+
+pub(crate) fn render_crystal_fn_sig(func: &FunctionDef, ffi_prefix: &str) -> String {
+    let name = func.name.to_snake_case();
+    let params: Vec<String> = func
+        .params
+        .iter()
+        .map(|p| {
+            let pname = p.name.to_snake_case();
+            let pty = doc_type(&p.ty, Language::Crystal, ffi_prefix);
+            if p.optional {
+                format!("{pname} : {pty}? = nil")
+            } else {
+                format!("{pname} : {pty}")
+            }
+        })
+        .collect();
+    let ret = doc_type(&func.return_type, Language::Crystal, ffi_prefix);
+    if ret == "Nil" {
+        format!("def self.{}({})", name, params.join(", "))
+    } else {
+        format!("def self.{}({}) : {}", name, params.join(", "), ret)
+    }
 }
 
 pub(crate) fn render_c_fn_sig(func: &FunctionDef, ffi_prefix: &str) -> String {
@@ -465,6 +489,31 @@ pub(crate) fn render_method_signature_with_override(
                 format!("def self.{}({})", name, params.join(", "))
             } else {
                 format!("def {}({})", name, params.join(", "))
+            }
+        }
+        Language::Crystal => {
+            let params: Vec<String> = method
+                .params
+                .iter()
+                .map(|p| {
+                    let pname = p.name.to_snake_case();
+                    let pty = doc_type(&p.ty, lang, ffi_prefix);
+                    if p.optional {
+                        format!("{pname} : {pty}? = nil")
+                    } else {
+                        format!("{pname} : {pty}")
+                    }
+                })
+                .collect();
+            let ret_part = if ret == "Nil" {
+                String::new()
+            } else {
+                format!(" : {ret}")
+            };
+            if method.is_static {
+                format!("def self.{name}({}){ret_part}", params.join(", "))
+            } else {
+                format!("def {name}({}){ret_part}", params.join(", "))
             }
         }
         Language::Go => {

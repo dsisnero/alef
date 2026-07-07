@@ -215,6 +215,7 @@ fn output_path_for(lang: Language, config: &ResolvedCrateConfig) -> Option<&Path
         | Language::Swift
         | Language::Dart
         | Language::Gleam
+        | Language::Crystal
         | Language::Zig => None,
     }
 }

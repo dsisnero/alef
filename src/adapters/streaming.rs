@@ -32,7 +32,12 @@ pub fn generate_body(
             anyhow::bail!("Rust/C/JNI do not need generated binding adapters")
         }
         Language::Dart => Ok(gen_dart_body(adapter, config)),
-        Language::Kotlin | Language::KotlinAndroid | Language::Swift | Language::Gleam | Language::Zig => {
+        Language::Kotlin
+        | Language::KotlinAndroid
+        | Language::Swift
+        | Language::Gleam
+        | Language::Crystal
+        | Language::Zig => {
             anyhow::bail!("Phase 1: {language} backend not yet implemented")
         }
     }

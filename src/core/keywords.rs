@@ -679,6 +679,65 @@ pub const ZIG_KEYWORDS: &[&str] = &[
     "while",
 ];
 
+/// Crystal reserved keywords.
+///
+/// Crystal shares Ruby's surface syntax; this list covers Crystal's reserved
+/// words that cannot be used as bare method, field, or parameter identifiers.
+pub const CRYSTAL_KEYWORDS: &[&str] = &[
+    "abstract",
+    "alias",
+    "annotation",
+    "as",
+    "asm",
+    "begin",
+    "break",
+    "case",
+    "class",
+    "def",
+    "do",
+    "else",
+    "elsif",
+    "end",
+    "ensure",
+    "enum",
+    "extend",
+    "false",
+    "for",
+    "fun",
+    "if",
+    "in",
+    "include",
+    "lib",
+    "macro",
+    "module",
+    "next",
+    "nil",
+    "of",
+    "out",
+    "private",
+    "protected",
+    "require",
+    "rescue",
+    "return",
+    "select",
+    "self",
+    "sizeof",
+    "struct",
+    "super",
+    "then",
+    "true",
+    "type",
+    "typeof",
+    "uninitialized",
+    "union",
+    "unless",
+    "until",
+    "when",
+    "while",
+    "with",
+    "yield",
+];
+
 /// Rust reserved keywords (strict, reserved, and weak keywords from all editions).
 ///
 /// This list covers every identifier that cannot be used as a bare identifier in Rust
@@ -890,6 +949,37 @@ pub fn zig_ident(name: &str) -> String {
         sanitized.insert(0, '_');
     }
     zig_safe_name(&sanitized).unwrap_or(sanitized)
+}
+
+/// Returns `Some(escaped_name)` if `name` is a Crystal reserved keyword, else `None`.
+pub fn crystal_safe_name(name: &str) -> Option<String> {
+    if CRYSTAL_KEYWORDS.contains(&name) {
+        Some(format!("{name}_"))
+    } else {
+        None
+    }
+}
+
+/// Convenience: always returns a usable Crystal identifier.
+///
+/// Sanitizes the input so that it is a valid Crystal identifier:
+///   1. Non-`[A-Za-z0-9_]` characters are replaced with `_`.
+///   2. A leading digit is prefixed with `_`.
+///   3. The result is checked against Crystal's reserved-word list and escaped
+///      with a trailing `_` if necessary.
+pub fn crystal_ident(name: &str) -> String {
+    let mut sanitized = String::with_capacity(name.len() + 1);
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            sanitized.push(ch);
+        } else {
+            sanitized.push('_');
+        }
+    }
+    if sanitized.chars().next().is_some_and(|ch| ch.is_ascii_digit()) {
+        sanitized.insert(0, '_');
+    }
+    crystal_safe_name(&sanitized).unwrap_or(sanitized)
 }
 
 #[cfg(test)]

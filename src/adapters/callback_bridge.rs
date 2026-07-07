@@ -30,6 +30,7 @@ pub fn generate(
         | Language::Swift
         | Language::Dart
         | Language::Gleam
+        | Language::Crystal
         | Language::Zig => {
             anyhow::bail!("Phase 1: {language} backend not yet implemented")
         }

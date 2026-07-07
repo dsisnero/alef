@@ -307,6 +307,7 @@ fn public_member_name(lang: Language, name: &str) -> String {
         Language::Python | Language::Ruby | Language::Elixir | Language::Ffi | Language::R | Language::Rust => {
             name.to_snake_case()
         }
+        Language::Crystal => name.to_snake_case(),
         Language::Go => to_go_name(name),
         Language::Csharp => to_csharp_name(name),
         Language::Node
@@ -349,6 +350,7 @@ fn public_type_name(lang: Language, name: &str) -> String {
         | Language::R
         | Language::Rust
         | Language::C
+        | Language::Crystal
         | Language::Jni => name.to_pascal_case(),
     }
 }
@@ -367,6 +369,7 @@ fn public_enum_variant_name(lang: Language, name: &str) -> String {
         | Language::KotlinAndroid
         | Language::Swift
         | Language::Dart
+        | Language::Crystal
         | Language::Jni => name.to_pascal_case(),
     }
 }
@@ -473,6 +476,7 @@ fn is_reserved_keyword(lang: Language, name: &str) -> bool {
         Language::Dart => crate::core::keywords::DART_KEYWORDS.contains(&name),
         Language::Gleam => crate::core::keywords::GLEAM_KEYWORDS.contains(&name),
         Language::Zig => crate::core::keywords::ZIG_KEYWORDS.contains(&name),
+        Language::Crystal => crate::core::keywords::CRYSTAL_KEYWORDS.contains(&name),
         Language::Rust => crate::core::keywords::RUST_KEYWORDS.contains(&name),
         Language::Ffi | Language::C => false,
     }

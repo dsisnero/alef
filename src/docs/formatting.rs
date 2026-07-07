@@ -51,6 +51,7 @@ pub(crate) fn format_field_default(field: &FieldDef, lang: Language, api: &ApiSu
             | Language::Dart
             | Language::Gleam
             | Language::Zig => "`null`".to_string(),
+            Language::Crystal => "`nil`".to_string(),
         };
     }
     "—".to_string()
@@ -176,11 +177,12 @@ pub(crate) fn format_typed_default(
                     | Language::Dart
                     | Language::Gleam
                     | Language::Zig => "`[]`".to_string(),
+                    Language::Crystal => "`[]`".to_string(),
                 };
             }
             if matches!(inner_ty, TypeRef::Map(_, _)) {
                 return match lang {
-                    Language::Python | Language::Ruby | Language::Php => "`{}`".to_string(),
+                    Language::Python | Language::Ruby | Language::Php | Language::Crystal => "`{}`".to_string(),
                     Language::Node | Language::Wasm => "`{}`".to_string(),
                     Language::Go => "`nil`".to_string(),
                     Language::Elixir => "`%{}`".to_string(),
@@ -227,6 +229,7 @@ pub(crate) fn format_typed_default(
                 | Language::Dart
                 | Language::Gleam
                 | Language::Zig => "`null`".to_string(),
+                Language::Crystal => "`nil`".to_string(),
             }
         }
         DefaultValue::None => {
@@ -251,6 +254,7 @@ pub(crate) fn format_typed_default(
                 | Language::Dart
                 | Language::Gleam
                 | Language::Zig => "`null`".to_string(),
+                Language::Crystal => "`nil`".to_string(),
             }
         }
     }
@@ -269,6 +273,7 @@ pub(crate) fn format_enum_variant_ref(enum_type: &str, variant: &str, lang: Lang
         Language::Elixir => format!(":{variant}"),
         Language::R => format!("\"{variant}\""),
         Language::Rust => format!("{enum_type}::{variant}"),
+        Language::Crystal => format!("{enum_type}::{variant}"),
         Language::Ffi | Language::C | Language::Jni => format!(
             "{}_{}",
             ffi_prefix.to_shouty_snake_case(),
@@ -304,7 +309,7 @@ pub(crate) fn format_error_phrase(error_type: &str, lang: Language) -> String {
             format!("Throws `{ename}`.")
         }
         Language::Node | Language::Wasm => "Throws `Error` with a descriptive message.".to_string(),
-        Language::Ruby => {
+        Language::Ruby | Language::Crystal => {
             let ename = short.to_pascal_case();
             format!("Raises `{ename}`.")
         }
@@ -347,6 +352,7 @@ pub(crate) fn doc_type_with_optional(ty: &TypeRef, lang: Language, optional: boo
             Language::Java => format!("Optional<{}>", java_boxed_type(ty)),
             Language::Csharp => format!("{inner}?"),
             Language::Ruby => format!("{inner}?"),
+            Language::Crystal => format!("{inner}?"),
             Language::Php => format!("?{inner}"),
             Language::Elixir => format!("{inner} | nil"),
             Language::R => format!("{inner} or NULL"),

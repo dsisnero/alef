@@ -219,6 +219,12 @@ pub fn default_update_config(lang: Language, output_dir: &str, ctx: &LangContext
             update: Some(StringOrVec::Single(format!("cd {output_dir} && gleam deps update"))),
             upgrade: Some(StringOrVec::Single(format!("cd {output_dir} && gleam deps update"))),
         },
+        Language::Crystal => UpdateConfig {
+            precondition: Some(require_tool("shards")),
+            before: None,
+            update: Some(StringOrVec::Single(format!("cd {output_dir} && shards update"))),
+            upgrade: Some(StringOrVec::Single(format!("cd {output_dir} && shards update"))),
+        },
         Language::Jni => UpdateConfig {
             precondition: None,
             before: None,

@@ -258,6 +258,12 @@ pub(super) fn generate_readme_hardcoded(
                 "gleam",
             )
         }
+        Language::Crystal => (
+            "Crystal",
+            format!("Add to `shard.yml`:\n\n```yaml\ndependencies:\n  {name}:\n    github: <owner>/<repo>\n```"),
+            example_pointer.clone(),
+            "crystal",
+        ),
         Language::C | Language::Jni | Language::Zig => {
             let module = config.zig_module_name();
             (
