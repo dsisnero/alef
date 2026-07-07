@@ -1,0 +1,74 @@
+---
+source: tests/backends_crystal_snapshot_test.rs
+expression: "&visitor.content"
+---
+# Visitor trait bridge for `Renderer` — a Crystal object implementing the Rust
+# `Renderer` trait across the C ABI. Layout mirrors the FFI visitor vtable.
+require "json"
+
+lib LibDemo
+  struct RendererContext
+    depth : Int32
+    tag_name : LibC::Char*
+  end
+
+  alias RendererVisitorHandle = Void*
+
+  struct RendererVisitorCallbacks
+    user_data : Void*
+    visit_text : (RendererContext*, Void*, LibC::Char*, LibC::Char**, LibC::SizeT*) -> Int32
+  end
+
+  fun renderer_visitor_create = demo_visitor_create(callbacks : RendererVisitorCallbacks*) : RendererVisitorHandle
+  fun renderer_visitor_free = demo_visitor_free(handle : RendererVisitorHandle) : Void
+  fun renderer_options_set_visitor = demo_options_set_visitor_handle(options : Void*, handle : RendererVisitorHandle) : Void
+end
+
+module Demo
+
+  # Decoded visitor context passed to each callback.
+  struct RendererVisitorContext
+    getter depth : Int32
+    getter tag_name : String
+    def initialize(@depth, @tag_name)
+    end
+  end
+
+  # Subclass and override the methods you care about; each defaults to
+  # `WalkDecision::Continue`.
+  abstract class RendererVisitor
+    # Visit a text node.
+    def visit_text(ctx : RendererVisitorContext, text : String) : WalkDecision
+      WalkDecision::Continue
+    end
+  end
+
+  # Register a Crystal visitor and return an opaque handle. Attach it to a
+  # conversion via `LibDemo.renderer_options_set_visitor(opts, handle)`,
+  # run the conversion, then release it with `free_renderer_visitor`.
+  def self.register_renderer_visitor(impl : RendererVisitor) : LibDemo::RendererVisitorHandle
+    boxed = Box.box(impl)
+    callbacks = LibDemo::RendererVisitorCallbacks.new
+    callbacks.user_data = boxed
+    callbacks.visit_text = ->(ctx : LibDemo::RendererContext*, user_data : Void*, text : LibC::Char*, out_custom : LibC::Char**, out_len : LibC::SizeT*) do
+      visitor = Box(RendererVisitor).unbox(user_data)
+      raw = ctx.value
+      context = RendererVisitorContext.new(raw.depth, String.new(raw.tag_name))
+      text_value = String.new(text)
+      decision = visitor.visit_text(context, text_value)
+      case decision
+      when WalkDecision::Continue then 0
+      when WalkDecision::SkipChildren then 1
+      when WalkDecision::Stop then 2
+      else 0
+      end
+    end
+    LibDemo.renderer_visitor_create(pointerof(callbacks))
+  end
+
+  # Release a visitor handle returned by `register_renderer_visitor`.
+  def self.free_renderer_visitor(handle : LibDemo::RendererVisitorHandle) : Nil
+    LibDemo.renderer_visitor_free(handle)
+    nil
+  end
+end
