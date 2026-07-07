@@ -48,7 +48,7 @@ module Demo
 
   # Process input and return a result.
   def self.process(input : String, count : UInt32) : String
-    __ptr = LibDemo.process(input.to_json, count)
+    __ptr = LibDemo.process(input, count)
     raise "LibDemo.process returned a null pointer" if __ptr.null?
     __json = String.new(__ptr)
     LibDemo.free_string(__ptr)

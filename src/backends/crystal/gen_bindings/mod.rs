@@ -365,11 +365,7 @@ impl CrystalBackend {
         let mut start_args: Vec<String> = receiver.map(|r| r.to_string()).into_iter().collect();
         for (n, ty) in &spec.params {
             let pn = public_host_identifier(Language::Crystal, PublicIdentifierKind::Parameter, n);
-            if is_scalar(ty) {
-                start_args.push(pn);
-            } else {
-                start_args.push(format!("{pn}.to_json"));
-            }
+            start_args.push(marshal_value(&pn, ty, &HashSet::new()));
         }
         let mut b = String::new();
         b.push_str(&format!("\n    # Stream of `{item}` items over a fiber-fed channel.\n"));
@@ -1055,15 +1051,27 @@ fn is_scalar(ty: &TypeRef) -> bool {
 }
 
 /// The Crystal expression passing a parameter across the C ABI: scalars pass
-/// through, opaque handles pass their pointer, everything else is JSON-encoded.
+/// through by value, opaque handles pass their pointer, string-ish values pass
+/// the raw C string (the FFI expects raw `char*`, not JSON), and only structured
+/// values (Named/Vec/Map/Json) are JSON-encoded.
 fn marshal_call_arg(p: &crate::core::ir::ParamDef, opaque: &HashSet<String>) -> String {
     let name = public_host_identifier(Language::Crystal, PublicIdentifierKind::Parameter, &p.name);
-    if is_scalar(&p.ty) {
-        name
-    } else if is_opaque_named(&p.ty, opaque) {
+    marshal_value(&name, &p.ty, opaque)
+}
+
+/// Marshal a named value of a given type into its C-ABI call expression.
+fn marshal_value(name: &str, ty: &TypeRef, opaque: &HashSet<String>) -> String {
+    if is_scalar(ty) {
+        name.to_string()
+    } else if is_opaque_named(ty, opaque) {
         format!("{name}.to_unsafe")
     } else {
-        format!("{name}.to_json")
+        match ty {
+            // The FFI receives string params as raw `char*` (Crystal auto-converts
+            // a String to a NUL-terminated pointer); JSON-encoding would double-quote.
+            TypeRef::String | TypeRef::Char | TypeRef::Path => name.to_string(),
+            _ => format!("{name}.to_json"),
+        }
     }
 }
 

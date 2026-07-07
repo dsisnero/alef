@@ -145,10 +145,10 @@ fn complex_params_are_json_encoded_scalars_pass_through() {
     )]);
     let content = &CrystalBackend.generate_bindings(&api, &make_config()).unwrap()[0].content;
 
-    // String arg is JSON-encoded across the ABI; the scalar passes through.
+    // String arg passes raw (the FFI expects raw char*); the scalar passes through.
     assert!(
-        content.contains("LibDemo.mix(text.to_json, n)"),
-        "wrong marshalling: {content}"
+        content.contains("LibDemo.mix(text, n)"),
+        "string param should pass raw, scalar through: {content}"
     );
 }
 

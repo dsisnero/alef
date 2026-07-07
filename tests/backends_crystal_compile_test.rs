@@ -1616,7 +1616,7 @@ fn opaque_instance_method_emitted() {
         "missing instance method: {content}"
     );
     assert!(
-        content.contains("LibDemo.engine_process(@handle, input.to_json)"),
+        content.contains("LibDemo.engine_process(@handle, input)"),
         "method should pass @handle: {content}"
     );
 }
@@ -1851,7 +1851,7 @@ fn streaming_method_with_params_emits_signature() {
         "start binding should carry params: {content}"
     );
     assert!(
-        content.contains("_start(@handle, prompt.to_json, limit)"),
+        content.contains("_start(@handle, prompt, limit)"),
         "start call should marshal params: {content}"
     );
 }
@@ -2454,6 +2454,169 @@ int32_t demo_probe_name(char* out, size_t cap) {
     assert!(
         run.status.success() && stdout.trim() == "OK",
         "plugin program failed: status={:?} stdout={stdout:?} stderr={:?}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Full e2e against a real Rust-compiled cdylib (rustc `--crate-type=cdylib`),
+/// exercising Rust's actual `CString` allocator/ABI interplay with the Crystal
+/// binding's `free_string` — a step beyond the C oracle. Covers regular function
+/// returns (Rust `CString::into_raw`) and the plugin bridge (Crystal-malloc'd
+/// `out_result` freed by the Crystal `free_string` the Rust side invokes).
+#[test]
+fn full_e2e_against_real_rust_cdylib() {
+    let have_rustc = Command::new("rustc").arg("--version").output().is_ok();
+    let have_crystal = Command::new("crystal").arg("--version").output().is_ok();
+    if !have_rustc || !have_crystal {
+        eprintln!("skipping: need both `rustc` and `crystal`");
+        return;
+    }
+
+    // API: a function (greet) + a plugin Store trait.
+    let mut api = plugin_bridge_api();
+    api.functions = vec![make_fn(
+        "greet",
+        vec![make_param("name", TypeRef::String)],
+        TypeRef::String,
+        None,
+    )];
+    let files = CrystalBackend.generate_bindings(&api, &plugin_bridge_config()).unwrap();
+    let mut binding = String::new();
+    for f in &files {
+        binding.push_str(&f.content);
+        binding.push_str("\n\n");
+    }
+
+    let dir = std::env::temp_dir().join(format!("alef_crystal_rustffi_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+
+    // Real Rust FFI cdylib: greet returns a CString (Rust allocator); the plugin
+    // registry stores the vtable and a probe invokes fetch through it.
+    let rust = r#"
+use std::ffi::{CStr, CString};
+use std::os::raw::{c_char, c_void};
+
+#[unsafe(no_mangle)]
+pub extern "C" fn demo_greet(name: *const c_char) -> *mut c_char {
+    let name = unsafe { CStr::from_ptr(name) }.to_string_lossy().into_owned();
+    CString::new(format!("hi {}", name)).unwrap().into_raw()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn demo_free_string(p: *mut c_char) {
+    if !p.is_null() { drop(unsafe { CString::from_raw(p) }); }
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct StoreVTable {
+    name_fn: Option<unsafe extern "C" fn(*const c_void, *mut *mut c_char, *mut *mut c_char) -> i32>,
+    version_fn: Option<unsafe extern "C" fn(*const c_void, *mut *mut c_char, *mut *mut c_char) -> i32>,
+    initialize_fn: Option<unsafe extern "C" fn(*const c_void, *mut *mut c_char) -> i32>,
+    shutdown_fn: Option<unsafe extern "C" fn(*const c_void, *mut *mut c_char) -> i32>,
+    fetch: Option<unsafe extern "C" fn(*const c_void, *const c_char, *mut *mut c_char, *mut *mut c_char) -> i32>,
+    free_string: Option<unsafe extern "C" fn(*mut c_char)>,
+    free_user_data: Option<unsafe extern "C" fn(*mut c_void)>,
+}
+
+static mut G_VT: Option<StoreVTable> = None;
+static mut G_UD: *const c_void = std::ptr::null();
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn demo_register_store(_name: *const c_char, vt: *const StoreVTable, ud: *const c_void, _e: *mut *mut c_char) -> i32 {
+    unsafe { G_VT = Some(*vt); G_UD = ud; }
+    0
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn demo_unregister_store(_name: *const c_char, _e: *mut *mut c_char) -> i32 {
+    unsafe { G_VT = None; }
+    0
+}
+
+/// Invoke the registered plugin's fetch and return the result as a Rust CString.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn demo_probe_fetch(key: *const c_char) -> *mut c_char {
+    let (vt, ud) = unsafe { (G_VT, G_UD) };
+    let vt = match vt { Some(v) => v, None => return std::ptr::null_mut() };
+    let fetch = match vt.fetch { Some(f) => f, None => return std::ptr::null_mut() };
+    let mut out_result: *mut c_char = std::ptr::null_mut();
+    let mut out_error: *mut c_char = std::ptr::null_mut();
+    let status = unsafe { fetch(ud, key, &mut out_result, &mut out_error) };
+    if status != 0 || out_result.is_null() { return std::ptr::null_mut(); }
+    // Read the (Crystal-malloc'd) string, copy into a Rust CString, then free via the vtable.
+    let s = unsafe { CStr::from_ptr(out_result) }.to_string_lossy().into_owned();
+    if let Some(free) = vt.free_string { unsafe { free(out_result); } }
+    CString::new(s).unwrap().into_raw()
+}
+"#;
+    std::fs::write(dir.join("shim.rs"), rust).expect("write shim.rs");
+
+    let lib_file = if cfg!(target_os = "macos") {
+        "libdemo_ffi.dylib"
+    } else {
+        "libdemo_ffi.so"
+    };
+    let rc = Command::new("rustc")
+        .current_dir(&dir)
+        .args(["--crate-type=cdylib", "--edition=2024", "-O", "shim.rs", "-o", lib_file])
+        .output()
+        .expect("run rustc");
+    assert!(
+        rc.status.success(),
+        "rustc failed: {}",
+        String::from_utf8_lossy(&rc.stderr)
+    );
+
+    let program = format!(
+        "{binding}\n\n\
+         lib LibDemo\n\
+         \x20 fun probe_fetch = demo_probe_fetch(key : LibC::Char*) : LibC::Char*\n\
+         end\n\n\
+         raise \"greet\" unless Demo.greet(\"world\") == \"hi world\"\n\
+         class MyStore < Demo::Store\n\
+         \x20 def fetch(key : String) : String\n\
+         \x20   \"got:\" + key\n\
+         \x20 end\n\
+         end\n\
+         raise \"register\" unless Demo.register_store(\"test\", MyStore.new)\n\
+         rp = LibDemo.probe_fetch(\"k1\")\n\
+         raise \"probe null\" if rp.null?\n\
+         got = String.new(rp)\n\
+         LibDemo.free_string(rp)\n\
+         raise \"probe got #{{got}}\" unless got == \"got:k1\"\n\
+         Demo.unregister_store(\"test\")\n\
+         puts \"OK\"\n"
+    );
+    std::fs::write(dir.join("demo.cr"), &program).expect("write demo.cr");
+
+    let dir_str = dir.to_string_lossy().to_string();
+    let exe = dir.join("e2e_prog");
+    let build = Command::new("crystal")
+        .current_dir(&dir)
+        .args(["build", "demo.cr", "-o"])
+        .arg(&exe)
+        .arg("--link-flags")
+        .arg(format!("-L{dir_str} -Wl,-rpath,{dir_str}"))
+        .output()
+        .expect("run crystal build");
+    assert!(
+        build.status.success(),
+        "crystal build failed:\n{program}\n--- stderr ---\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .env("DYLD_LIBRARY_PATH", &dir_str)
+        .env("LD_LIBRARY_PATH", &dir_str)
+        .output()
+        .expect("run e2e program");
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        run.status.success() && stdout.trim() == "OK",
+        "e2e program failed: status={:?} stdout={stdout:?} stderr={:?}",
         run.status,
         String::from_utf8_lossy(&run.stderr)
     );
