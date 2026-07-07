@@ -2012,3 +2012,129 @@ fn free_function_stream_typechecks() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// End-to-end link + run: build a C shared library implementing the exact FFI
+/// symbols the generated Crystal binding expects, then `crystal build` (full link)
+/// the binding against it and run it. This validates that the emitted `lib` symbol
+/// names, C signatures, and runtime marshalling (scalar pass-through, String↔char*,
+/// free_string ownership) are genuinely ABI-correct and linkable — not just that
+/// the Crystal type-checks.
+fn link_api() -> ApiSurface {
+    ApiSurface {
+        crate_name: "demo".into(),
+        version: "0.1.0".into(),
+        types: vec![],
+        functions: vec![
+            make_fn(
+                "add",
+                vec![
+                    make_param("a", TypeRef::Primitive(PrimitiveType::I32)),
+                    make_param("b", TypeRef::Primitive(PrimitiveType::I32)),
+                ],
+                TypeRef::Primitive(PrimitiveType::I32),
+                None,
+            ),
+            make_fn(
+                "greet",
+                vec![make_param("name", TypeRef::String)],
+                TypeRef::String,
+                None,
+            ),
+        ],
+        enums: vec![],
+        errors: vec![],
+        excluded_type_paths: ::std::collections::HashMap::new(),
+        excluded_trait_names: ::std::collections::HashSet::new(),
+        services: vec![],
+        handler_contracts: vec![],
+        unsupported_public_items: Vec::new(),
+    }
+}
+
+#[test]
+fn ffi_link_and_run_against_c_oracle() {
+    let have_cc = Command::new("cc").arg("--version").output().is_ok();
+    let have_crystal = Command::new("crystal").arg("--version").output().is_ok();
+    if !have_cc || !have_crystal {
+        eprintln!("skipping: need both `cc` and `crystal` on PATH");
+        return;
+    }
+
+    let content = &CrystalBackend.generate_bindings(&link_api(), &make_config()).unwrap()[0].content;
+
+    let dir = std::env::temp_dir().join(format!("alef_crystal_link_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+
+    // C oracle implementing the documented ABI contract.
+    let shim = r#"#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+int32_t demo_add(int32_t a, int32_t b) { return a + b; }
+/* `name` arrives JSON-encoded (e.g. "\"world\""); return an owned greeting. */
+char* demo_greet(const char* name) {
+    const char* msg = "hello";
+    char* out = (char*) malloc(strlen(msg) + 1);
+    strcpy(out, msg);
+    return out;
+}
+void demo_free_string(char* ptr) { free(ptr); }
+"#;
+    std::fs::write(dir.join("shim.c"), shim).expect("write shim.c");
+
+    // Build the shared library (matching `@[Link(ldflags: "-ldemo_ffi")]`).
+    let lib_file = if cfg!(target_os = "macos") {
+        "libdemo_ffi.dylib"
+    } else {
+        "libdemo_ffi.so"
+    };
+    let mut cc = Command::new("cc");
+    cc.current_dir(&dir);
+    if cfg!(target_os = "macos") {
+        cc.args(["-dynamiclib", "-o", lib_file, "shim.c"]);
+    } else {
+        cc.args(["-shared", "-fPIC", "-o", lib_file, "shim.c"]);
+    }
+    let cc_out = cc.output().expect("run cc");
+    assert!(
+        cc_out.status.success(),
+        "cc failed: {}",
+        String::from_utf8_lossy(&cc_out.stderr)
+    );
+
+    // Generated binding + a main that asserts scalar and string round-trips.
+    let program = format!(
+        "{content}\n\nabort(\"add\") unless Demo.add(2_i32, 3_i32) == 5\nabort(\"greet\") unless Demo.greet(\"world\") == \"hello\"\nputs \"OK\"\n"
+    );
+    std::fs::write(dir.join("demo.cr"), &program).expect("write demo.cr");
+
+    let dir_str = dir.to_string_lossy().to_string();
+    let exe = dir.join("demo_prog");
+    let build = Command::new("crystal")
+        .current_dir(&dir)
+        .args(["build", "demo.cr", "-o"])
+        .arg(&exe)
+        .arg("--link-flags")
+        .arg(format!("-L{dir_str} -Wl,-rpath,{dir_str}"))
+        .output()
+        .expect("run crystal build");
+    assert!(
+        build.status.success(),
+        "crystal build (link) failed:\n--- program ---\n{program}\n--- stderr ---\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .env("DYLD_LIBRARY_PATH", &dir_str)
+        .env("LD_LIBRARY_PATH", &dir_str)
+        .output()
+        .expect("run generated program");
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        run.status.success() && stdout.trim() == "OK",
+        "linked program did not run cleanly: status={:?} stdout={stdout:?} stderr={:?}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
