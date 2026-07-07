@@ -1,7 +1,23 @@
 # Plan: Crystal alef-e2e harness + plugin-style trait bridges
 
-Status: in progress. Decisions: **(c) both verification paths**, **both e2e scopes**
-(function-call + trait-bridge AND HTTP `TestClientRenderer`), **e2e harness first**.
+Status: **DONE** (all phases A–D landed + verified). Decisions: **(c) both
+verification paths**, **both e2e scopes**, **e2e harness first**.
+
+## Outcome
+
+- Phase A ✅ `CrystalE2eCodegen` harness scaffold (shard.yml + spec_helper +
+  per-category specs + binding smoke spec), registered, `crystal spec` e2e cmd.
+- Phase B ✅ plugin-style (registry) trait bridge codegen — `#[repr(C)]` vtable,
+  register/unregister, per-method trampolines, abstract class + register API.
+- Phase C ✅ e2e `emit_test_backend` for Crystal (stub subclass + register call).
+- Phase D1 ✅ in-repo C-oracle plugin-bridge **link + run** test.
+- Phase D2 ✅ full e2e against a real `rustc`-compiled cdylib (Rust CString
+  allocator/ABI ↔ Crystal `free_string`, plugin round-trip). **Surfaced and
+  fixed a real bug**: String/Char/Path params must pass raw `char*`, not JSON.
+
+Remaining (future): rich fixture→assertion engine in the harness (Phase A emits
+`pending` placeholders); wiring `emit_test_backend` into generated specs; HTTP
+`TestClientRenderer` path; plugin methods with `Bytes`/`Optional`-complex params.
 
 ## Goal
 
