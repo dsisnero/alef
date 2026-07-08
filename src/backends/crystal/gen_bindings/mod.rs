@@ -1343,6 +1343,20 @@ impl Backend for CrystalBackend {
             generated_header: true,
         }];
 
+        // Emit a minimal shard.yml so `shards build` works out of the box.
+        files.push(GeneratedFile {
+            path: PathBuf::from(format!("{output_dir}shard.yml")),
+            content: render(
+                "shard.yml.jinja",
+                minijinja::context! {
+                    shard_name => shard_name,
+                    crate_name => api.crate_name,
+                    version => api.version,
+                },
+            ),
+            generated_header: false,
+        });
+
         // Visitor-style trait bridges → a `visitor.cr` per bridge (reopens the lib).
         for bridge in &config.trait_bridges {
             let bridge_snake = crate::codegen::naming::public_host_identifier(
