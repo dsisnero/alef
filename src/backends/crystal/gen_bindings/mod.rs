@@ -1051,6 +1051,19 @@ impl CrystalBackend {
     }
 }
 
+/// Check whether a type reference (including nested Vec/Optional/Map) mentions
+/// an excluded type name, so we can filter fields that would reference an
+/// undefined constant.
+fn type_ref_uses_excluded(ty: &TypeRef, excluded: &[String]) -> bool {
+    match ty {
+        TypeRef::Named(n) => excluded.contains(n),
+        TypeRef::Optional(inner) => type_ref_uses_excluded(inner, excluded),
+        TypeRef::Vec(inner) => type_ref_uses_excluded(inner, excluded),
+        TypeRef::Map(k, v) => type_ref_uses_excluded(k, excluded) || type_ref_uses_excluded(v, excluded),
+        _ => false,
+    }
+}
+
 /// Scalar types pass across the C ABI by value (no JSON marshalling).
 fn is_scalar(ty: &TypeRef) -> bool {
     matches!(ty, TypeRef::Primitive(_) | TypeRef::Duration | TypeRef::Unit)
@@ -1256,6 +1269,11 @@ impl Backend for CrystalBackend {
                 deduped.types.retain(|t| !c.exclude_types.contains(&t.name));
                 deduped.enums.retain(|e| !c.exclude_types.contains(&e.name));
                 deduped.errors.retain(|e| !c.exclude_types.contains(&e.name));
+                // Also filter fields in remaining types that reference excluded types,
+                // so we don't emit `getter x : ExcludedType?` with an undefined constant.
+                for typ in &mut deduped.types {
+                    typ.fields.retain(|f| !type_ref_uses_excluded(&f.ty, &c.exclude_types));
+                }
             }
         }
         let _api = &deduped;
@@ -1302,6 +1320,23 @@ impl Backend for CrystalBackend {
         );
         content.push_str(&Self::gen_module(api, &ffi_prefix, &extra_exclude, &opaque, &streaming));
 
+        // Append `require` statements for auxiliary bridge files before finalising content.
+        let lib_name = Self::lib_name(&ffi_prefix);
+        let module_name = Self::module_name(&api.crate_name);
+        for bridge in &config.trait_bridges {
+            let bridge_snake = crate::codegen::naming::public_host_identifier(
+                Language::Crystal,
+                PublicIdentifierKind::Function,
+                &bridge.trait_name,
+            );
+            if super::trait_bridge::gen_visitor_file(api, bridge, &ffi_prefix, &lib_name, &module_name).is_some() {
+                content.push_str(&format!("require \"./{shard_name}_{bridge_snake}_visitor\"\n"));
+            }
+            if super::trait_bridge::gen_plugin_file(api, bridge, &ffi_prefix, &lib_name, &module_name).is_some() {
+                content.push_str(&format!("require \"./{shard_name}_{bridge_snake}_plugin\"\n"));
+            }
+        }
+
         let mut files = vec![GeneratedFile {
             path: PathBuf::from(format!("{output_dir}src/{shard_name}.cr")),
             content,
@@ -1309,8 +1344,6 @@ impl Backend for CrystalBackend {
         }];
 
         // Visitor-style trait bridges → a `visitor.cr` per bridge (reopens the lib).
-        let lib_name = Self::lib_name(&ffi_prefix);
-        let module_name = Self::module_name(&api.crate_name);
         for bridge in &config.trait_bridges {
             let bridge_snake = crate::codegen::naming::public_host_identifier(
                 Language::Crystal,

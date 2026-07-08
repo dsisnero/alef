@@ -320,6 +320,17 @@ fn supported_plugin_bridge_generates_plugin_file() {
         plugin_content.contains("fun register_renderer = demo_register_renderer"),
         "should contain register fun: {plugin_content}"
     );
+
+    let main_content = files
+        .iter()
+        .find(|f| f.path.display().to_string().ends_with("src/demo.cr"))
+        .map(|f| &f.content)
+        .expect("main binding file");
+
+    assert!(
+        main_content.contains("require \"./demo_renderer_plugin\""),
+        "main file should require plugin bridge file: {main_content}"
+    );
 }
 
 #[test]
