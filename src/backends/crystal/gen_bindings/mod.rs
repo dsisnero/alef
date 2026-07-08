@@ -104,6 +104,7 @@ impl CrystalBackend {
             }
             let crystal_name = public_host_identifier(Language::Crystal, PublicIdentifierKind::Function, &func.name);
             let c_symbol = abi_symbol(ffi_prefix, &func.name);
+            let ret_ty = Self::lib_return(func, opaque, ffi_structs);
             out.push_str(&render(
                 "lib_fun.jinja",
                 minijinja::context! {
@@ -111,7 +112,7 @@ impl CrystalBackend {
                     crystal_name => crystal_name,
                     c_symbol => c_symbol,
                         params => Self::lib_params(func, opaque, ffi_structs),
-                        return_type => Self::lib_return(func, opaque, ffi_structs),
+                        return_type => ret_ty,
                 },
             ));
         }
@@ -1172,7 +1173,9 @@ fn lib_c_return(
     if is_opaque_named(return_type, opaque) {
         return "Void*".to_string();
     }
-    if error_type.is_some() {
+    // Fallible struct returns: the function returns a struct pointer (not JSON);
+    // NULL signals an error. JSON-string returns are only for scalar/string types.
+    if error_type.is_some() && !matches!(return_type, TypeRef::Named(_)) && !is_opaque_named(return_type, opaque) {
         return "LibC::Char*".to_string();
     }
     c_type_of(return_type, opaque, ffi_structs).into_owned()
