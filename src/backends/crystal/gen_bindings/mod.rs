@@ -46,12 +46,12 @@ impl CrystalBackend {
     }
 
     /// Render the `fun` param list for a lib declaration.
-    fn lib_params(func: &FunctionDef, opaque: &HashSet<String>) -> String {
+    fn lib_params(func: &FunctionDef, opaque: &HashSet<String>, ffi_structs: &HashSet<String>) -> String {
         func.params
             .iter()
             .map(|p| {
                 let name = public_host_identifier(Language::Crystal, PublicIdentifierKind::Parameter, &p.name);
-                let cty = c_type_of(&p.ty, opaque);
+                let cty = c_type_of(&p.ty, opaque, ffi_structs);
                 format!("{name} : {cty}")
             })
             .collect::<Vec<_>>()
@@ -59,11 +59,12 @@ impl CrystalBackend {
     }
 
     /// Render the C return type for a lib declaration.
-    fn lib_return(func: &FunctionDef, opaque: &HashSet<String>) -> String {
-        lib_c_return(&func.return_type, func.error_type.as_deref(), opaque)
+    fn lib_return(func: &FunctionDef, opaque: &HashSet<String>, ffi_structs: &HashSet<String>) -> String {
+        lib_c_return(&func.return_type, func.error_type.as_deref(), opaque, ffi_structs)
     }
 
     /// Generate the `lib` block binding all exported C symbols.
+    #[allow(clippy::too_many_arguments)]
     fn gen_lib_block(
         api: &ApiSurface,
         ffi_prefix: &str,
@@ -72,6 +73,7 @@ impl CrystalBackend {
         ffi_exclude: &HashSet<String>,
         opaque: &HashSet<String>,
         streaming: &[StreamSpec],
+        ffi_structs: &HashSet<String>,
     ) -> String {
         let mut out = render(
             "lib_header.jinja",
@@ -82,6 +84,19 @@ impl CrystalBackend {
                 ffi_header => ffi_header,
             },
         );
+
+        // Emit opaque struct declarations for C FFI struct types (non-opaque types
+        // that have `from_json`/`to_json`/`free` helpers). These must be declared
+        // before any `fun` that references them.
+        let mut sorted_structs: Vec<&String> = ffi_structs.iter().collect();
+        sorted_structs.sort();
+        for name in &sorted_structs {
+            let struct_name = crystal_type_name(name);
+            out.push_str(&format!("  struct {struct_name}; end\n"));
+        }
+        if !sorted_structs.is_empty() {
+            out.push('\n');
+        }
 
         for func in &api.functions {
             if Self::is_excluded(func, ffi_exclude) {
@@ -95,8 +110,8 @@ impl CrystalBackend {
                     doc => func.doc.lines().next().unwrap_or_default().trim(),
                     crystal_name => crystal_name,
                     c_symbol => c_symbol,
-                    params => Self::lib_params(func, opaque),
-                    return_type => Self::lib_return(func, opaque),
+                        params => Self::lib_params(func, opaque, ffi_structs),
+                        return_type => Self::lib_return(func, opaque, ffi_structs),
                 },
             ));
         }
@@ -123,9 +138,9 @@ impl CrystalBackend {
                 };
                 for p in &m.params {
                     let pn = public_host_identifier(Language::Crystal, PublicIdentifierKind::Parameter, &p.name);
-                    params.push(format!("{pn} : {}", c_type_of(&p.ty, opaque)));
+                    params.push(format!("{pn} : {}", c_type_of(&p.ty, opaque, ffi_structs)));
                 }
-                let ret = lib_c_return(&m.return_type, m.error_type.as_deref(), opaque);
+                let ret = lib_c_return(&m.return_type, m.error_type.as_deref(), opaque, ffi_structs);
                 out.push_str(&format!(
                     "  fun {type_snake}_{method_snake} = {c_symbol}({}) : {ret}\n",
                     params.join(", ")
@@ -153,7 +168,7 @@ impl CrystalBackend {
             };
             for (pname, pty) in &spec.params {
                 let pn = public_host_identifier(Language::Crystal, PublicIdentifierKind::Parameter, pname);
-                start_params.push(format!("{pn} : {}", c_type_of(pty, opaque)));
+                start_params.push(format!("{pn} : {}", c_type_of(pty, opaque, ffi_structs)));
             }
             out.push_str(&format!(
                 "  fun {base}_start = {c_base}_start({}) : Void*\n",
@@ -1148,14 +1163,19 @@ fn marshal_value(name: &str, ty: &TypeRef, opaque: &HashSet<String>) -> String {
 }
 
 /// The Crystal `lib` C return type for a return/error pair.
-fn lib_c_return(return_type: &TypeRef, error_type: Option<&str>, opaque: &HashSet<String>) -> String {
+fn lib_c_return(
+    return_type: &TypeRef,
+    error_type: Option<&str>,
+    opaque: &HashSet<String>,
+    ffi_structs: &HashSet<String>,
+) -> String {
     if is_opaque_named(return_type, opaque) {
         return "Void*".to_string();
     }
     if error_type.is_some() {
         return "LibC::Char*".to_string();
     }
-    c_type_of(return_type, opaque).into_owned()
+    c_type_of(return_type, opaque, ffi_structs).into_owned()
 }
 
 /// A streaming method: an owner type with a method that yields a stream of items,
@@ -1220,6 +1240,53 @@ fn streaming_specs(config: &ResolvedCrateConfig) -> Vec<StreamSpec> {
         .collect()
 }
 
+/// Collect type names of non-opaque struct types in the API surface.
+/// These have C-level `from_json`/`to_json`/`free` helpers in the FFI and must be
+/// passed as struct pointers, not JSON strings.
+/// Collect Named type names used in function signatures (params + returns).
+/// These correspond to C FFI struct types that need `struct` declarations and
+/// `from_json`/`to_json`/`free` helpers.
+fn ffi_struct_names(api: &ApiSurface) -> HashSet<String> {
+    let mut names = HashSet::new();
+    // From functions
+    for func in &api.functions {
+        for p in &func.params {
+            collect_named_types(&p.ty, &mut names);
+        }
+        collect_named_types(&func.return_type, &mut names);
+    }
+    // From opaque type methods
+    for ty in &api.types {
+        for m in &ty.methods {
+            for p in &m.params {
+                collect_named_types(&p.ty, &mut names);
+            }
+            collect_named_types(&m.return_type, &mut names);
+        }
+    }
+    names
+}
+
+fn collect_named_types(ty: &TypeRef, names: &mut HashSet<String>) {
+    match ty {
+        TypeRef::Named(n) => {
+            names.insert(n.clone());
+        }
+        TypeRef::Optional(inner) => collect_named_types(inner, names),
+        TypeRef::Vec(inner) => collect_named_types(inner, names),
+        TypeRef::Map(k, v) => {
+            collect_named_types(k, names);
+            collect_named_types(v, names);
+        }
+        _ => {}
+    }
+}
+
+/// Whether a Named type reference is a C FFI struct type (non-opaque, in the API).
+fn is_ffi_struct(name: &str, ffi_structs: &HashSet<String>) -> bool {
+    ffi_structs.contains(name)
+}
+
 /// The set of opaque (handle-based) type names in an API surface.
 fn opaque_names(api: &ApiSurface) -> HashSet<String> {
     api.types
@@ -1235,10 +1302,16 @@ fn is_opaque_named(ty: &TypeRef, opaque: &HashSet<String>) -> bool {
 }
 
 /// The Crystal `lib` (C-ABI) type for a value, treating opaque handles as `Void*`
-/// (a raw pointer) rather than the default JSON-string marshalling.
-fn c_type_of(ty: &TypeRef, opaque: &HashSet<String>) -> std::borrow::Cow<'static, str> {
+/// (a raw pointer) and FFI struct types as struct pointers rather than the default
+/// JSON-string marshalling.
+fn c_type_of(ty: &TypeRef, opaque: &HashSet<String>, ffi_structs: &HashSet<String>) -> std::borrow::Cow<'static, str> {
     if is_opaque_named(ty, opaque) {
         return std::borrow::Cow::Borrowed("Void*");
+    }
+    if let TypeRef::Named(name) = ty {
+        if is_ffi_struct(name, ffi_structs) {
+            return std::borrow::Cow::Owned(format!("{}*", crystal_type_name(name)));
+        }
     }
     crystal_c_type(ty)
 }
@@ -1359,6 +1432,7 @@ impl Backend for CrystalBackend {
         let shard_name = Self::shard_name(&config.name);
 
         let opaque = opaque_names(api);
+        let ffi_structs = ffi_struct_names(api);
         let streaming = streaming_specs(config);
         let mut content = Self::gen_lib_block(
             api,
@@ -1368,6 +1442,7 @@ impl Backend for CrystalBackend {
             &extra_exclude,
             &opaque,
             &streaming,
+            &ffi_structs,
         );
         content.push_str(&Self::gen_module(api, &ffi_prefix, &extra_exclude, &opaque, &streaming));
 
