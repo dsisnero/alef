@@ -772,7 +772,9 @@ fn plugin_decode_param(ty: &TypeRef, name: &str) -> (String, String) {
             format!("{}.from_json(String.new({name}))", crystal_type(ty))
         }
         TypeRef::Bytes => {
-            format!("Array(UInt8).from_json(String.new({name})).to_slice")
+            format!(
+                "(begin; __arr = Array(UInt8).from_json(String.new({name})); Bytes.new(__arr.to_unsafe, __arr.size); end)"
+            )
         }
         TypeRef::Optional(inner) => {
             let (_, inner_expr) = plugin_decode_param(inner, name);
@@ -1165,7 +1167,11 @@ mod tests {
     fn decode_bytes_param() {
         let (val, expr) = plugin_decode_param(&TypeRef::Bytes, "data");
         assert_eq!(val, "__data");
-        assert_eq!(expr, "Array(UInt8).from_json(String.new(data)).to_slice");
+        assert!(
+            expr.contains("Array(UInt8).from_json(String.new(data))"),
+            "expr: {expr}"
+        );
+        assert!(expr.contains("Bytes.new(__arr.to_unsafe"), "expr: {expr}");
     }
 
     #[test]

@@ -286,6 +286,19 @@ impl CrystalBackend {
             if wire != field_name {
                 out.push_str(&format!("    @[JSON::Field(key: {wire:?})]\n"));
             }
+            // Bytes (Slice) does not implement JSON::Serializable in Crystal stdlib.
+            // Nilable Bytes? → ignore (struct can still use from_json for other fields).
+            // Non-nilable Bytes → emit a default `Bytes.empty` so the constructor is satisfied.
+            if field.optional && field_type_contains_bytes(&field.ty) {
+                out.push_str("    @[JSON::Field(ignore: true)]\n");
+                out.push_str(&format!("    getter {field_name} : {field_ty}\n"));
+                continue;
+            } else if !field.optional && field_type_contains_bytes(&field.ty) {
+                out.push_str("    @[JSON::Field(ignore: true)]\n");
+                out.push_str(&format!("    getter {field_name} : Bytes = Bytes.empty\n"));
+                continue;
+            }
+            out.push_str(&format!("    getter {field_name} : {field_ty}\n"));
             out.push_str(&format!("    getter {field_name} : {field_ty}\n"));
         }
         out.push_str("  end\n");
@@ -1086,6 +1099,18 @@ fn type_ref_uses_excluded(ty: &TypeRef, excluded: &[String]) -> bool {
         TypeRef::Optional(inner) => type_ref_uses_excluded(inner, excluded),
         TypeRef::Vec(inner) => type_ref_uses_excluded(inner, excluded),
         TypeRef::Map(k, v) => type_ref_uses_excluded(k, excluded) || type_ref_uses_excluded(v, excluded),
+        _ => false,
+    }
+}
+
+/// Check whether a type reference (including nested Vec/Optional/Map/Hash) involves
+/// `Bytes`, which does not implement JSON::Serializable in Crystal stdlib.
+fn field_type_contains_bytes(ty: &TypeRef) -> bool {
+    match ty {
+        TypeRef::Bytes => true,
+        TypeRef::Optional(inner) => field_type_contains_bytes(inner),
+        TypeRef::Vec(inner) => field_type_contains_bytes(inner),
+        TypeRef::Map(k, v) => field_type_contains_bytes(k) || field_type_contains_bytes(v),
         _ => false,
     }
 }
