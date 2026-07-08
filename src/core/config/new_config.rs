@@ -273,6 +273,7 @@ impl NewAlefConfig {
             csharp: krate.csharp.clone().or_else(|| ws.csharp.clone()),
             r: krate.r.clone().or_else(|| ws.r.clone()),
             zig: krate.zig.clone().or_else(|| ws.zig.clone()),
+            crystal: krate.crystal.clone().or_else(|| ws.crystal.clone()),
             exclude: krate.exclude.clone(),
             include: krate.include.clone(),
             output_paths,

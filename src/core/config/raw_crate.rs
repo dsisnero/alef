@@ -18,9 +18,9 @@ use super::SourceCrate;
 use super::e2e::E2eConfig;
 use super::extras::{AdapterConfig, Language};
 use super::languages::{
-    CSharpConfig, CustomModulesConfig, CustomRegistrationsConfig, DartConfig, ElixirConfig, FfiConfig, GleamConfig,
-    GoConfig, JavaConfig, JniConfig, KotlinAndroidConfig, KotlinConfig, NodeConfig, PhpConfig, PythonConfig, RConfig,
-    RubyConfig, SwiftConfig, WasmConfig, ZigConfig,
+    CSharpConfig, CrystalConfig, CustomModulesConfig, CustomRegistrationsConfig, DartConfig, ElixirConfig, FfiConfig,
+    GleamConfig, GoConfig, JavaConfig, JniConfig, KotlinAndroidConfig, KotlinConfig, NodeConfig, PhpConfig,
+    PythonConfig, RConfig, RubyConfig, SwiftConfig, WasmConfig, ZigConfig,
 };
 use super::output::{
     BuildCommandConfig, CleanConfig, DocsConfig, ExcludeConfig, IncludeConfig, LintConfig, OutputConfig, ReadmeConfig,
@@ -159,6 +159,7 @@ pub struct RawCrateConfig {
     pub r: Option<RConfig>,
     #[serde(default)]
     pub zig: Option<ZigConfig>,
+    pub crystal: Option<CrystalConfig>,
 
     // -----------------------------------------------------------------
     // Filters and output paths

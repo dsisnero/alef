@@ -18,7 +18,7 @@ use super::GenerateConfig;
 use super::dto::DtoConfig;
 use super::extras::Language;
 use super::languages::{
-    CSharpConfig, DartConfig, ElixirConfig, FfiConfig, GleamConfig, GoConfig, JavaConfig, JniConfig,
+    CSharpConfig, CrystalConfig, DartConfig, ElixirConfig, FfiConfig, GleamConfig, GoConfig, JavaConfig, JniConfig,
     KotlinAndroidConfig, KotlinConfig, NodeConfig, PhpConfig, PythonConfig, RConfig, RubyConfig, SwiftConfig,
     WasmConfig, ZigConfig,
 };
@@ -140,6 +140,7 @@ pub struct WorkspaceConfig {
     /// Default Zig backend settings.
     #[serde(default)]
     pub zig: Option<ZigConfig>,
+    pub crystal: Option<CrystalConfig>,
 
     /// Global package-manager and dev-tool preferences. Inherited by every
     /// crate; cannot be overridden per-crate today.

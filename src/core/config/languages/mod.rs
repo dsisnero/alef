@@ -1,5 +1,6 @@
 mod capsule;
 mod common;
+mod crystal;
 mod csharp;
 mod custom;
 mod dart;
@@ -22,6 +23,7 @@ mod zig;
 
 pub use capsule::{HostCapsuleTypeConfig, zig_capsule_import_name, zig_capsule_import_names};
 pub use common::StubsConfig;
+pub use crystal::CrystalConfig;
 pub use csharp::CSharpConfig;
 pub use custom::{CustomModulesConfig, CustomRegistration, CustomRegistrationsConfig};
 pub use dart::{DartConfig, DartStyle, DartTargetDepOverride};

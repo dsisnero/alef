@@ -1245,7 +1245,20 @@ impl Backend for CrystalBackend {
 
         // Crystal is a single compiled surface over the C ABI (like Go/Zig): collapse
         // same-named cfg-variant functions so we do not emit duplicate `fun`/method defs.
-        let deduped = api.with_deduped_functions();
+        let mut deduped = api.with_deduped_functions();
+
+        // Apply per-language exclude lists from `[crates.crystal]`.
+        if let Some(c) = &config.crystal {
+            if !c.exclude_functions.is_empty() {
+                deduped.functions.retain(|f| !c.exclude_functions.contains(&f.name));
+            }
+            if !c.exclude_types.is_empty() {
+                deduped.types.retain(|t| !c.exclude_types.contains(&t.name));
+                deduped.enums.retain(|e| !c.exclude_types.contains(&e.name));
+                deduped.errors.retain(|e| !c.exclude_types.contains(&e.name));
+            }
+        }
+        let _api = &deduped;
         let api = &deduped;
 
         let ffi_prefix = config.ffi_prefix();
@@ -1257,6 +1270,14 @@ impl Backend for CrystalBackend {
             .as_ref()
             .map(|f| f.exclude_functions.iter().cloned().collect())
             .unwrap_or_default();
+
+        let crystal_exclude: HashSet<String> = config
+            .crystal
+            .as_ref()
+            .map(|c| c.exclude_functions.iter().cloned().collect())
+            .unwrap_or_default();
+
+        let extra_exclude: HashSet<String> = ffi_exclude.union(&crystal_exclude).cloned().collect();
 
         let output_dir = {
             let mut d = resolve_output_dir(config.output_paths.get("crystal"), &config.name, "packages/crystal/");
@@ -1275,11 +1296,11 @@ impl Backend for CrystalBackend {
             &ffi_prefix,
             &ffi_lib_name,
             &ffi_header,
-            &ffi_exclude,
+            &extra_exclude,
             &opaque,
             &streaming,
         );
-        content.push_str(&Self::gen_module(api, &ffi_prefix, &ffi_exclude, &opaque, &streaming));
+        content.push_str(&Self::gen_module(api, &ffi_prefix, &extra_exclude, &opaque, &streaming));
 
         let mut files = vec![GeneratedFile {
             path: PathBuf::from(format!("{output_dir}src/{shard_name}.cr")),
