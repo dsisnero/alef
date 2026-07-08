@@ -1043,22 +1043,13 @@ impl CrystalBackend {
             .collect::<Vec<_>>()
             .join(", ");
 
-        // Call arguments: scalars pass through, opaque handles pass their pointer,
-        // everything else is JSON-encoded.
-        let call_args = func
-            .params
-            .iter()
-            .map(|p| marshal_call_arg(p, opaque))
-            .collect::<Vec<_>>()
-            .join(", ");
-
         let ret_annot = if matches!(func.return_type, TypeRef::Unit) && func.error_type.is_none() {
             "Nil".to_string()
         } else {
             ret_ty.into_owned()
         };
 
-        let body = Self::gen_wrapper_body(func, lib_name, &method, &call_args, opaque, ffi_structs);
+        let body = Self::gen_wrapper_body(func, lib_name, &method, opaque, ffi_structs);
 
         format!(
             "\n  # {doc}\n  def self.{method}({sig_params}) : {ret_annot}\n{body}  end\n",
@@ -1070,12 +1061,35 @@ impl CrystalBackend {
         func: &FunctionDef,
         lib_name: &str,
         method: &str,
-        call_args: &str,
         opaque: &HashSet<String>,
         ffi_structs: &HashSet<String>,
     ) -> String {
-        let call = format!("{lib_name}.{method}({call_args})");
-        Self::gen_call_body(
+        // Generate setup/teardown for FFI struct params that need `from_json`/`free`.
+        let mut setup = String::new();
+        let mut teardown = String::new();
+        let mut call_parts: Vec<String> = Vec::new();
+
+        for p in &func.params {
+            let pname = public_host_identifier(Language::Crystal, PublicIdentifierKind::Parameter, &p.name);
+            if let TypeRef::Named(type_name) = &p.ty {
+                if is_ffi_struct(type_name, ffi_structs) {
+                    let type_snake =
+                        public_host_identifier(Language::Crystal, PublicIdentifierKind::Function, type_name);
+                    let handle_var = format!("__handle_{pname}");
+                    setup.push_str(&format!(
+                        "    {handle_var} = {lib_name}.{type_snake}_from_json({pname}.to_json)\n"
+                    ));
+                    teardown.push_str(&format!("    {lib_name}.{type_snake}_free({handle_var})\n"));
+                    call_parts.push(handle_var);
+                    continue;
+                }
+            }
+            call_parts.push(marshal_value(&pname, &p.ty, opaque));
+        }
+
+        let call = format!("{lib_name}.{method}({})", call_parts.join(", "));
+        let mut body = setup;
+        body.push_str(&Self::gen_call_body(
             &call,
             &func.return_type,
             func.error_type.as_deref(),
@@ -1083,7 +1097,9 @@ impl CrystalBackend {
             opaque,
             ffi_structs,
             method,
-        )
+        ));
+        body.push_str(&teardown);
+        body
     }
 
     /// Emit the marshalling + return-decoding body for a call expression, shared by
@@ -1327,17 +1343,16 @@ fn streaming_specs(config: &ResolvedCrateConfig) -> Vec<StreamSpec> {
 /// passed as struct pointers, not JSON strings.
 /// Collect Named type names used in function signatures (params + returns).
 /// These correspond to C FFI struct types that need `struct` declarations and
-/// `from_json`/`to_json`/`free` helpers.
+/// `from_json`/`to_json`/`free` helpers. Opaque handle types are excluded.
 fn ffi_struct_names(api: &ApiSurface) -> HashSet<String> {
+    let opaque = opaque_names(api);
     let mut names = HashSet::new();
-    // From functions
     for func in &api.functions {
         for p in &func.params {
             collect_named_types(&p.ty, &mut names);
         }
         collect_named_types(&func.return_type, &mut names);
     }
-    // From opaque type methods
     for ty in &api.types {
         for m in &ty.methods {
             for p in &m.params {
@@ -1346,6 +1361,7 @@ fn ffi_struct_names(api: &ApiSurface) -> HashSet<String> {
             collect_named_types(&m.return_type, &mut names);
         }
     }
+    names.retain(|n| !opaque.contains(n));
     names
 }
 
