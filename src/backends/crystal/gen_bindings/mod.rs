@@ -242,7 +242,7 @@ impl CrystalBackend {
             if en.binding_excluded {
                 continue;
             }
-            out.push_str(&Self::gen_enum(en));
+            out.push_str(&Self::gen_enum(en, api));
         }
         for err in &api.errors {
             if err.binding_excluded {
@@ -458,7 +458,7 @@ impl CrystalBackend {
     ///   (`"Unit"` for unit variants, `{"Variant": payload}` for newtype variants).
     /// - anything else (struct/multi-tuple variants, internally/adjacently-tagged,
     ///   untagged) → skipped with an explanatory note (pending).
-    fn gen_enum(en: &EnumDef) -> String {
+    fn gen_enum(en: &EnumDef, api: &ApiSurface) -> String {
         let name = crystal_type_name(&en.name);
         let variants: Vec<&crate::core::ir::EnumVariant> = en.variants.iter().filter(|v| !v.binding_excluded).collect();
 
@@ -482,14 +482,7 @@ impl CrystalBackend {
             return Self::gen_untagged(en, &name, &variants, is_unit);
         }
         if let Some(tag) = en.serde_tag.as_deref() {
-            // Internally-tagged: only unit + struct variants are valid in serde.
-            if variants.iter().any(|v| v.is_tuple) {
-                return format!(
-                    "\n  # NOTE: internally-tagged enum `{name}` with tuple/newtype variants \
-                     is not representable; skipped.\n"
-                );
-            }
-            return Self::gen_internally_tagged(en, &name, &variants, tag, is_unit);
+            return Self::gen_internally_tagged(en, &name, &variants, tag, is_unit, api);
         }
 
         Self::gen_tagged_union(en, &name, &variants, is_unit)
@@ -505,6 +498,7 @@ impl CrystalBackend {
         variants: &[&crate::core::ir::EnumVariant],
         tag: &str,
         is_unit: impl Fn(&crate::core::ir::EnumVariant) -> bool,
+        api: &ApiSurface,
     ) -> String {
         let wire = |v: &crate::core::ir::EnumVariant| {
             wire_variant_value(&v.name, v.serde_rename.as_deref(), en.serde_rename_all.as_deref())
@@ -533,20 +527,52 @@ impl CrystalBackend {
             out.push_str(&format!("    @[JSON::Field(key: {tag:?})]\n"));
             out.push_str(&format!("    getter {tag_ident} : String = {:?}\n", wire(v)));
             if !is_unit(v) {
-                for f in &v.fields {
-                    if f.binding_excluded {
-                        continue;
+                if v.is_tuple && v.fields.len() == 1 {
+                    let inner = &v.fields[0];
+                    if let TypeRef::Named(inner_name) = &inner.ty {
+                        if let Some(inner_type) = api.types.iter().find(|t| t.name == *inner_name) {
+                            for f in &inner_type.fields {
+                                if f.binding_excluded {
+                                    continue;
+                                }
+                                let getter =
+                                    public_host_identifier(Language::Crystal, PublicIdentifierKind::Field, &f.name);
+                                let key = wire_field_name(
+                                    &f.name,
+                                    f.serde_rename.as_deref(),
+                                    inner_type.serde_rename_all.as_deref(),
+                                );
+                                let mut ty = crystal_type(&f.ty).into_owned();
+                                if f.optional && !ty.ends_with('?') {
+                                    ty.push('?');
+                                }
+                                if key != getter {
+                                    out.push_str(&format!("    @[JSON::Field(key: {key:?})]\n"));
+                                }
+                                out.push_str(&format!("    getter {getter} : {ty}\n"));
+                            }
+                        }
+                    } else {
+                        let ty = crystal_type(&inner.ty).into_owned();
+                        out.push_str(&format!("    getter value : {ty}\n"));
+                        out.push_str(&format!("    def initialize(@value : {ty})\n    end\n"));
                     }
-                    let getter = public_host_identifier(Language::Crystal, PublicIdentifierKind::Field, &f.name);
-                    let key = wire_field_name(&f.name, f.serde_rename.as_deref(), en.serde_rename_all.as_deref());
-                    let mut ty = crystal_type(&f.ty).into_owned();
-                    if f.optional && !ty.ends_with('?') {
-                        ty.push('?');
+                } else {
+                    for f in &v.fields {
+                        if f.binding_excluded {
+                            continue;
+                        }
+                        let getter = public_host_identifier(Language::Crystal, PublicIdentifierKind::Field, &f.name);
+                        let key = wire_field_name(&f.name, f.serde_rename.as_deref(), en.serde_rename_all.as_deref());
+                        let mut ty = crystal_type(&f.ty).into_owned();
+                        if f.optional && !ty.ends_with('?') {
+                            ty.push('?');
+                        }
+                        if key != getter {
+                            out.push_str(&format!("    @[JSON::Field(key: {key:?})]\n"));
+                        }
+                        out.push_str(&format!("    getter {getter} : {ty}\n"));
                     }
-                    if key != getter {
-                        out.push_str(&format!("    @[JSON::Field(key: {key:?})]\n"));
-                    }
-                    out.push_str(&format!("    getter {getter} : {ty}\n"));
                 }
             }
             out.push_str("  end\n");
