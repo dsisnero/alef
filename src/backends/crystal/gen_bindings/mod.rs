@@ -94,6 +94,22 @@ impl CrystalBackend {
             let struct_name = crystal_type_name(name);
             out.push_str(&format!("  struct {struct_name}; end\n"));
         }
+        // Emit `from_json`/`to_json`/`free` helper declarations for each struct type.
+        for name in &sorted_structs {
+            let type_snake = public_host_identifier(Language::Crystal, PublicIdentifierKind::Function, name);
+            out.push_str(&format!(
+                "  fun {type_snake}_from_json = {ffi_prefix}_{type_snake}_from_json(json : LibC::Char*) : {struct_name}*\n",
+                struct_name = crystal_type_name(name),
+            ));
+            out.push_str(&format!(
+                "  fun {type_snake}_to_json = {ffi_prefix}_{type_snake}_to_json(ptr : {struct_name}*) : LibC::Char*\n",
+                struct_name = crystal_type_name(name),
+            ));
+            out.push_str(&format!(
+                "  fun {type_snake}_free = {ffi_prefix}_{type_snake}_free(ptr : {struct_name}*)\n",
+                struct_name = crystal_type_name(name),
+            ));
+        }
         if !sorted_structs.is_empty() {
             out.push('\n');
         }
@@ -199,6 +215,7 @@ impl CrystalBackend {
         ffi_exclude: &HashSet<String>,
         opaque: &HashSet<String>,
         streaming: &[StreamSpec],
+        ffi_structs: &HashSet<String>,
     ) -> String {
         let module_name = Self::module_name(&api.crate_name);
         let lib_name = Self::lib_name(ffi_prefix);
@@ -213,13 +230,20 @@ impl CrystalBackend {
 
         // Type definitions (structs, enums, error classes) live inside the module
         // namespace so wrapper methods can reference `Config.from_json(...)` etc.
-        out.push_str(&Self::gen_types(api, ffi_prefix, &lib_name, opaque, streaming));
+        out.push_str(&Self::gen_types(
+            api,
+            ffi_prefix,
+            &lib_name,
+            opaque,
+            streaming,
+            ffi_structs,
+        ));
 
         for func in &api.functions {
             if Self::is_excluded(func, ffi_exclude) {
                 continue;
             }
-            out.push_str(&Self::gen_wrapper_method(func, &lib_name, opaque));
+            out.push_str(&Self::gen_wrapper_method(func, &lib_name, opaque, ffi_structs));
         }
 
         // Free (owner-less) streaming methods — owners that are not opaque handles
@@ -242,6 +266,7 @@ impl CrystalBackend {
         lib_name: &str,
         opaque: &HashSet<String>,
         streaming: &[StreamSpec],
+        ffi_structs: &HashSet<String>,
     ) -> String {
         let mut out = String::new();
         for ty in &api.types {
@@ -249,7 +274,14 @@ impl CrystalBackend {
                 continue;
             }
             if ty.is_opaque {
-                out.push_str(&Self::gen_opaque(ty, ffi_prefix, lib_name, opaque, streaming));
+                out.push_str(&Self::gen_opaque(
+                    ty,
+                    ffi_prefix,
+                    lib_name,
+                    opaque,
+                    streaming,
+                    ffi_structs,
+                ));
                 continue;
             }
             out.push_str(&Self::gen_struct(ty));
@@ -330,6 +362,7 @@ impl CrystalBackend {
         lib_name: &str,
         opaque: &HashSet<String>,
         streaming: &[StreamSpec],
+        ffi_structs: &HashSet<String>,
     ) -> String {
         let name = crystal_type_name(&ty.name);
         let type_snake = public_host_identifier(Language::Crystal, PublicIdentifierKind::Function, &ty.name);
@@ -349,7 +382,14 @@ impl CrystalBackend {
             if m.binding_excluded {
                 continue;
             }
-            out.push_str(&Self::gen_opaque_method(ty, m, &type_snake, lib_name, opaque));
+            out.push_str(&Self::gen_opaque_method(
+                ty,
+                m,
+                &type_snake,
+                lib_name,
+                opaque,
+                ffi_structs,
+            ));
         }
 
         // Streaming methods owned by this type → fiber-fed channels.
@@ -441,6 +481,7 @@ impl CrystalBackend {
         type_snake: &str,
         lib_name: &str,
         opaque: &HashSet<String>,
+        ffi_structs: &HashSet<String>,
     ) -> String {
         let method = public_host_identifier(Language::Crystal, PublicIdentifierKind::Function, &m.name);
         let method_snake = &method;
@@ -468,7 +509,15 @@ impl CrystalBackend {
             crystal_type(&m.return_type).into_owned()
         };
         let label = format!("{type_snake}_{method_snake}");
-        let body = Self::gen_call_body(&call, &m.return_type, m.error_type.as_deref(), lib_name, opaque, &label);
+        let body = Self::gen_call_body(
+            &call,
+            &m.return_type,
+            m.error_type.as_deref(),
+            lib_name,
+            opaque,
+            ffi_structs,
+            &label,
+        );
         let decl = if m.is_static {
             format!("self.{method}")
         } else {
@@ -974,7 +1023,12 @@ impl CrystalBackend {
     }
 
     /// Generate a single snake_case wrapper method delegating to the lib fun.
-    fn gen_wrapper_method(func: &FunctionDef, lib_name: &str, opaque: &HashSet<String>) -> String {
+    fn gen_wrapper_method(
+        func: &FunctionDef,
+        lib_name: &str,
+        opaque: &HashSet<String>,
+        ffi_structs: &HashSet<String>,
+    ) -> String {
         let method = public_host_identifier(Language::Crystal, PublicIdentifierKind::Function, &func.name);
         let ret_ty = crystal_type(&func.return_type);
 
@@ -1004,7 +1058,7 @@ impl CrystalBackend {
             ret_ty.into_owned()
         };
 
-        let body = Self::gen_wrapper_body(func, lib_name, &method, &call_args, opaque);
+        let body = Self::gen_wrapper_body(func, lib_name, &method, &call_args, opaque, ffi_structs);
 
         format!(
             "\n  # {doc}\n  def self.{method}({sig_params}) : {ret_annot}\n{body}  end\n",
@@ -1018,6 +1072,7 @@ impl CrystalBackend {
         method: &str,
         call_args: &str,
         opaque: &HashSet<String>,
+        ffi_structs: &HashSet<String>,
     ) -> String {
         let call = format!("{lib_name}.{method}({call_args})");
         Self::gen_call_body(
@@ -1026,6 +1081,7 @@ impl CrystalBackend {
             func.error_type.as_deref(),
             lib_name,
             opaque,
+            ffi_structs,
             method,
         )
     }
@@ -1038,6 +1094,7 @@ impl CrystalBackend {
         error_type: Option<&str>,
         lib_name: &str,
         opaque: &HashSet<String>,
+        ffi_structs: &HashSet<String>,
         label: &str,
     ) -> String {
         // Opaque return: the lib fun returns a raw handle pointer; wrap it in the
@@ -1049,6 +1106,28 @@ impl CrystalBackend {
                 "    raise \"{lib_name}.{label} returned a null pointer\" if __ptr.null?\n"
             ));
             b.push_str(&format!("    {ty}.new(__ptr)\n"));
+            return b;
+        }
+
+        // FFI struct returns use `*_to_json`/`*_free` helpers instead of raw string.
+        let is_struct_return = matches!(return_type, TypeRef::Named(n) if ffi_structs.contains(n));
+        if is_struct_return {
+            let type_name = match return_type {
+                TypeRef::Named(n) => n,
+                _ => unreachable!(),
+            };
+            let type_snake = public_host_identifier(Language::Crystal, PublicIdentifierKind::Function, type_name);
+            let mut b = String::new();
+            b.push_str(&format!("    __ptr = {call}\n"));
+            b.push_str(&format!(
+                "    raise \"{lib_name}.{label} returned a null pointer\" if __ptr.null?\n"
+            ));
+            b.push_str(&format!("    __json_ptr = {lib_name}.{type_snake}_to_json(__ptr)\n"));
+            b.push_str(&format!("    {lib_name}.{type_snake}_free(__ptr)\n"));
+            b.push_str("    __json = String.new(__json_ptr)\n");
+            b.push_str(&format!("    {lib_name}.free_string(__json_ptr)\n"));
+            let ty = crystal_type(return_type);
+            b.push_str(&format!("    {ty}.from_json(__json)\n"));
             return b;
         }
 
@@ -1447,7 +1526,14 @@ impl Backend for CrystalBackend {
             &streaming,
             &ffi_structs,
         );
-        content.push_str(&Self::gen_module(api, &ffi_prefix, &extra_exclude, &opaque, &streaming));
+        content.push_str(&Self::gen_module(
+            api,
+            &ffi_prefix,
+            &extra_exclude,
+            &opaque,
+            &streaming,
+            &ffi_structs,
+        ));
 
         // Append `require` statements for auxiliary bridge files before finalising content.
         let lib_name = Self::lib_name(&ffi_prefix);
