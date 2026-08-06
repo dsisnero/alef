@@ -103,10 +103,6 @@ pub fn magnus_error_methods_registrations(error: &ErrorDef) -> Vec<String> {
     lines
 }
 
-// ---------------------------------------------------------------------------
-// PHP (ext-php-rs) error generation
-// ---------------------------------------------------------------------------
-
 /// Generate a converter function that maps a core error to `PhpException`.
 pub fn gen_php_error_converter(error: &ErrorDef, core_import: &str) -> String {
     let rust_path = if error.rust_path.is_empty() {
@@ -117,7 +113,6 @@ pub fn gen_php_error_converter(error: &ErrorDef, core_import: &str) -> String {
 
     let fn_name = format!("{}_to_php_err", to_snake_case(&error.name));
 
-    // Pre-compute (pattern, variant_name) pairs
     let mut variants = Vec::new();
     for variant in &error.variants {
         let pattern = error_variant_wildcard_pattern(&rust_path, variant);
@@ -221,10 +216,6 @@ pub fn gen_php_error_methods_impl(error: &ErrorDef, core_import: &str) -> String
     format!("{struct_def}\n\n{from_fn}\n\n{impl_block}")
 }
 
-// ---------------------------------------------------------------------------
-// Magnus (Ruby) error generation
-// ---------------------------------------------------------------------------
-
 /// Generate a converter function that maps a core error to `magnus::Error`.
 pub fn gen_magnus_error_converter(error: &ErrorDef, core_import: &str) -> String {
     let rust_path = if error.rust_path.is_empty() {
@@ -248,10 +239,6 @@ pub fn gen_magnus_error_converter(error: &ErrorDef, core_import: &str) -> String
 pub fn magnus_converter_fn_name(error: &ErrorDef) -> String {
     format!("{}_to_magnus_err", to_snake_case(&error.name))
 }
-
-// ---------------------------------------------------------------------------
-// Rustler (Elixir) error generation
-// ---------------------------------------------------------------------------
 
 /// Generate a converter function that maps a core error to a Rustler error tuple `{:error, reason}`.
 pub fn gen_rustler_error_converter(error: &ErrorDef, core_import: &str) -> String {
@@ -277,10 +264,6 @@ pub fn rustler_converter_fn_name(error: &ErrorDef) -> String {
     format!("{}_to_rustler_err", to_snake_case(&error.name))
 }
 
-// ---------------------------------------------------------------------------
-// FFI (C) error code generation
-// ---------------------------------------------------------------------------
-
 /// Generate a C enum of error codes plus an error-message function declaration.
 ///
 /// Produces a `typedef enum` with `PREFIX_ERROR_NONE = 0` followed by one entry
@@ -289,7 +272,6 @@ pub fn gen_ffi_error_codes(error: &ErrorDef) -> String {
     let prefix = to_screaming_snake(&error.name);
     let prefix_lower = to_snake_case(&error.name);
 
-    // Pre-compute (variant_screaming, index) pairs
     let mut variant_variants = Vec::new();
     for (i, variant) in error.variants.iter().enumerate() {
         let variant_screaming = to_screaming_snake(&variant.name);
@@ -307,7 +289,7 @@ pub fn gen_ffi_error_codes(error: &ErrorDef) -> String {
     )
 }
 
-/// Generate `#[no_mangle] extern "C"` helper functions for the whitelisted
+/// Generate `#[unsafe(no_mangle)] extern "C"` helper functions for the whitelisted
 /// introspection methods (`status_code`, `is_transient`, `error_type`) declared
 /// in `error.methods`.
 ///
@@ -338,14 +320,14 @@ pub fn gen_ffi_error_methods(error: &ErrorDef, core_import: &str, api_prefix: &s
                 items.push(format!(
                     "/// Return the HTTP status code for the error pointed to by `err`.\n\
                      /// Returns `0` if `err` is null.\n\
-                     #[no_mangle]\n\
+                     #[unsafe(no_mangle)]\n\
                      pub unsafe extern \"C\" fn {fn_name}(err: *const {rust_path}) -> u16 {{\n\
-                         // SAFETY: caller guarantees `err` points to a live `{rust_path}` value\n\
-                         // allocated by this library, or is null.\n\
                          if err.is_null() {{\n\
                              return 0;\n\
                          }}\n\
-                         (*err).status_code()\n\
+                         // SAFETY: caller guarantees `err` points to a live `{rust_path}` value\n\
+                         // allocated by this library, or is null (checked above).\n\
+                         unsafe {{ (*err).status_code() }}\n\
                      }}"
                 ));
             }
@@ -354,14 +336,14 @@ pub fn gen_ffi_error_methods(error: &ErrorDef, core_import: &str, api_prefix: &s
                 items.push(format!(
                     "/// Return whether the error pointed to by `err` is transient.\n\
                      /// Returns `false` if `err` is null.\n\
-                     #[no_mangle]\n\
+                     #[unsafe(no_mangle)]\n\
                      pub unsafe extern \"C\" fn {fn_name}(err: *const {rust_path}) -> bool {{\n\
-                         // SAFETY: caller guarantees `err` points to a live `{rust_path}` value\n\
-                         // allocated by this library, or is null.\n\
                          if err.is_null() {{\n\
                              return false;\n\
                          }}\n\
-                         (*err).is_transient()\n\
+                         // SAFETY: caller guarantees `err` points to a live `{rust_path}` value\n\
+                         // allocated by this library, or is null (checked above).\n\
+                         unsafe {{ (*err).is_transient() }}\n\
                      }}"
                 ));
             }
@@ -373,14 +355,14 @@ pub fn gen_ffi_error_methods(error: &ErrorDef, core_import: &str, api_prefix: &s
                      /// to by `err` as a heap-allocated, NUL-terminated C string.\n\
                      /// The caller must free the returned pointer with `{free_fn_name}`.\n\
                      /// Returns a null pointer if `err` is null.\n\
-                     #[no_mangle]\n\
+                     #[unsafe(no_mangle)]\n\
                      pub unsafe extern \"C\" fn {fn_name}(err: *const {rust_path}) -> *mut std::ffi::c_char {{\n\
-                         // SAFETY: caller guarantees `err` points to a live `{rust_path}` value\n\
-                         // allocated by this library, or is null.\n\
                          if err.is_null() {{\n\
                              return std::ptr::null_mut();\n\
                          }}\n\
-                         let s = (*err).error_type();\n\
+                         // SAFETY: caller guarantees `err` points to a live `{rust_path}` value\n\
+                         // allocated by this library, or is null (checked above).\n\
+                         let s = unsafe {{ (*err).error_type() }};\n\
                          // SAFETY: `error_type()` returns a `'static str` containing no NUL bytes.\n\
                          std::ffi::CString::new(s)\n\
                              .map(|c| c.into_raw())\n\
@@ -388,19 +370,18 @@ pub fn gen_ffi_error_methods(error: &ErrorDef, core_import: &str, api_prefix: &s
                      }}\n\n\
                      /// Free a string previously returned by `{fn_name}`.\n\
                      /// Passing a null pointer is a no-op.\n\
-                     #[no_mangle]\n\
+                     #[unsafe(no_mangle)]\n\
                      pub unsafe extern \"C\" fn {free_fn_name}(ptr: *mut std::ffi::c_char) {{\n\
-                         // SAFETY: `ptr` was allocated by `CString::into_raw` inside\n\
-                         // `{fn_name}` and is now being reclaimed by the matching\n\
-                         // `CString::from_raw`.  Passing null is explicitly allowed.\n\
                          if !ptr.is_null() {{\n\
-                             drop(std::ffi::CString::from_raw(ptr));\n\
+                             // SAFETY: `ptr` was allocated by `CString::into_raw` inside\n\
+                             // `{fn_name}` and is now being reclaimed by the matching\n\
+                             // `CString::from_raw`.  Passing null is explicitly allowed.\n\
+                             unsafe {{ drop(std::ffi::CString::from_raw(ptr)) }};\n\
                          }}\n\
                      }}"
                 ));
             }
             other => {
-                // Unknown whitelisted method — emit a comment so it is visible in review.
                 items.push(format!(
                     "// Not emitted: FFI helper for method `{other}` on `{rust_path}`"
                 ));
@@ -410,10 +391,6 @@ pub fn gen_ffi_error_methods(error: &ErrorDef, core_import: &str, api_prefix: &s
 
     items.join("\n\n")
 }
-
-// ---------------------------------------------------------------------------
-// Go error type generation
-// ---------------------------------------------------------------------------
 
 /// Generate Go sentinel errors and a structured error type for an `ErrorDef`.
 ///

@@ -329,6 +329,64 @@ fn wasm_imports_nested_types_from_json_object_element_types() {
         output.contains("WasmFileExtractionConfig"),
         "WASM imports must include nested DTOs reached through json_object element types;\n{output}"
     );
+
+    // The bare `element_type = "ExtractInput"` names a wasm-wrapped struct, so
+    // the constructor reference is prefixed (`WasmExtractInput.default()`). The
+    // import statement must reference the same prefixed name or the test throws
+    // `ReferenceError: WasmExtractInput is not defined` at runtime.
+    let import_line = output
+        .lines()
+        .find(|l| l.starts_with("import") && l.contains("@test/wasm"))
+        .expect("wasm test file must have a binding import line");
+    assert!(
+        import_line.contains("WasmExtractInput"),
+        "import line must reference the prefixed input class;\n{import_line}"
+    );
+    assert!(
+        !import_line.split([',', '{', '}', ' ']).any(|tok| tok == "ExtractInput"),
+        "import line must NOT reference the bare, unprefixed input class;\n{import_line}"
+    );
+    assert!(
+        output.contains("WasmExtractInput.default()"),
+        "constructor reference must use the prefixed input class;\n{output}"
+    );
+}
+
+#[test]
+fn wasm_prefixed_wrapped_type_prefixes_known_structs_and_enums() {
+    let struct_def = make_type("ExtractInput", vec![]);
+    let enum_def = crate::core::ir::EnumDef {
+        name: "OutputFormat".to_string(),
+        ..Default::default()
+    };
+    let type_defs = [struct_def];
+    let enums = [enum_def];
+
+    // Known wrapped struct → prefixed.
+    assert_eq!(
+        wasm_prefixed_wrapped_type("wasm", "ExtractInput", &type_defs, &enums, "Wasm"),
+        "WasmExtractInput"
+    );
+    // Known wrapped enum → prefixed.
+    assert_eq!(
+        wasm_prefixed_wrapped_type("wasm", "OutputFormat", &type_defs, &enums, "Wasm"),
+        "WasmOutputFormat"
+    );
+    // Already prefixed → unchanged (no double prefix).
+    assert_eq!(
+        wasm_prefixed_wrapped_type("wasm", "WasmExtractInput", &type_defs, &enums, "Wasm"),
+        "WasmExtractInput"
+    );
+    // Unknown / host type → unchanged.
+    assert_eq!(
+        wasm_prefixed_wrapped_type("wasm", "Uint8Array", &type_defs, &enums, "Wasm"),
+        "Uint8Array"
+    );
+    // Non-wasm language → never prefixed, even for a known struct.
+    assert_eq!(
+        wasm_prefixed_wrapped_type("node", "ExtractInput", &type_defs, &enums, "Wasm"),
+        "ExtractInput"
+    );
 }
 
 #[test]
@@ -594,5 +652,143 @@ fn render_env_setup_uses_defaultassign_semantics() {
     assert!(
         output.contains("??="),
         "must use ??= operator for setdefault semantics; got: {output}"
+    );
+}
+
+/// Regression: a fixture whose request declares `multipart/form-data` but carries a
+/// plain JSON *object* body (a multipart param with no synthesized body) must be sent
+/// as a JSON.stringify'd body with `application/json`, NOT with the synthesized
+/// multipart boundary Content-Type — that header on a JSON body makes the server's
+/// multipart parser reject the request with 400 before the handler runs. Mirrors the
+/// Python generator's else-branch.
+#[test]
+fn multipart_param_with_json_object_body_does_not_emit_boundary_content_type() {
+    use crate::e2e::fixture::{Fixture, HttpExpectedResponse, HttpFixture, HttpHandler, HttpRequest};
+
+    let fixture = Fixture {
+        id: "upload_file_basic".to_string(),
+        category: Some("upload".to_string()),
+        description: "upload a file".to_string(),
+        tags: vec![],
+        skip: None,
+        env: None,
+        setup: Vec::new(),
+        call: None,
+        input: serde_json::Value::Null,
+        mock_response: None,
+        visitor: None,
+        args: vec![],
+        assertion_recipes: vec![],
+        assertions: vec![],
+        source: String::new(),
+        http: Some(HttpFixture {
+            handler: HttpHandler {
+                route: "/upload".to_string(),
+                method: "POST".to_string(),
+                body_schema: None,
+                parameters: Default::default(),
+                middleware: None,
+            },
+            request: HttpRequest {
+                method: "POST".to_string(),
+                path: "/upload".to_string(),
+                headers: Default::default(),
+                query_params: Default::default(),
+                cookies: Default::default(),
+                body: Some(serde_json::json!({"file": {"content": "hi", "filename": "a.txt"}})),
+                form_data: None,
+                content_type: Some("multipart/form-data".to_string()),
+            },
+            expected_response: HttpExpectedResponse {
+                status_code: 200,
+                body: Some(serde_json::json!({"filename": "a.txt"})),
+                body_partial: None,
+                headers: Default::default(),
+                validation_errors: None,
+            },
+        }),
+    };
+
+    let mut out = String::new();
+    super::http::render_http_test_case(&mut out, &fixture);
+
+    assert!(
+        !out.contains("boundary=alef-boundary"),
+        "a JSON object body must NOT get the multipart boundary Content-Type; got:\n{out}"
+    );
+    assert!(
+        out.contains("JSON.stringify"),
+        "a JSON object body must be JSON.stringify'd; got:\n{out}"
+    );
+    assert!(
+        out.contains("application/json"),
+        "a JSON object body must declare application/json; got:\n{out}"
+    );
+}
+
+/// Regression: a multipart fixture with no explicit body but a `body_schema` still
+/// synthesizes a real multipart string body and MUST carry the boundary Content-Type
+/// (sent via Buffer.from as raw bytes).
+#[test]
+fn multipart_synthesized_body_emits_boundary_content_type() {
+    use crate::e2e::fixture::{Fixture, HttpExpectedResponse, HttpFixture, HttpHandler, HttpRequest};
+
+    let fixture = Fixture {
+        id: "upload_synth".to_string(),
+        category: Some("upload".to_string()),
+        description: "synthesized multipart".to_string(),
+        tags: vec![],
+        skip: None,
+        env: None,
+        setup: Vec::new(),
+        call: None,
+        input: serde_json::Value::Null,
+        mock_response: None,
+        visitor: None,
+        args: vec![],
+        assertion_recipes: vec![],
+        assertions: vec![],
+        source: String::new(),
+        http: Some(HttpFixture {
+            handler: HttpHandler {
+                route: "/upload".to_string(),
+                method: "POST".to_string(),
+                body_schema: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {"file": {"type": "string", "format": "binary"}}
+                })),
+                parameters: Default::default(),
+                middleware: None,
+            },
+            request: HttpRequest {
+                method: "POST".to_string(),
+                path: "/upload".to_string(),
+                headers: Default::default(),
+                query_params: Default::default(),
+                cookies: Default::default(),
+                body: None,
+                form_data: None,
+                content_type: Some("multipart/form-data".to_string()),
+            },
+            expected_response: HttpExpectedResponse {
+                status_code: 200,
+                body: None,
+                body_partial: None,
+                headers: Default::default(),
+                validation_errors: None,
+            },
+        }),
+    };
+
+    let mut out = String::new();
+    super::http::render_http_test_case(&mut out, &fixture);
+
+    assert!(
+        out.contains("boundary=alef-boundary"),
+        "a synthesized multipart body must carry the boundary Content-Type; got:\n{out}"
+    );
+    assert!(
+        out.contains("Buffer.from"),
+        "a synthesized multipart body must be sent as raw bytes via Buffer.from; got:\n{out}"
     );
 }

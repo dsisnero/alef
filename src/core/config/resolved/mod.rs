@@ -54,9 +54,6 @@ use crate::core::config::workspace::ClientConstructorConfig;
 /// placeholders substituted).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ResolvedCrateConfig {
-    // -----------------------------------------------------------------
-    // Identity
-    // -----------------------------------------------------------------
     pub name: String,
     pub sources: Vec<PathBuf>,
     pub source_crates: Vec<SourceCrate>,
@@ -71,14 +68,13 @@ pub struct ResolvedCrateConfig {
     pub extra_dependencies: HashMap<String, toml::Value>,
     pub auto_path_mappings: bool,
 
-    // -----------------------------------------------------------------
-    // Languages targeted by this crate
-    // -----------------------------------------------------------------
     pub languages: Vec<Language>,
 
-    // -----------------------------------------------------------------
-    // Per-language settings (workspace defaults already merged)
-    // -----------------------------------------------------------------
+    /// Resolved per-target opt-out toggles: workspace `[targets]` defaults with
+    /// per-crate `[[crates]] targets` overrides merged in. Empty means every
+    /// target is enabled (the default). Consumed via [`Self::target_enabled`].
+    pub targets: std::collections::BTreeMap<String, bool>,
+
     pub python: Option<PythonConfig>,
     pub node: Option<NodeConfig>,
     pub ruby: Option<RubyConfig>,
@@ -99,9 +95,6 @@ pub struct ResolvedCrateConfig {
     pub zig: Option<ZigConfig>,
     pub crystal: Option<CrystalConfig>,
 
-    // -----------------------------------------------------------------
-    // Filters
-    // -----------------------------------------------------------------
     pub exclude: ExcludeConfig,
     pub include: IncludeConfig,
 
@@ -117,9 +110,6 @@ pub struct ResolvedCrateConfig {
     /// any other consumer that derives identifiers from the user-supplied path.
     pub explicit_output: OutputConfig,
 
-    // -----------------------------------------------------------------
-    // Pipelines (workspace defaults merged with per-crate overrides)
-    // -----------------------------------------------------------------
     pub lint: HashMap<String, LintConfig>,
     pub test: HashMap<String, TestConfig>,
     pub setup: HashMap<String, SetupConfig>,
@@ -127,25 +117,16 @@ pub struct ResolvedCrateConfig {
     pub clean: HashMap<String, CleanConfig>,
     pub build_commands: HashMap<String, BuildCommandConfig>,
 
-    // -----------------------------------------------------------------
-    // Generation flags
-    // -----------------------------------------------------------------
     pub generate: GenerateConfig,
     pub generate_overrides: HashMap<String, GenerateConfig>,
     pub dto: DtoConfig,
 
-    // -----------------------------------------------------------------
-    // Workspace concerns surfaced to the crate (read-only inheritance)
-    // -----------------------------------------------------------------
     pub tools: ToolsConfig,
     pub opaque_types: HashMap<String, String>,
     pub client_constructors: HashMap<String, ClientConstructorConfig>,
     pub sync: Option<SyncConfig>,
     pub citation: Option<CitationConfig>,
 
-    // -----------------------------------------------------------------
-    // Packaging, e2e, extensibility
-    // -----------------------------------------------------------------
     pub publish: Option<PublishConfig>,
     pub e2e: Option<E2eConfig>,
     pub adapters: Vec<AdapterConfig>,
@@ -204,5 +185,16 @@ impl ResolvedCrateConfig {
     /// Whether this crate targets the given language.
     pub fn targets(&self, lang: Language) -> bool {
         self.languages.contains(&lang)
+    }
+
+    /// Whether the given Rust target triple is enabled for this crate's
+    /// generated target lists, per the resolved `[targets]` opt-out table.
+    ///
+    /// Returns `true` unless the triple's canonical target key is present with
+    /// an explicit `false`. Triples with no canonical key (arm/wasm32) are
+    /// always enabled.
+    #[must_use]
+    pub fn target_enabled(&self, triple: &str) -> bool {
+        crate::publish::platform::target_triple_enabled(&self.targets, triple)
     }
 }

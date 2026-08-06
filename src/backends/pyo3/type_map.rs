@@ -32,23 +32,13 @@ impl Default for Pyo3Mapper {
 
 impl TypeMapper for Pyo3Mapper {
     fn json(&self) -> Cow<'static, str> {
-        Cow::Borrowed("String") // JSON as string, user deserializes
+        Cow::Borrowed("String")
     }
 
     fn named<'a>(&self, name: &'a str) -> Cow<'a, str> {
         if self.trait_type_names.contains(name) {
-            // Trait objects cannot be used as bare types (E0782) and cannot cross the
-            // PyO3 FFI boundary as `Arc<dyn Trait>` (Arc breaks IntoPyObject).
-            // Use PyVisitorRef wrapper: a newtype that wraps Py<PyAny> and implements Clone
-            // via Python::with_gil, allowing the binding struct to derive Clone.
             Cow::Borrowed("PyVisitorRef")
         } else if name == "Value" {
-            // Bare `Value` references that the source crate did not fully qualify as
-            // `serde_json::Value`. Map to `serde_json::Value` so the generated struct
-            // compiles without scope issues (PyO3 structs need all types fully qualified
-            // or in scope via imports). Unlike NAPI, PyO3 does not auto-convert
-            // serde_json::Value, so fields remain as serde_json::Value and callers
-            // handle JSON serialization in getter/setter methods if needed.
             Cow::Borrowed("serde_json::Value")
         } else {
             Cow::Borrowed(name)
@@ -89,5 +79,38 @@ pub fn python_type(ty: &TypeRef) -> String {
         TypeRef::Json => "dict[str, Any]".to_string(),
         TypeRef::Unit => "None".to_string(),
         TypeRef::Duration => "int".to_string(),
+    }
+}
+
+/// Maps a TypeRef to its Python representation for a value the host *returns* to a trait
+/// bridge — a `Protocol` method the caller implements and PyO3 extracts from.
+///
+/// Numeric sequences widen to `Iterable[...]`. PyO3's `Vec<T>` extraction accepts any object
+/// passing `PySequence_Check`, not just `list`, so annotating these as `list[...]` understates
+/// the boundary and forces array-based implementations (NumPy and friends) through a `.tolist()`
+/// the bridge never needed. Parameters keep [`python_type`], which describes what the bridge
+/// actually passes in.
+///
+/// Only numeric leaves widen. `Iterable[str]` would admit a bare `str` — `str` is iterable and
+/// yields `str` — which PyO3 explicitly rejects (`Can't extract \`str\` to \`Vec\``), so widening
+/// a `Vec<String>` return would delete a static check that catches a real mistake. `str` is not
+/// an `Iterable[float]`, so the numeric case has no such hole, and it is the only case with an
+/// array form to accommodate.
+pub fn python_callback_return_type(ty: &TypeRef) -> String {
+    match ty {
+        TypeRef::Vec(inner) if has_numeric_leaf(inner) => {
+            format!("Iterable[{}]", python_callback_return_type(inner))
+        }
+        TypeRef::Optional(inner) => format!("{} | None", python_callback_return_type(inner)),
+        other => python_type(other),
+    }
+}
+
+/// True when `ty` is a numeric scalar, or nests down to one through `Vec`.
+fn has_numeric_leaf(ty: &TypeRef) -> bool {
+    match ty {
+        TypeRef::Primitive(_) => true,
+        TypeRef::Vec(inner) => has_numeric_leaf(inner),
+        _ => false,
     }
 }

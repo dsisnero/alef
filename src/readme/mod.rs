@@ -20,6 +20,8 @@ pub fn generate_readmes(
     config: &ResolvedCrateConfig,
     languages: &[Language],
 ) -> anyhow::Result<Vec<GeneratedFile>> {
+    validate_readme_snippets_dir(config)?;
+
     let mut files = vec![];
     let mut seen_paths = HashSet::new();
     for &lang in languages {
@@ -48,24 +50,14 @@ fn generate_readme(
     config: &ResolvedCrateConfig,
     lang: Language,
 ) -> anyhow::Result<Option<GeneratedFile>> {
-    // Rust is the source crate, not a binding. The canonical Rust README lives at
-    // the workspace crate (e.g. `crates/<name>/README.md`) and is hand-written or
-    // managed by the consumer repo. Only emit a Rust README when the user has
-    // explicitly opted in via `[readme.languages.rust]` with an `output_path`.
     if matches!(lang, Language::Rust) && !rust_readme_explicitly_configured(config) {
         return Ok(None);
     }
 
-    // Language::Jni and Language::C are FFI shim glue layers, not publishable
-    // bindings — they share their public surface with the host language (kotlin-android,
-    // ffi). The hardcoded fallback used to emit them at `packages/zig/README.md`,
-    // which collided with the actual Zig README. Skip silently — consumers that
-    // want a C/JNI README can opt in via `[readme.languages.c]` / `.jni`.
     if matches!(lang, Language::C | Language::Jni) {
         return Ok(None);
     }
 
-    // Try template-based generation first when readme config is present
     if let Some(readme_cfg) = &config.readme {
         if let Some(template_dir) = &readme_cfg.template_dir {
             let workspace_root = config.workspace_root.clone().unwrap_or_else(|| PathBuf::from("."));
@@ -80,7 +72,6 @@ fn generate_readme(
         }
     }
 
-    // Fall back to hardcoded generation
     Ok(Some(fallback::generate_readme_hardcoded(api, config, lang)?))
 }
 
@@ -137,6 +128,34 @@ fn push_unique_readme(
         );
     }
     files.push(file);
+    Ok(())
+}
+
+/// Validate that a configured `crates.readme.snippets_dir` actually exists.
+///
+/// Checked unconditionally, before any template renders, regardless of
+/// whether the language templates currently reference the `include_snippet`
+/// filter: a stale `snippets_dir` must fail the build even for languages
+/// whose README template does not (yet, or ever) call the filter. A
+/// misconfigured path here previously resolved every `include_snippet` call
+/// to a silent `<!-- snippet not found -->` placeholder that shipped into
+/// published READMEs while `alef readme` reported success. ~keep
+fn validate_readme_snippets_dir(config: &ResolvedCrateConfig) -> anyhow::Result<()> {
+    let Some(readme_cfg) = &config.readme else {
+        return Ok(());
+    };
+    let Some(snippets_dir) = &readme_cfg.snippets_dir else {
+        return Ok(());
+    };
+    let workspace_root = config.workspace_root.clone().unwrap_or_else(|| PathBuf::from("."));
+    let abs_snippets_dir = workspace_root.join(snippets_dir);
+    if !abs_snippets_dir.exists() {
+        anyhow::bail!(
+            "config key `crates.readme.snippets_dir` is set to '{}' (resolved to '{}'), which does not exist",
+            snippets_dir.display(),
+            abs_snippets_dir.display()
+        );
+    }
     Ok(())
 }
 

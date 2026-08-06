@@ -40,6 +40,28 @@ pub struct PhpBridgeGenerator {
     pub forwardable_defaulted: std::collections::HashSet<String>,
 }
 
+/// Returns true if a `Zval` for `ty` can be produced directly via `IntoZval` (Rust -> PHP),
+/// recursing into `Vec`. Used to decide when a trait-bridge callback argument can be passed as a
+/// native PHP array/scalar instead of a Debug-string encoded one (#1304).
+pub(super) fn is_php_encodable(ty: &TypeRef) -> bool {
+    match ty {
+        TypeRef::String => true,
+        TypeRef::Primitive(_) => true,
+        TypeRef::Vec(inner) => is_php_encodable(inner),
+        _ => false,
+    }
+}
+
+/// Returns true if a `Zval` for `ty` can be decoded directly via `FromZval` (PHP -> Rust),
+/// recursing into `Vec`. Unlike napi-rs (which lacks `FromNapiValue for f32`), ext-php-rs
+/// 0.15.15 implements `FromZval` for every `PrimitiveType` variant including `f32`
+/// (`impl FromZval<'_> for f32` in `types/mod.rs`, converting the PHP `double` zval via
+/// `zval.double().map(|v| v as f32)`), so no primitive needs to be excluded here — this
+/// classifier is intentionally identical to [`is_php_encodable`].
+pub(super) fn is_php_decodable(ty: &TypeRef) -> bool {
+    is_php_encodable(ty)
+}
+
 impl PhpBridgeGenerator {
     /// Binding `#[php_class]` name to extract for a native-object return, when the return is a bare
     /// `Named` struct on the (conversion-gated) native-marshalled return allowlist. The bridge tries
@@ -71,14 +93,8 @@ impl PhpBridgeGenerator {
                 "ext_php_rs::types::Zval::try_from(format!(\"{{:?}}\", {})).unwrap_or_default()",
                 p.name
             ),
-            // Known serde struct: hand PHP the binding's native object, not a JSON string. The
             // bare `#[php_class]` struct is not `IntoZval`; box it in a `ZendClassObject` (which
-            // is) so the host receives a real class instance rather than a serialized string.
-            // Borrowed params deref first; owned (by-value) params construct from the value
-            // directly — `(*owned)` would not type-check (E0614).
             TypeRef::Named(n) if self.struct_param_types.contains(n.as_str()) => {
-                // Borrowed params must clone out of the `&`; owned params are moved in (the
-                // param — e.g. a by-value `ExtractInput` carrying document bytes — is used once).
                 let core_value = if p.is_ref {
                     format!("(*{}).clone()", p.name)
                 } else {
@@ -88,13 +104,22 @@ impl PhpBridgeGenerator {
                     "ext_php_rs::convert::IntoZval::into_zval(ext_php_rs::types::ZendClassObject::new({n}::from({core_value})), false).unwrap_or_default()"
                 )
             }
-            // Other Named params (enums, opaque/handle, excluded/unknown) keep the JSON string.
             TypeRef::Named(_) => format!(
                 "ext_php_rs::types::Zval::try_from(serde_json::to_string(&{}).unwrap_or_default()).unwrap_or_default()",
                 p.name
             ),
             TypeRef::Primitive(_) => {
                 format!("ext_php_rs::types::Zval::try_from({}).unwrap_or_default()", p.name)
+            }
+            // `Vec<T>` of a php-native `T` (String/primitive, recursively) is `IntoZval` in
+            // ext-php-rs — pass it as a native PHP array instead of a Debug string (#1304).
+            TypeRef::Vec(inner) if is_php_encodable(inner) => {
+                let owned = if p.is_ref {
+                    format!("{}.to_vec()", p.name)
+                } else {
+                    format!("{}.clone()", p.name)
+                };
+                format!("ext_php_rs::convert::IntoZval::into_zval({owned}, false).unwrap_or_default()")
             }
             _ => format!(
                 "ext_php_rs::types::Zval::try_from(format!(\"{{:?}}\", {})).unwrap_or_default()",
@@ -162,6 +187,13 @@ impl TraitBridgeGenerator for PhpBridgeGenerator {
 
         let deserialize_error_expr = spec.make_error("format!(\"Deserialize error: {}\", e)");
         let call_error_expr = spec.make_error("e.to_string()");
+        // Native decode only applies to the generic (non-primitive, non-native-struct) branch: ~keep
+        // `is_primitive_return` already decodes primitives directly via `val.long()`/`val.bool()`, ~keep
+        // and `native_return_binding` already covers known serde structs. ~keep
+        let native_decodable = !is_primitive_return && is_php_decodable(&method.return_type);
+        let native_decode_error_expr = spec.make_error(&format!(
+            "\"Failed to decode native PHP return value for method '{name}'\".to_string()"
+        ));
 
         crate::backends::php::template_env::render(
             "sync_method_body.jinja",
@@ -174,6 +206,8 @@ impl TraitBridgeGenerator for PhpBridgeGenerator {
                 is_primitive_return => is_primitive_return,
                 return_type => return_type,
                 native_return_binding => self.native_struct_return(&method.return_type),
+                native_decodable => native_decodable,
+                native_decode_error_expr => native_decode_error_expr,
                 deserialize_error_expr => deserialize_error_expr,
                 call_error_expr => call_error_expr,
             },
@@ -193,9 +227,24 @@ impl TraitBridgeGenerator for PhpBridgeGenerator {
         let args_expr = self.args_expr(method);
 
         let is_result_type = method.error_type.is_some();
+        let is_primitive_return = matches!(&method.return_type, TypeRef::Primitive(_));
+        // Native decode only applies to the generic (non-primitive, non-native-struct) branch —
+        // see the matching comment in `gen_sync_method_body`.
+        let native_decodable = !is_primitive_return && is_php_decodable(&method.return_type);
+        let return_type = match &method.return_type {
+            TypeRef::Named(n) => self
+                .type_paths
+                .get(n.as_str())
+                .map(|p| p.replace('-', "_"))
+                .unwrap_or_else(|| n.clone()),
+            other => crate::codegen::generators::trait_bridge::format_type_ref(other, &self.type_paths),
+        };
         let deserialize_error_expr = spec.make_error("format!(\"Deserialize error: {}\", e)");
         let call_error_expr = spec.make_error(&format!(
             "format!(\"Plugin '{{}}' method '{name}' failed: {{}}\", cached_name, e)"
+        ));
+        let native_decode_error_expr = spec.make_error(&format!(
+            "format!(\"Plugin '{{}}' failed to decode native PHP return value for method '{name}'\", cached_name)"
         ));
 
         crate::backends::php::template_env::render(
@@ -205,7 +254,10 @@ impl TraitBridgeGenerator for PhpBridgeGenerator {
                 args_expr => args_expr,
                 string_params => string_params,
                 is_result_type => is_result_type,
+                return_type => return_type,
                 native_return_binding => self.native_struct_return(&method.return_type),
+                native_decodable => native_decodable,
+                native_decode_error_expr => native_decode_error_expr,
                 deserialize_error_expr => deserialize_error_expr,
                 call_error_expr => call_error_expr,
             },
@@ -303,7 +355,6 @@ pub fn gen_trait_bridge(
     error_constructor: &str,
     api: &ApiSurface,
 ) -> BridgeOutput {
-    // Build type name → rust_path lookup as owned HashMap
     let type_paths: HashMap<String, String> = api
         .types
         .iter()
@@ -313,8 +364,6 @@ pub fn gen_trait_bridge(
                 .iter()
                 .map(|e| (e.name.clone(), e.rust_path.replace('-', "_"))),
         )
-        // Include excluded types so trait methods referencing them (e.g. `&InternalDocument`)
-        // are qualified with the full Rust path rather than emitting the bare type name.
         .chain(
             api.excluded_type_paths
                 .iter()
@@ -322,7 +371,6 @@ pub fn gen_trait_bridge(
         )
         .collect();
 
-    // Visitor-style bridge: all methods have defaults, no registry, no super-trait.
     let is_visitor_bridge = bridge_cfg.type_alias.is_some()
         && bridge_cfg.register_fn.is_none()
         && bridge_cfg.super_trait.is_none()
@@ -335,34 +383,17 @@ pub fn gen_trait_bridge(
         let trait_path = trait_type.rust_path.replace('-', "_");
         let code = gen_visitor_bridge(trait_type, bridge_cfg, &struct_name, &trait_path, &type_paths, api);
 
-        // Note: PHP interface file generation is handled separately by the PHP backend
-        // in generate_bindings() to emit it as a standalone PHP file, not inline Rust code.
-        //
-        // The visitor-bridge struct uses `inc_count()`/`dec_count()` from the `PhpRc`
-        // trait in its Clone/Drop/new impls (see `visitor_bridge_struct.jinja` and
-        // `bridge_constructor.jinja`) — the trait must be in scope at the binding-crate
-        // root or those calls fail with E0599 "no method named inc_count for _zend_object".
         BridgeOutput {
             imports: vec!["ext_php_rs::rc::PhpRc".to_string()],
             code,
         }
     } else {
-        // Use the IR-driven TraitBridgeGenerator infrastructure.
-        //
-        // Classify which callback params get native-object marshalling using the SHARED rule
-        // (`native_marshalled_struct_params`) so the allowlist is identical to what other
         // backends consult. For such params the bridge hands PHP the binding's native `#[php_class]`
-        // object (built via the same `From<core::T>` conversion used for return values) instead of
-        // a JSON string.
         let struct_param_types =
             crate::codegen::generators::trait_bridge::native_marshalled_struct_params(trait_type, api);
-        // Return-side uses the shared classifier too. ext-php-rs implements `FromZval` for
         // references to `#[php_class]` types, so the generated bridge extracts `&Binding` and
-        // clones through the binding's `From<core::T>` counterpart before falling back to JSON.
         let struct_return_types =
             crate::codegen::generators::trait_bridge::native_marshalled_struct_returns(trait_type, api);
-        // Rust-defaulted methods the bridge can forward to the host (host-defined
-        // implementations win; the Rust default runs otherwise).
         let forwardable_defaulted =
             crate::codegen::generators::trait_bridge::forwardable_defaulted_method_names(trait_type, api);
         let generator = PhpBridgeGenerator {

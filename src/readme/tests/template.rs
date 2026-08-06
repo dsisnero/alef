@@ -1,3 +1,6 @@
+// Test module: debug output to stderr is expected here. ~keep
+#![allow(clippy::print_stdout, clippy::print_stderr)]
+
 use super::super::*;
 use super::*;
 use crate::readme::template::render_performance_table;
@@ -25,8 +28,6 @@ fn test_render_performance_table_ops_sec() {
     assert!(result.contains("small.json"), "Got: {result}");
     assert!(result.contains("large.json"), "Got: {result}");
 }
-
-// --- render_performance_table: throughput table ---
 
 #[test]
 fn test_render_performance_table_throughput() {
@@ -57,8 +58,6 @@ fn test_render_performance_table_throughput() {
     );
 }
 
-// --- readme_output_path: output_pattern branch ---
-
 #[test]
 fn test_template_with_output_pattern() {
     let tmp = std::env::temp_dir().join("alef_readme_test_output_pattern");
@@ -68,7 +67,6 @@ fn test_template_with_output_pattern() {
 
     let mut config = test_config();
     let mut lang_map = std::collections::HashMap::new();
-    // No output_path key — let output_pattern drive the path
     lang_map.insert(
         "python".to_string(),
         serde_json::json!({
@@ -95,14 +93,11 @@ fn test_template_with_output_pattern() {
     let _ = fs::remove_dir_all(&tmp);
 }
 
-// --- try_template_readme: template file missing falls back to hardcoded ---
-
 #[test]
 fn test_template_readme_missing_template_falls_back() {
     let tmp = std::env::temp_dir().join("alef_readme_test_missing_tmpl");
     let _ = fs::remove_dir_all(&tmp);
     fs::create_dir_all(&tmp).unwrap();
-    // No template file written — the entry points at a file that does not exist
 
     let mut config = test_config();
     let mut lang_map = std::collections::HashMap::new();
@@ -128,7 +123,6 @@ fn test_template_readme_missing_template_falls_back() {
     let api = test_api();
     let files = generate_readmes(&api, &config, &[Language::Python]).unwrap();
     assert_eq!(files.len(), 1);
-    // Falls back to hardcoded — must contain pip install
     assert!(
         files[0].content.contains("pip install"),
         "Expected hardcoded fallback content, got: {}",
@@ -138,8 +132,6 @@ fn test_template_readme_missing_template_falls_back() {
     let _ = fs::remove_dir_all(&tmp);
 }
 
-// --- try_template_readme: no language entry falls back to hardcoded ---
-
 #[test]
 fn test_template_readme_no_lang_entry_falls_back() {
     let tmp = std::env::temp_dir().join("alef_readme_test_no_lang_entry");
@@ -147,7 +139,6 @@ fn test_template_readme_no_lang_entry_falls_back() {
     fs::create_dir_all(&tmp).unwrap();
 
     let mut config = test_config();
-    // Languages map is empty — no entry for Python
     config.readme = Some(ReadmeConfig {
         template_dir: Some(tmp.clone()),
         snippets_dir: None,
@@ -167,8 +158,6 @@ fn test_template_readme_no_lang_entry_falls_back() {
 
     let _ = fs::remove_dir_all(&tmp);
 }
-
-// --- try_template_readme: deprecated YAML config path ---
 
 #[test]
 fn test_template_readme_yaml_config() {
@@ -193,7 +182,7 @@ languages:
         output_pattern: None,
         discord_url: None,
         banner_url: None,
-        languages: std::collections::HashMap::new(), // empty — triggers YAML path
+        languages: std::collections::HashMap::new(),
         targets: std::collections::HashMap::new(),
     });
     config.workspace_root = Some(tmp.clone());
@@ -209,8 +198,6 @@ languages:
 
     let _ = fs::remove_dir_all(&tmp);
 }
-
-// --- try_template_readme: discord_url and banner_url in context ---
 
 #[test]
 fn test_template_readme_discord_and_banner_url() {
@@ -257,8 +244,6 @@ fn test_template_readme_discord_and_banner_url() {
 
     let _ = fs::remove_dir_all(&tmp);
 }
-
-// --- try_template_readme: template without scaffold (default description/repo/license) ---
 
 #[test]
 fn test_template_readme_no_scaffold_uses_defaults() {
@@ -308,15 +293,12 @@ fn test_template_readme_no_scaffold_uses_defaults() {
     let _ = fs::remove_dir_all(&tmp);
 }
 
-// --- try_template_readme: content already ends with newline (no double-newline) ---
-
 #[test]
 fn test_template_readme_trailing_newline_not_doubled() {
     let tmp = std::env::temp_dir().join("alef_readme_test_trailing_newline");
     let _ = fs::remove_dir_all(&tmp);
     fs::create_dir_all(&tmp).unwrap();
 
-    // Template content ends with a literal newline already
     fs::write(tmp.join("t.md"), "hello\n").unwrap();
 
     let mut config = test_config();
@@ -352,8 +334,6 @@ fn test_template_readme_trailing_newline_not_doubled() {
 
     let _ = fs::remove_dir_all(&tmp);
 }
-
-// --- default_readme_path: all language variants ---
 
 #[test]
 fn test_default_readme_path_ffi() {
@@ -392,7 +372,6 @@ fn test_default_readme_path_rust_when_explicitly_configured() {
         languages: std::collections::HashMap::new(),
         targets: std::collections::HashMap::new(),
     };
-    // Opt in via output_path so the Rust README is not silently skipped.
     readme_cfg.languages.insert(
         "rust".to_string(),
         serde_json::json!({ "output_path": "crates/my-lib/README.md" }),
@@ -530,8 +509,6 @@ fn test_readme_duplicate_output_path_is_rejected() {
     let _ = fs::remove_dir_all(&tmp);
 }
 
-// --- readme_output_path: "output" key alias ---
-
 #[test]
 fn test_template_output_key_alias() {
     let tmp = std::env::temp_dir().join("alef_readme_test_output_alias");
@@ -541,7 +518,6 @@ fn test_template_output_key_alias() {
 
     let mut config = test_config();
     let mut lang_map = std::collections::HashMap::new();
-    // Use "output" instead of "output_path" to exercise the .or_else() branch
     lang_map.insert(
         "python".to_string(),
         serde_json::json!({
@@ -569,8 +545,6 @@ fn test_template_output_key_alias() {
     let _ = fs::remove_dir_all(&tmp);
 }
 
-// --- readme_output_path: falls through to default_readme_path ---
-
 #[test]
 fn test_template_readme_default_path_fallthrough() {
     let tmp = std::env::temp_dir().join("alef_readme_test_default_path");
@@ -580,7 +554,6 @@ fn test_template_readme_default_path_fallthrough() {
 
     let mut config = test_config();
     let mut lang_map = std::collections::HashMap::new();
-    // No output_path, no output key, no output_pattern — falls through to default_readme_path
     lang_map.insert("python".to_string(), serde_json::json!({ "template": "t.md" }));
     config.readme = Some(ReadmeConfig {
         template_dir: Some(tmp.clone()),
@@ -602,19 +575,13 @@ fn test_template_readme_default_path_fallthrough() {
     let _ = fs::remove_dir_all(&tmp);
 }
 
-// --- try_template_readme: missing snippets key does not error ---
-
 #[test]
-fn test_template_readme_missing_snippets_renders_gracefully() {
-    // Reproduces: sample_crate ffi language config has no `snippets` key.
-    // The quick_start partial accesses `snippets.basic_extraction` unconditionally;
-    // if `snippets` is absent from the context the render must not error.
+fn should_error_loudly_when_template_uses_snippets_but_none_are_configured() {
     let tmp = std::env::temp_dir().join("alef_readme_test_missing_snippets");
     let _ = fs::remove_dir_all(&tmp);
     let partials_dir = tmp.join("partials");
     fs::create_dir_all(&partials_dir).unwrap();
 
-    // Minimal partial that accesses snippets.basic_extraction unconditionally
     fs::write(
         partials_dir.join("quick_start.md.jinja"),
         "{{ snippets.basic_extraction | include_snippet(language) }}",
@@ -628,7 +595,6 @@ fn test_template_readme_missing_snippets_renders_gracefully() {
 
     let mut config = test_config();
     let mut lang_map = std::collections::HashMap::new();
-    // No `snippets` key — mirrors sample_crate's ffi language block
     lang_map.insert(
         "ffi".to_string(),
         serde_json::json!({
@@ -650,14 +616,17 @@ fn test_template_readme_missing_snippets_renders_gracefully() {
     config.workspace_root = Some(tmp.clone());
 
     let api = test_api();
-    // Must not error even though `snippets` is absent from the language config
-    let files = generate_readmes(&api, &config, &[Language::Ffi]).unwrap();
-    assert_eq!(files.len(), 1);
+    let err = generate_readmes(&api, &config, &[Language::Ffi]).expect_err(
+        "a template that calls include_snippet with no snippets_dir configured must fail, not render a placeholder",
+    );
+    let message = err.to_string();
+    assert!(
+        message.contains("crates.readme.snippets_dir"),
+        "error must name the missing config key, got: {message}"
+    );
 
     let _ = fs::remove_dir_all(&tmp);
 }
-
-// --- include_snippet: snippets_dir in template context (filter exercised via template) ---
 
 #[test]
 fn test_template_include_snippet_filter() {
@@ -667,7 +636,6 @@ fn test_template_include_snippet_filter() {
     let lang_snippet_dir = snippets_dir.join("python");
     fs::create_dir_all(&lang_snippet_dir).unwrap();
     fs::write(lang_snippet_dir.join("hello.py"), "print('hi')").unwrap();
-    // Template exercises the include_snippet filter
     fs::write(tmp.join("t.md"), r#"{{ "hello.py" | include_snippet("python") }}"#).unwrap();
 
     let mut config = test_config();
@@ -703,29 +671,231 @@ fn test_template_include_snippet_filter() {
     let _ = fs::remove_dir_all(&tmp);
 }
 
-// --- STY-5 regression test: alef all vs cold alef readme produce identical READMEs ---
+// --- crates.readme.languages.<name>.snippet_language: cross-directory alias ---
 //
-// This test verifies that README generation is consistent regardless of whether it's
-// called after scaffold (as in `alef all`) or in isolation (as in `alef readme`).
-// Previously, alef all would produce READMEs with extra blank lines and different table
-// cell padding compared to cold alef readme, causing CI gate failures even when nothing
-// else changed. The root cause was suspected to be state pollution from earlier pipeline
-// stages or inconsistent minijinja environment setup.
-//
-// This test simulates both paths:
-// Path A: readme generation in isolation (cold path, what `alef readme` does)
-// Path B: readme generation after some operations (warm path, what `alef all` does)
-// Both should produce identical README content.
+// A README language may borrow its snippets from a differently-named snippet
+// directory (e.g. `ffi` pulling from a `c/` root, since the FFI binding's
+// examples *are* C code and a consumer repo already maintains one `c/`
+// snippet set rather than a duplicate `ffi/` one). Regression coverage for
+// the incident where xberg's `[crates.readme.languages.ffi]` entry had no
+// snippet source at all: `docs-site/src/snippets/` only ever had a `c/`
+// directory, never an `ffi/` one, so every `include_snippet(language)` call
+// in `partials/quick_start.md.jinja` failed once alef stopped silently
+// swallowing missing snippets (see `include_snippet`'s `~keep` doc comment). ~keep
+
+#[test]
+fn test_readme_snippet_language_alias_resolves_from_aliased_directory() {
+    let tmp = std::env::temp_dir().join("alef_readme_test_snippet_language_alias");
+    let _ = fs::remove_dir_all(&tmp);
+    let snippets_dir = tmp.join("snippets");
+    // Only a `c/` snippet directory exists — no `ffi/` directory anywhere.
+    let c_snippet_dir = snippets_dir.join("c");
+    fs::create_dir_all(&c_snippet_dir).unwrap();
+    fs::write(c_snippet_dir.join("hello.c"), "int main(void) { return 0; }").unwrap();
+    fs::write(tmp.join("t.md"), r#"{{ "hello.c" | include_snippet(language) }}"#).unwrap();
+
+    let mut config = test_config();
+    let mut lang_map = std::collections::HashMap::new();
+    lang_map.insert(
+        "ffi".to_string(),
+        serde_json::json!({
+            "template": "t.md",
+            "output_path": "crates/my-lib-ffi/README.md",
+            "snippet_language": "c"
+        }),
+    );
+    config.readme = Some(ReadmeConfig {
+        template_dir: Some(tmp.clone()),
+        snippets_dir: Some(PathBuf::from("snippets")),
+        config: None,
+        output_pattern: None,
+        discord_url: None,
+        banner_url: None,
+        languages: lang_map,
+        targets: std::collections::HashMap::new(),
+    });
+    config.workspace_root = Some(tmp.clone());
+
+    let api = test_api();
+    let files = generate_readmes(&api, &config, &[Language::Ffi]).unwrap_or_else(|err| {
+        panic!("expected `snippet_language = \"c\"` to resolve the ffi README's snippets from the `c/` directory, got error: {err}")
+    });
+    assert_eq!(files.len(), 1);
+    assert!(
+        files[0].content.contains("int main(void) { return 0; }"),
+        "Expected the aliased `c/hello.c` snippet content, got: {}",
+        files[0].content
+    );
+
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn test_readme_snippet_language_alias_does_not_affect_explicit_language_calls() {
+    let tmp = std::env::temp_dir().join("alef_readme_test_snippet_language_alias_explicit");
+    let _ = fs::remove_dir_all(&tmp);
+    let snippets_dir = tmp.join("snippets");
+    let c_snippet_dir = snippets_dir.join("c");
+    let python_snippet_dir = snippets_dir.join("python");
+    fs::create_dir_all(&c_snippet_dir).unwrap();
+    fs::create_dir_all(&python_snippet_dir).unwrap();
+    fs::write(c_snippet_dir.join("hello.c"), "int main(void) { return 0; }").unwrap();
+    fs::write(python_snippet_dir.join("hello.py"), "print('hi')").unwrap();
+    // The own-language lookup (`language`) must resolve via the alias to `c/`,
+    // while an explicit literal request for a different language's snippet
+    // (as a comparison callout might do) must be honoured verbatim. ~keep
+    fs::write(
+        tmp.join("t.md"),
+        r#"{{ "hello.c" | include_snippet(language) }}
+{{ "hello.py" | include_snippet("python") }}"#,
+    )
+    .unwrap();
+
+    let mut config = test_config();
+    let mut lang_map = std::collections::HashMap::new();
+    lang_map.insert(
+        "ffi".to_string(),
+        serde_json::json!({
+            "template": "t.md",
+            "output_path": "crates/my-lib-ffi/README.md",
+            "snippet_language": "c"
+        }),
+    );
+    config.readme = Some(ReadmeConfig {
+        template_dir: Some(tmp.clone()),
+        snippets_dir: Some(PathBuf::from("snippets")),
+        config: None,
+        output_pattern: None,
+        discord_url: None,
+        banner_url: None,
+        languages: lang_map,
+        targets: std::collections::HashMap::new(),
+    });
+    config.workspace_root = Some(tmp.clone());
+
+    let api = test_api();
+    let files = generate_readmes(&api, &config, &[Language::Ffi]).unwrap();
+    assert_eq!(files.len(), 1);
+    assert!(
+        files[0].content.contains("int main(void) { return 0; }"),
+        "Expected the aliased `c/hello.c` snippet content, got: {}",
+        files[0].content
+    );
+    assert!(
+        files[0].content.contains("print('hi')"),
+        "Expected the explicitly-requested `python/hello.py` snippet content, got: {}",
+        files[0].content
+    );
+
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn should_error_when_configured_snippets_dir_does_not_exist_even_if_unused() {
+    let tmp = std::env::temp_dir().join("alef_readme_test_snippets_dir_missing");
+    let _ = fs::remove_dir_all(&tmp);
+    fs::create_dir_all(&tmp).unwrap();
+    // No `snippets/` directory is created under `tmp`, and the template below
+    // never references the `include_snippet` filter: the missing directory must
+    // still fail the build, matching the incident where `readme_templates/rust.md`
+    // never called the filter yet `snippets_dir` pointed at a nonexistent path. ~keep
+    fs::write(tmp.join("t.md"), "# {{ name }}").unwrap();
+
+    let mut config = test_config();
+    let mut lang_map = std::collections::HashMap::new();
+    lang_map.insert(
+        "python".to_string(),
+        serde_json::json!({
+            "template": "t.md",
+            "output_path": "packages/python/README.md"
+        }),
+    );
+    config.readme = Some(ReadmeConfig {
+        template_dir: Some(tmp.clone()),
+        snippets_dir: Some(PathBuf::from("docs/snippets")),
+        config: None,
+        output_pattern: None,
+        discord_url: None,
+        banner_url: None,
+        languages: lang_map,
+        targets: std::collections::HashMap::new(),
+    });
+    config.workspace_root = Some(tmp.clone());
+
+    let api = test_api();
+    let err = generate_readmes(&api, &config, &[Language::Python])
+        .expect_err("a configured snippets_dir that does not exist on disk must be a hard error");
+    let message = err.to_string();
+    assert!(
+        message.contains("crates.readme.snippets_dir"),
+        "error must name the config key, got: {message}"
+    );
+    assert!(
+        message.contains("docs/snippets"),
+        "error must name the offending configured path, got: {message}"
+    );
+
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn should_error_when_referenced_snippet_file_cannot_be_resolved() {
+    let tmp = std::env::temp_dir().join("alef_readme_test_snippet_file_missing");
+    let _ = fs::remove_dir_all(&tmp);
+    let snippets_dir = tmp.join("snippets");
+    fs::create_dir_all(snippets_dir.join("python")).unwrap();
+    // `snippets_dir` itself exists, but `missing.py` is never written under it.
+    fs::write(tmp.join("t.md"), r#"{{ "missing.py" | include_snippet("python") }}"#).unwrap();
+
+    let mut config = test_config();
+    let mut lang_map = std::collections::HashMap::new();
+    lang_map.insert(
+        "python".to_string(),
+        serde_json::json!({
+            "template": "t.md",
+            "output_path": "packages/python/README.md"
+        }),
+    );
+    config.readme = Some(ReadmeConfig {
+        template_dir: Some(tmp.clone()),
+        snippets_dir: Some(PathBuf::from("snippets")),
+        config: None,
+        output_pattern: None,
+        discord_url: None,
+        banner_url: None,
+        languages: lang_map,
+        targets: std::collections::HashMap::new(),
+    });
+    config.workspace_root = Some(tmp.clone());
+
+    let api = test_api();
+    let err = generate_readmes(&api, &config, &[Language::Python])
+        .expect_err("an unresolvable snippet reference must fail the build, not render a placeholder comment");
+    let message = err.to_string();
+    assert!(
+        message.contains("python"),
+        "error must name the language, got: {message}"
+    );
+    assert!(
+        message.contains("missing.py"),
+        "error must name the path, got: {message}"
+    );
+    assert!(
+        message.to_lowercase().contains("snippets"),
+        "error must name the snippets root that was searched, got: {message}"
+    );
+
+    let _ = fs::remove_dir_all(&tmp);
+}
+
 #[test]
 fn test_alef_all_and_cold_readme_produce_same_output() {
     let tmp = std::env::temp_dir().join("alef_sty5_test");
     let _ = fs::remove_dir_all(&tmp);
     fs::create_dir_all(&tmp).unwrap();
 
-    // Create a minimal template to test with
     fs::create_dir_all(tmp.join("templates")).unwrap();
 
-    // Template that exercises key paths: variables, performance table
     let template_content = r#"# {{name}}
 
 {{description}}
@@ -747,7 +917,6 @@ fn test_alef_all_and_cold_readme_produce_same_output() {
 "#;
     fs::write(tmp.join("templates/test.md"), template_content).unwrap();
 
-    // Set up a config with template-based README generation
     let mut config = test_config();
     config.workspace_root = Some(tmp.clone());
 
@@ -792,19 +961,14 @@ fn test_alef_all_and_cold_readme_produce_same_output() {
 
     let api = test_api();
 
-    // Path A: readme generation in isolation (cold path)
     let cold_files = generate_readmes(&api, &config, &[Language::Python]).unwrap();
     assert_eq!(cold_files.len(), 1);
     let cold_content = &cold_files[0].content;
 
-    // Path B: readme generation again (warm path, simulating alef all)
-    // In real alef all, scaffold runs first, but that shouldn't affect readme input.
-    // If there's state pollution, it would show up here.
     let warm_files = generate_readmes(&api, &config, &[Language::Python]).unwrap();
     assert_eq!(warm_files.len(), 1);
     let warm_content = &warm_files[0].content;
 
-    // Both paths should produce identical output
     if cold_content != warm_content {
         eprintln!("=== COLD OUTPUT ===\n{}\n", cold_content);
         eprintln!("=== WARM OUTPUT ===\n{}\n", warm_content);

@@ -1,12 +1,7 @@
 use crate::core::config::ResolvedCrateConfig;
 use crate::core::version::to_rubygems_prerelease;
 use anyhow::Context as _;
-use std::sync::LazyLock;
 use tracing::info;
-
-/// Regex for matching version field in Cargo.toml format files.
-static CARGO_VERSION_RE: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r#"(?m)^(version\s*=\s*)"[^"]*""#).expect("valid regex"));
 
 /// Read the version from a Cargo.toml file (workspace or regular package).
 pub(crate) fn read_version(version_from: &str) -> anyhow::Result<String> {
@@ -69,19 +64,48 @@ pub(super) fn bump_version(version: &str, component: &str) -> anyhow::Result<Str
 
 /// Write a bumped version back into a Cargo.toml (workspace or regular package).
 pub(super) fn write_version_to_cargo_toml(cargo_toml_path: &str, new_version: &str) -> anyhow::Result<()> {
+    use toml_edit::DocumentMut;
+
     let content =
         std::fs::read_to_string(cargo_toml_path).with_context(|| format!("Failed to read {cargo_toml_path}"))?;
+    let mut doc: DocumentMut = content
+        .parse()
+        .with_context(|| format!("Failed to parse TOML in {cargo_toml_path}"))?;
 
-    // Match `version = "..."` as a standalone line (covers both [package] and [workspace.package])
-    let new_content = CARGO_VERSION_RE
-        .replace(&content, format!(r#"version = "{new_version}""#).as_str())
-        .to_string();
+    // dependency (e.g. `[target.'cfg(...)'.dependencies.hf-hub]`), and the regex
+    let mut changed = false;
 
-    if new_content == content {
-        anyhow::bail!("Could not find a `version = \"...\"` field to update in {cargo_toml_path}");
+    if let Some(ws_version) = doc
+        .get_mut("workspace")
+        .and_then(|w| w.as_table_like_mut())
+        .and_then(|t| t.get_mut("package"))
+        .and_then(|p| p.as_table_like_mut())
+        .and_then(|t| t.get_mut("version"))
+    {
+        if ws_version.is_str() && ws_version.as_str() != Some(new_version) {
+            *ws_version = toml_edit::value(new_version);
+            changed = true;
+        }
     }
 
-    std::fs::write(cargo_toml_path, new_content)
+    if let Some(pkg_version) = doc
+        .get_mut("package")
+        .and_then(|p| p.as_table_like_mut())
+        .and_then(|t| t.get_mut("version"))
+    {
+        if pkg_version.is_str() && pkg_version.as_str() != Some(new_version) {
+            *pkg_version = toml_edit::value(new_version);
+            changed = true;
+        }
+    }
+
+    if !changed {
+        anyhow::bail!(
+            "Could not find a `[package]`/`[workspace.package]` version field to update in {cargo_toml_path}"
+        );
+    }
+
+    std::fs::write(cargo_toml_path, doc.to_string())
         .with_context(|| format!("Failed to write updated version to {cargo_toml_path}"))?;
 
     Ok(())
@@ -147,9 +171,6 @@ pub(crate) fn patch_workspace_dep_versions(
 
     let mut changed = false;
 
-    // Patch a single dep-table item in-place. Returns true when any version was
-    // updated. `dep_table` must be a `&mut Item` pointing at an inline or
-    // regular TOML table of `{ dep-name = { version = "...", ... } }` entries.
     fn patch_dep_table(
         dep_table: &mut Item,
         new_version: &str,
@@ -160,9 +181,6 @@ pub(crate) fn patch_workspace_dep_versions(
         };
         let mut any = false;
         for (key, item) in table.iter_mut() {
-            // A dep entry matches if its key is a workspace member name OR if it
-            // carries a `package = "..."` field whose value is a workspace member
-            // name (aliased deps like `sample_core = { package = "sample-core", ... }`).
             let is_member = workspace_members.contains(key.get())
                 || item
                     .as_table_like()
@@ -172,7 +190,6 @@ pub(crate) fn patch_workspace_dep_versions(
             if !is_member {
                 continue;
             }
-            // The dep value can be an inline table `{ path = "...", version = "X" }`.
             if let Some(inline) = item.as_table_like_mut() {
                 if let Some(ver_item) = inline.get_mut("version") {
                     if ver_item.as_str() != Some(new_version) {
@@ -185,7 +202,6 @@ pub(crate) fn patch_workspace_dep_versions(
         any
     }
 
-    // Walk standard top-level dep tables.
     for table_key in &["dependencies", "dev-dependencies", "build-dependencies"] {
         if let Some(item) = doc.get_mut(table_key) {
             if patch_dep_table(item, new_version, workspace_members) {
@@ -194,9 +210,6 @@ pub(crate) fn patch_workspace_dep_versions(
         }
     }
 
-    // Walk [workspace.dependencies] (root manifest only).
-    // We use a two-level path so we don't accidentally touch
-    // `[workspace.package]` or other sibling keys.
     if let Some(workspace) = doc.get_mut("workspace") {
         if let Some(ws_table) = workspace.as_table_like_mut() {
             if let Some(deps) = ws_table.get_mut("dependencies") {
@@ -210,7 +223,6 @@ pub(crate) fn patch_workspace_dep_versions(
     // Walk [target.'cfg(...)'.{dependencies,dev-dependencies,build-dependencies}].
     if let Some(target_item) = doc.get_mut("target") {
         if let Some(target_table) = target_item.as_table_like_mut() {
-            // Collect the keys first to avoid borrow conflicts.
             let cfg_keys: Vec<String> = target_table.iter().map(|(k, _)| k.to_string()).collect();
             for cfg_key in cfg_keys {
                 if let Some(cfg_item) = target_table.get_mut(&cfg_key) {
@@ -276,7 +288,6 @@ pub(crate) fn patch_cargo_crates_io_version(
         return Ok(false);
     };
     let Some(ver_item) = entry_table.get_mut("version") else {
-        // Path-only entry — nothing to update.
         return Ok(false);
     };
     if ver_item.as_str() == Some(new_version) {
@@ -296,9 +307,6 @@ pub fn verify_versions(config: &ResolvedCrateConfig) -> anyhow::Result<Vec<Strin
     let expected_rubygems = to_rubygems_prerelease(&expected);
     let mut mismatches = Vec::new();
 
-    // Cache compiled regexes across calls within this verify pass — the same
-    // ~15 patterns get reused on every invocation, and `Regex::new` is the
-    // dominant cost when the function is called from a tight loop.
     fn extract_version(path: &str, pattern: &str) -> Option<String> {
         use std::collections::HashMap;
         use std::sync::Mutex;
@@ -319,7 +327,6 @@ pub fn verify_versions(config: &ResolvedCrateConfig) -> anyhow::Result<Vec<Strin
         re.captures(&content)?.get(1).map(|m| m.as_str().to_string())
     }
 
-    // Python (PEP 440 format)
     if let Some(found) = extract_version("packages/python/pyproject.toml", r#"version\s*=\s*"([^"]*)""#) {
         if found != expected_pep440 {
             mismatches.push(format!(
@@ -328,7 +335,6 @@ pub fn verify_versions(config: &ResolvedCrateConfig) -> anyhow::Result<Vec<Strin
         }
     }
 
-    // Node
     if let Some(found) = extract_version("packages/node/package.json", r#""version"\s*:\s*"([^"]*)""#) {
         if found != expected {
             mismatches.push(format!(
@@ -337,7 +343,6 @@ pub fn verify_versions(config: &ResolvedCrateConfig) -> anyhow::Result<Vec<Strin
         }
     }
 
-    // Java
     if let Some(found) = extract_version("packages/java/pom.xml", r"<version>([^<]*)</version>") {
         if found != expected {
             mismatches.push(format!("packages/java/pom.xml: found {found}, expected {expected}"));
@@ -353,7 +358,6 @@ pub fn verify_versions(config: &ResolvedCrateConfig) -> anyhow::Result<Vec<Strin
         }
     }
 
-    // Ruby gemspec (compare normalized form)
     if let Ok(entries) = std::fs::read_dir("packages/ruby") {
         for entry in entries.flatten() {
             let path = entry.path();
@@ -373,7 +377,6 @@ pub fn verify_versions(config: &ResolvedCrateConfig) -> anyhow::Result<Vec<Strin
         }
     }
 
-    // Ruby version.rb files (packages/ruby/{lib/*/,ext/*/src/*/,ext/*/native/src/*/}version.rb) (compare normalized form)
     for pattern in &[
         "packages/ruby/lib/*/version.rb",
         "packages/ruby/ext/*/src/*/version.rb",
@@ -393,7 +396,6 @@ pub fn verify_versions(config: &ResolvedCrateConfig) -> anyhow::Result<Vec<Strin
         }
     }
 
-    // C# csproj
     if let Some(found) = extract_version(
         "packages/csharp/SampleCrawler/SampleCrawler.csproj",
         r"<Version>([^<]*)</Version>",
@@ -403,7 +405,6 @@ pub fn verify_versions(config: &ResolvedCrateConfig) -> anyhow::Result<Vec<Strin
         }
     }
 
-    // PHP composer.json
     if let Some(found) = extract_version("packages/php/composer.json", r#""version"\s*:\s*"([^"]*)""#) {
         if found != expected {
             mismatches.push(format!(
@@ -412,7 +413,6 @@ pub fn verify_versions(config: &ResolvedCrateConfig) -> anyhow::Result<Vec<Strin
         }
     }
 
-    // Dart pubspec.yaml — `version: X.Y.Z`
     if let Some(found) = extract_version("packages/dart/pubspec.yaml", r"(?m)^version:\s*([^\s#\n]+)") {
         if found != expected {
             mismatches.push(format!(
@@ -421,9 +421,6 @@ pub fn verify_versions(config: &ResolvedCrateConfig) -> anyhow::Result<Vec<Strin
         }
     }
 
-    // Zig build.zig.zon — `.version = "X.Y.Z"`. The `(?m)^\s*\.version\b`
-    // anchor is required so the `.minimum_zig_version = "..."` line on the
-    // same file is not picked up by the looser `.version` substring match.
     if let Some(found) = extract_version("packages/zig/build.zig.zon", r#"(?m)^\s*\.version\s*=\s*"([^"]*)""#) {
         if found != expected {
             mismatches.push(format!(
@@ -432,7 +429,6 @@ pub fn verify_versions(config: &ResolvedCrateConfig) -> anyhow::Result<Vec<Strin
         }
     }
 
-    // Swift Package.swift binary release URL, when the root package opts into binary distribution.
     if let Some(found) = extract_version(
         "Package.swift",
         r#"releases/download/v(\d+\.\d+\.\d+(?:-[a-zA-Z0-9._]+)*)/"#,

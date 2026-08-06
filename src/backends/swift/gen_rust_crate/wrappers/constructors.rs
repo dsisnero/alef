@@ -57,34 +57,21 @@ pub(crate) fn emit_type_wrapper(
             },
         ));
 
-        // Constructor — params use bridge types (String for JSON-bridged fields)
-        // and Option<bridge_ty> when the field is optional.
-        // Excluded fields (via exclude_fields config) and cfg-unsatisfied fields
-        // are omitted from params and left at Default::default() in the field initializers.
         let constructor_fields = constructor_fields(ty, exclude_fields, configured_features);
         let params: Vec<String> = constructor_fields
             .iter()
             .map(|f| {
                 let bridge_ty = bridge_type(&f.ty);
                 let bridge_ty = if f.optional && !needs_json_bridge(&f.ty) {
-                    // Optional fields are JSON-bridged so this branch is rarely hit;
-                    // when it is (a primitive Option), wrap in Option<>.
                     format!("Option<{bridge_ty}>")
                 } else {
                     bridge_ty
                 };
-                // Escape Swift keywords so the param name in `pub fn new()` matches
-                // the extern declaration (which also escapes via swift_ident).
                 let name = swift_ident(&f.name.to_snake_case());
                 format!("{name}: {bridge_ty}")
             })
             .collect();
 
-        // Determine construction strategy (see default_construction.rs for details):
-        // when any field requires Default-based assignment, we cannot emit a direct struct literal.
-        // Primitive-only DTOs always get a direct struct-literal constructor regardless
-        // of `Default` impl or serde derive — must stay in lockstep with
-        // `extern_block::has_constructor_extern`'s matching fast path.
         let all_primitive_fields = constructor_fields.iter().all(|f| matches!(f.ty, TypeRef::Primitive(_)));
         let has_vec_non_primitive = constructor_fields.iter().any(|f| {
             matches!(&f.ty, TypeRef::Vec(inner) if !matches!(inner.as_ref(), TypeRef::Primitive(_) | TypeRef::Bytes))
@@ -103,10 +90,10 @@ pub(crate) fn emit_type_wrapper(
                     .any(|f| needs_json_bridge(&f.ty) || matches!(f.ty, TypeRef::Named(_))));
 
         if needs_default_construction && !ty.has_default {
-            // The struct needs mutable-default construction but doesn't impl Default.
-            // Omit the constructor entirely — swift-bridge will not expose `init()` for
-            // this type, which is correct: the host language can't construct it anyway.
         } else {
+            if !needs_default_construction && ty.has_default {
+                out.push_str("    #[allow(clippy::needless_update)]\n");
+            }
             out.push_str(&crate::backends::swift::template_env::render(
                 "fn_new_signature.jinja",
                 minijinja::context! {
@@ -146,12 +133,14 @@ pub(crate) fn emit_type_wrapper(
                     out.push_str(init);
                     out.push_str(",\n");
                 }
+                if ty.has_default {
+                    out.push_str("            ..Default::default()\n");
+                }
                 out.push_str("        })\n");
             }
             out.push_str("    }\n");
-        } // end else (constructor emitted)
+        }
 
-        // Getters — return bridge types (String for JSON-bridged, wrappers for Named).
         emit_getters(
             ty,
             type_paths,
@@ -300,7 +289,6 @@ mod tests {
         let exclude_fields = std::collections::HashSet::new();
         let mut configured_features = std::collections::HashSet::new();
         configured_features.insert("pdf");
-        // Note: "heuristics" is NOT in configured_features
 
         let output = emit_type_wrapper(
             &ty,
@@ -314,11 +302,84 @@ mod tests {
             &configured_features,
         );
 
-        // The wrapper output should include the newtype and impl block
         assert!(output.contains("pub struct TestType"));
-        // The constructor should NOT include field_b (cfg-gated with heuristics)
         assert!(!output.contains("field_b: String"));
-        // The constructor SHOULD include field_a
         assert!(output.contains("field_a: u32"));
+    }
+
+    fn primitive_field(name: &str) -> FieldDef {
+        FieldDef {
+            name: name.to_string(),
+            ty: TypeRef::Primitive(crate::core::ir::PrimitiveType::U32),
+            optional: false,
+            ..Default::default()
+        }
+    }
+
+    fn primitive_only_type(has_default: bool) -> crate::core::ir::TypeDef {
+        crate::core::ir::TypeDef {
+            name: "SampleLimits".to_string(),
+            rust_path: "test::SampleLimits".to_string(),
+            fields: vec![primitive_field("depth"), primitive_field("width")],
+            is_clone: true,
+            has_default,
+            ..Default::default()
+        }
+    }
+
+    fn emit_wrapper(ty: &crate::core::ir::TypeDef) -> String {
+        emit_type_wrapper(
+            ty,
+            "test_crate",
+            &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
+            &std::collections::HashSet::new(),
+            &std::collections::HashSet::new(),
+            &std::collections::HashSet::new(),
+            &std::collections::HashSet::new(),
+            &std::collections::HashSet::new(),
+        )
+    }
+
+    /// Forward-compatibility: the direct struct-literal constructor for a
+    /// has_default core type must end with `..Default::default()`, so an
+    /// additive core field falls back to its default instead of failing E0063
+    /// until the bindings are regenerated.
+    #[test]
+    fn wrapper_constructor_direct_literal_with_default_spreads() {
+        let output = emit_wrapper(&primitive_only_type(true));
+
+        assert!(
+            output.contains("..Default::default()"),
+            "has_default core type must get the spread trailer in the direct-literal \
+             constructor; got:\n{output}"
+        );
+        assert!(
+            output.contains("#[allow(clippy::needless_update)]"),
+            "the spread over a fully-mirrored literal needs the needless_update allow; \
+             got:\n{output}"
+        );
+    }
+
+    /// Companion: without a core `Default` impl the spread cannot compile (E0277) —
+    /// the exhaustive literal must stay as-is.
+    #[test]
+    fn wrapper_constructor_direct_literal_without_default_keeps_exhaustive_literal() {
+        let output = emit_wrapper(&primitive_only_type(false));
+
+        assert!(
+            output.contains("pub fn new("),
+            "primitive-only DTOs keep their direct constructor regardless of Default; \
+             got:\n{output}"
+        );
+        assert!(
+            !output.contains("..Default::default()"),
+            "the spread trailer must not be emitted when the core type has no Default \
+             impl; got:\n{output}"
+        );
+        assert!(
+            !output.contains("#[allow(clippy::needless_update)]"),
+            "needless_update allow must not be emitted when no spread; got:\n{output}"
+        );
     }
 }

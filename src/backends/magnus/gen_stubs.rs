@@ -1,14 +1,14 @@
 use crate::backends::magnus::type_map::rbs_type;
-use crate::codegen::shared::{binding_fields, substitute_excluded_types};
+use crate::codegen::shared::{binding_fields, substitute_excluded_types, substitute_trait_interfaces};
 use crate::core::config::TraitBridgeConfig;
 use crate::core::hash::{self, CommentStyle};
-use crate::core::ir::{ApiSurface, EnumDef, FunctionDef, MethodDef, TypeDef};
+use crate::core::ir::{ApiSurface, EnumDef, FunctionDef, MethodDef, TypeDef, TypeRef};
 
 pub fn gen_stubs(
     api: &ApiSurface,
     gem_name: &str,
     emit_docstrings: bool,
-    streaming_method_names: &ahash::AHashSet<String>,
+    streaming_return_types: &ahash::AHashMap<String, String>,
     trait_bridges: &[TraitBridgeConfig],
 ) -> String {
     let header = hash::header(CommentStyle::Hash);
@@ -20,45 +20,72 @@ pub fn gen_stubs(
     lines.push("".to_string());
     lines.push("  VERSION: String".to_string());
     lines.push("".to_string());
-    // Type alias for JSON values: any JSON-compatible type
     lines.push(
         "  type json_value = Hash[String, untyped] | Array[untyped] | String | Integer | Float | bool | nil"
             .to_string(),
     );
     lines.push("".to_string());
 
-    // Generate type stubs
+    // Types excluded from the binding surface (opaque `alef(skip)` traits, binding-excluded ~keep
+    // structs) have no RBS declaration, so any signature referencing them is substituted to the ~keep
+    // declared `json_value` alias — otherwise steep fails with `RBS::UnknownTypeName`. ~keep
+    let excluded: std::collections::HashSet<&str> = api
+        .excluded_type_paths
+        .keys()
+        .map(String::as_str)
+        .chain(api.types.iter().filter(|t| t.binding_excluded).map(|t| t.name.as_str()))
+        .collect();
+
+    // Trait names exposed as a host-implementable RBS `interface _Name` (trait-bridge traits with a ~keep
+    // `register_fn` whose methods are non-empty and whose trait type exists in the API surface — the ~keep
+    // same condition `gen_plugin_interface_stub` uses to decide whether it emits the interface). Any ~keep
+    // function/method param or return referencing one of these bare trait names must be substituted ~keep
+    // to `_Name` via `substitute_trait_interfaces`, otherwise steep fails with `RBS::UnknownTypeName` ~keep
+    // (the bare trait name is never declared — only the `_Name` interface is). ~keep
+    let trait_interfaces: std::collections::HashSet<&str> = trait_bridges
+        .iter()
+        .filter(|bridge| bridge.register_fn.is_some())
+        .filter(|bridge| !bridge.resolve_methods(api).is_empty())
+        .filter(|bridge| api.types.iter().any(|t| t.name == bridge.trait_name))
+        .map(|bridge| bridge.trait_name.as_str())
+        .collect();
+
     for typ in api.types.iter().filter(|typ| !typ.is_trait) {
         if typ.is_opaque {
-            lines.push(gen_opaque_type_stub(typ, emit_docstrings, streaming_method_names));
+            lines.push(gen_opaque_type_stub(
+                typ,
+                emit_docstrings,
+                streaming_return_types,
+                &excluded,
+                &trait_interfaces,
+            ));
             lines.push("".to_string());
         } else {
-            lines.push(gen_type_stub(typ, emit_docstrings, streaming_method_names));
+            lines.push(gen_type_stub(
+                typ,
+                emit_docstrings,
+                streaming_return_types,
+                &excluded,
+                &trait_interfaces,
+            ));
             lines.push("".to_string());
         }
     }
 
-    // Generate enum stubs
     for enum_def in &api.enums {
         lines.push(gen_enum_stub(enum_def, emit_docstrings));
         lines.push("".to_string());
     }
 
-    // Generate function stubs (module methods)
     for func in &api.functions {
-        lines.push(gen_function_stub(func, streaming_method_names));
+        lines.push(gen_function_stub(
+            func,
+            streaming_return_types,
+            &excluded,
+            &trait_interfaces,
+        ));
         lines.push("".to_string());
     }
-    // Emit a host-implementable RBS `interface` for each plugin-pattern trait bridge (those with
-    // a `register_*` function) whose trait is resolvable in the API surface. This surfaces the
-    // typed protocol a host backend must implement to be registered, rather than leaving callers
-    // with an untyped `backend`. Interface method params that are known serde structs are typed as
-    // their native struct type and returns as the result type, matching the native Ruby values the
-    // runtime bridge now passes/expects.
-    //
-    // Track the trait names that received an interface so the `register_*` signature below can type
-    // its `backend` parameter against the interface instead of `untyped`.
-    let mut interface_trait_names: std::collections::HashSet<String> = std::collections::HashSet::new();
     for bridge in trait_bridges {
         if bridge.register_fn.is_none() {
             continue;
@@ -66,21 +93,14 @@ pub fn gen_stubs(
         if let Some(stub) = gen_plugin_interface_stub(bridge, api) {
             lines.push(stub);
             lines.push("".to_string());
-            interface_trait_names.insert(bridge.trait_name.clone());
         }
     }
-    // Names already emitted as module methods above (from `api.functions`). A bridge's `clear_fn`
-    // is often also exposed as a regular registry function (`clear_embedding_backends`), so emitting
-    // it again here would be a duplicate definition (RBS `DuplicatedMethodDefinitionError`). Skip any
-    // bridge function whose name already has a declaration; register/unregister are bridge-only.
     let declared_function_names: std::collections::HashSet<&str> =
         api.functions.iter().map(|f| f.name.as_str()).collect();
     for bridge in trait_bridges {
         if let Some(register_fn) = bridge.register_fn.as_deref() {
             if !declared_function_names.contains(register_fn) {
-                // Type the `backend` param against the host-implementable interface when one was
-                // emitted for this bridge's trait; otherwise fall back to `untyped`.
-                let backend_type = if interface_trait_names.contains(&bridge.trait_name) {
+                let backend_type = if trait_interfaces.contains(bridge.trait_name.as_str()) {
                     plugin_interface_name(&bridge.trait_name)
                 } else {
                     "untyped".to_string()
@@ -105,7 +125,6 @@ pub fn gen_stubs(
         }
     }
 
-    // Generate error info class stubs for errors with introspection methods.
     for error in api.errors.iter().filter(|e| !e.methods.is_empty()) {
         let class_name = format!("{}Info", error.name);
         let mut class_lines = vec![format!("  class {class_name}")];
@@ -152,9 +171,6 @@ fn gen_plugin_interface_stub(bridge: &TraitBridgeConfig, api: &ApiSurface) -> Op
     }
     api.types.iter().find(|t| t.name == bridge.trait_name)?;
 
-    // Types excluded from the binding surface (e.g. `InternalDocument`) are not emitted as RBS
-    // declarations, so an interface method referencing one would be an undefined RBS type. Substitute
-    // them with their JSON marshaling form, matching the runtime bridge (and the go/pyo3/napi backends).
     let excluded: std::collections::HashSet<&str> = api
         .excluded_type_paths
         .keys()
@@ -165,11 +181,6 @@ fn gen_plugin_interface_stub(bridge: &TraitBridgeConfig, api: &ApiSurface) -> Op
     let interface_name = plugin_interface_name(&bridge.trait_name);
     let mut lines = vec![format!("  interface {interface_name}")];
 
-    // Only the trait's non-defaulted methods are required at runtime: the bridge
-    // forwards Rust-defaulted methods when the host defines them (falling back to
-    // the Rust default otherwise), and the Plugin lifecycle hooks are no-ops when
-    // absent. RBS interfaces cannot express optional members, so the interface
-    // lists the required contract and a comment documents the optional surface.
     let (required, optional): (Vec<&crate::core::ir::MethodDef>, Vec<&crate::core::ir::MethodDef>) =
         methods.iter().partition(|m| !m.has_default_impl);
     if !optional.is_empty() {
@@ -223,7 +234,9 @@ fn get_module_name(crate_name: &str) -> String {
 fn gen_opaque_type_stub(
     typ: &TypeDef,
     emit_docstrings: bool,
-    streaming_method_names: &ahash::AHashSet<String>,
+    streaming_return_types: &ahash::AHashMap<String, String>,
+    excluded: &std::collections::HashSet<&str>,
+    trait_interfaces: &std::collections::HashSet<&str>,
 ) -> String {
     let mut lines = vec![];
 
@@ -238,17 +251,31 @@ fn gen_opaque_type_stub(
         lines.push("".to_string());
     }
 
-    // Instance methods
     for method in &typ.methods {
         if !method.is_static {
-            lines.push(gen_method_stub(method, false, emit_docstrings, streaming_method_names));
+            lines.push(gen_method_stub(
+                method,
+                false,
+                emit_docstrings,
+                streaming_return_types,
+                excluded,
+                trait_interfaces,
+                &typ.name,
+            ));
         }
     }
 
-    // Static methods
     for method in &typ.methods {
         if method.is_static {
-            lines.push(gen_method_stub(method, true, emit_docstrings, streaming_method_names));
+            lines.push(gen_method_stub(
+                method,
+                true,
+                emit_docstrings,
+                streaming_return_types,
+                excluded,
+                trait_interfaces,
+                &typ.name,
+            ));
         }
     }
 
@@ -258,12 +285,17 @@ fn gen_opaque_type_stub(
 }
 
 /// Generate a Ruby type stub for a struct.
-fn gen_type_stub(typ: &TypeDef, emit_docstrings: bool, streaming_method_names: &ahash::AHashSet<String>) -> String {
+fn gen_type_stub(
+    typ: &TypeDef,
+    emit_docstrings: bool,
+    streaming_return_types: &ahash::AHashMap<String, String>,
+    excluded: &std::collections::HashSet<&str>,
+    trait_interfaces: &std::collections::HashSet<&str>,
+) -> String {
     let mut lines = vec![];
 
     lines.push(format!("  class {}", typ.name));
 
-    // Add docstring if present
     if emit_docstrings && !typ.doc.is_empty() {
         let doc_lines: Vec<String> = typ.doc.lines().map(ToString::to_string).collect();
         lines.push(crate::backends::magnus::template_env::render(
@@ -273,21 +305,17 @@ fn gen_type_stub(typ: &TypeDef, emit_docstrings: bool, streaming_method_names: &
         lines.push("".to_string());
     }
 
-    // Add field attr declarations — use attr_accessor for config types (has_default),
-    // attr_reader for immutable result types.
-    // For config types, all fields are optional (builder pattern).
     let accessor = if typ.has_default {
         "attr_accessor"
     } else {
         "attr_reader"
     };
+    let mut emitted_attr_names: ahash::AHashSet<&str> = ahash::AHashSet::default();
     for f in binding_fields(&typ.fields) {
         let mut field_type = rbs_type(&f.ty);
-        // Builder types have optional fields (attr_accessor allows setting/getting nil)
         if typ.has_default && !field_type.ends_with('?') {
             field_type.push('?');
         }
-        // Field-level doc comment from the Rust source. Gated behind emit_docstrings.
         if emit_docstrings && !f.doc.is_empty() {
             for line in f.doc.lines() {
                 let line = line.trim();
@@ -298,6 +326,7 @@ fn gen_type_stub(typ: &TypeDef, emit_docstrings: bool, streaming_method_names: &
                 }
             }
         }
+        emitted_attr_names.insert(f.name.as_str());
         lines.push(format!(r#"    {accessor} {}: {field_type}"#, f.name));
     }
 
@@ -305,9 +334,6 @@ fn gen_type_stub(typ: &TypeDef, emit_docstrings: bool, streaming_method_names: &
         lines.push("".to_string());
     }
 
-    // Add initialize method
-    // For has_default types (config/builder), all fields are optional kwargs.
-    // For result types, required fields are required kwargs, optional fields are optional.
     let init_params: Vec<String> = typ
         .fields
         .iter()
@@ -315,13 +341,10 @@ fn gen_type_stub(typ: &TypeDef, emit_docstrings: bool, streaming_method_names: &
         .map(|f| {
             let field_type = rbs_type(&f.ty);
             if typ.has_default {
-                // Config types: all fields are optional kwargs in Ruby (defaults applied in Rust)
                 format!("?{}: {}", f.name, field_type)
             } else if f.optional {
-                // Result types: optional fields are optional kwargs
                 format!("?{}: {}", f.name, field_type)
             } else {
-                // Result types: required fields are required kwargs
                 format!("{}: {}", f.name, field_type)
             }
         })
@@ -329,17 +352,38 @@ fn gen_type_stub(typ: &TypeDef, emit_docstrings: bool, streaming_method_names: &
 
     lines.push(format!("    def initialize: ({}) -> void", init_params.join(", ")));
 
-    // Add instance methods
     for method in &typ.methods {
         if !method.is_static {
-            lines.push(gen_method_stub(method, false, emit_docstrings, streaming_method_names));
+            // `attr_accessor providers` already declares `providers`, so a same-named method
+            // stub makes the class carry two definitions of it — RBS rejects that with
+            // `RBS::DuplicatedMethodDefinition`. The attribute is declared first and wins,
+            // matching what the magnus binding emits (see `classes::gen_struct_methods`). ~keep
+            if emitted_attr_names.contains(method.name.as_str()) {
+                continue;
+            }
+            lines.push(gen_method_stub(
+                method,
+                false,
+                emit_docstrings,
+                streaming_return_types,
+                excluded,
+                trait_interfaces,
+                &typ.name,
+            ));
         }
     }
 
-    // Add static methods
     for method in &typ.methods {
         if method.is_static {
-            lines.push(gen_method_stub(method, true, emit_docstrings, streaming_method_names));
+            lines.push(gen_method_stub(
+                method,
+                true,
+                emit_docstrings,
+                streaming_return_types,
+                excluded,
+                trait_interfaces,
+                &typ.name,
+            ));
         }
     }
 
@@ -348,19 +392,66 @@ fn gen_type_stub(typ: &TypeDef, emit_docstrings: bool, streaming_method_names: &
     lines.join("\n")
 }
 
+/// Like [`substitute_excluded_types`], but never substitutes `Named(owner_type_name)`.
+///
+/// A type is only added to `excluded` (in [`gen_stubs`]) when it has no RBS class
+/// declaration of its own — e.g. an `alef(skip)` trait, or a struct managed entirely by
+/// another codegen pass (services). But a service owner type still gets a `class Owner`
+/// stub emitted by [`gen_opaque_type_stub`]/[`gen_type_stub`] right here, so a method
+/// declared *on* that class returning `Self` (already resolved to `Named(owner_type_name)`
+/// during extraction — see `resolve_self_refs`) must reference the real, just-declared
+/// class rather than fall back to `json_value`.
+fn substitute_excluded_types_except_owner(
+    ty: &TypeRef,
+    excluded: &std::collections::HashSet<&str>,
+    owner_type_name: &str,
+) -> TypeRef {
+    match ty {
+        TypeRef::Named(name) if name == owner_type_name => ty.clone(),
+        TypeRef::Optional(inner) => TypeRef::Optional(Box::new(substitute_excluded_types_except_owner(
+            inner,
+            excluded,
+            owner_type_name,
+        ))),
+        TypeRef::Vec(inner) => TypeRef::Vec(Box::new(substitute_excluded_types_except_owner(
+            inner,
+            excluded,
+            owner_type_name,
+        ))),
+        TypeRef::Map(k, v) => TypeRef::Map(
+            Box::new(substitute_excluded_types_except_owner(k, excluded, owner_type_name)),
+            Box::new(substitute_excluded_types_except_owner(v, excluded, owner_type_name)),
+        ),
+        other => substitute_excluded_types(other, excluded),
+    }
+}
+
 /// Generate a method stub using RBS declaration syntax.
 /// Streaming methods return Enumerator[ItemType] instead of String.
+///
+/// `owner_type_name` is the name of the class this method is declared on. It is never
+/// substituted via `excluded`, even when the owning type is `binding_excluded` (e.g. a
+/// service owner type managed by the services extraction pass): a class stub for it is
+/// being emitted right here, so `Self`-returning methods (already resolved to the owning
+/// type's name during extraction) must reference that real, declared class rather than
+/// falling back to `json_value`.
 fn gen_method_stub(
     method: &MethodDef,
     is_static: bool,
     emit_docstrings: bool,
-    streaming_method_names: &ahash::AHashSet<String>,
+    streaming_return_types: &ahash::AHashMap<String, String>,
+    excluded: &std::collections::HashSet<&str>,
+    trait_interfaces: &std::collections::HashSet<&str>,
+    owner_type_name: &str,
 ) -> String {
     let params: Vec<String> = method
         .params
         .iter()
         .map(|p| {
-            let param_type = rbs_type(&p.ty);
+            let param_type = rbs_type(&substitute_trait_interfaces(
+                &substitute_excluded_types_except_owner(&p.ty, excluded, owner_type_name),
+                trait_interfaces,
+            ));
             if p.optional {
                 format!("?{} {}", param_type, p.name)
             } else {
@@ -369,23 +460,13 @@ fn gen_method_stub(
         })
         .collect();
 
-    let return_type = if streaming_method_names.contains(&method.name) {
-        // For streaming methods like crawl_stream, derive the iterator type name
-        // from the method name (e.g., crawl_stream → CrawlStreamIterator)
-        let pascal_name = method
-            .name
-            .split('_')
-            .map(|part| {
-                let mut chars = part.chars();
-                match chars.next() {
-                    None => String::new(),
-                    Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-                }
-            })
-            .collect::<String>();
-        format!("Enumerator[{}Iterator]", pascal_name)
+    let return_type = if let Some(item_type) = streaming_return_types.get(&method.name) {
+        format!("Enumerator[{item_type}]")
     } else {
-        rbs_type(&method.return_type)
+        rbs_type(&substitute_trait_interfaces(
+            &substitute_excluded_types_except_owner(&method.return_type, excluded, owner_type_name),
+            trait_interfaces,
+        ))
     };
 
     let param_list = format!("({})", params.join(", "));
@@ -396,8 +477,6 @@ fn gen_method_stub(
         format!("    def {}: {} -> {}", method.name, param_list, return_type)
     };
 
-    // Prefix with the method's Rust doc comment, line by line. RBS allows free-form
-    // comments preceding method declarations. Gated behind emit_docstrings.
     if !emit_docstrings || method.doc.is_empty() {
         return sig_line;
     }
@@ -419,10 +498,8 @@ fn gen_method_stub(
 fn gen_enum_stub(enum_def: &EnumDef, emit_docstrings: bool) -> String {
     let mut lines = vec![];
 
-    // Always emit class stub (even for unit enums, for Ruby introspection)
     lines.push(format!("  class {}", enum_def.name));
 
-    // Add docstring if present — gated behind emit_docstrings.
     if emit_docstrings && !enum_def.doc.is_empty() {
         let doc_lines: Vec<String> = enum_def.doc.lines().map(ToString::to_string).collect();
         lines.push(crate::backends::magnus::template_env::render(
@@ -431,11 +508,9 @@ fn gen_enum_stub(enum_def: &EnumDef, emit_docstrings: bool) -> String {
         ));
     }
 
-    // Check if enum has data (non-unit variants)
     let has_data = enum_def.variants.iter().any(|v| !v.fields.is_empty());
 
     if !has_data {
-        // Unit enum: also emit as type alias with symbol union inside the class
         let symbol_variants: Vec<String> = enum_def
             .variants
             .iter()
@@ -443,10 +518,6 @@ fn gen_enum_stub(enum_def: &EnumDef, emit_docstrings: bool) -> String {
             .collect();
         lines.push(format!("    type value = {}", symbol_variants.join(" | ")));
     } else if enum_def.serde_tag.is_none() {
-        // Data enum: declare a singleton constructor per data-carrying variant so RBS sees the
-        // `Shape.circle(...)` factories the runtime binding registers via define_singleton_method.
-        // Tagged data enums get no Rust-side factory class (it collides with their Ruby `module`
-        // representation), so they declare no singleton constructors here either.
         gen_data_enum_variant_constructor_stubs(&mut lines, enum_def);
     }
 
@@ -472,11 +543,6 @@ fn gen_data_enum_variant_constructor_stubs(lines: &mut Vec<String>, enum_def: &E
             .iter()
             .enumerate()
             .map(|(idx, p)| {
-                // A param is nilable in the emitted RBS signature when it is naturally optional OR was
-                // promoted because it follows an optional param — the same rule the runtime magnus
-                // binding applies (`is_promoted_optional`), which wraps such params in `Option<T>`.
-                // Mirroring it keeps the stub's required/optional split identical to the runtime
-                // constructor, and matches how `gen_function_stub` renders optional params (`?T name`).
                 let optional = p.optional || crate::codegen::shared::is_promoted_optional(&ctor.params, idx);
                 crate::backends::magnus::template_env::render(
                     "rbs_enum_variant_constructor_param.jinja",
@@ -502,12 +568,20 @@ fn gen_data_enum_variant_constructor_stubs(lines: &mut Vec<String>, enum_def: &E
 }
 
 /// Generate a function stub (module method) using RBS declaration syntax.
-fn gen_function_stub(func: &FunctionDef, streaming_method_names: &ahash::AHashSet<String>) -> String {
+fn gen_function_stub(
+    func: &FunctionDef,
+    streaming_return_types: &ahash::AHashMap<String, String>,
+    excluded: &std::collections::HashSet<&str>,
+    trait_interfaces: &std::collections::HashSet<&str>,
+) -> String {
     let params: Vec<String> = func
         .params
         .iter()
         .map(|p| {
-            let param_type = rbs_type(&p.ty);
+            let param_type = rbs_type(&substitute_trait_interfaces(
+                &substitute_excluded_types(&p.ty, excluded),
+                trait_interfaces,
+            ));
             if p.optional {
                 format!("?{} {}", param_type, p.name)
             } else {
@@ -516,22 +590,13 @@ fn gen_function_stub(func: &FunctionDef, streaming_method_names: &ahash::AHashSe
         })
         .collect();
 
-    let return_type = if streaming_method_names.contains(&func.name) {
-        // For streaming methods like batch_crawl_stream
-        let pascal_name = func
-            .name
-            .split('_')
-            .map(|part| {
-                let mut chars = part.chars();
-                match chars.next() {
-                    None => String::new(),
-                    Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-                }
-            })
-            .collect::<String>();
-        format!("Enumerator[{}Iterator]", pascal_name)
+    let return_type = if let Some(item_type) = streaming_return_types.get(&func.name) {
+        format!("Enumerator[{item_type}]")
     } else {
-        rbs_type(&func.return_type)
+        rbs_type(&substitute_trait_interfaces(
+            &substitute_excluded_types(&func.return_type, excluded),
+            trait_interfaces,
+        ))
     };
 
     let param_list = format!("({})", params.join(", "));

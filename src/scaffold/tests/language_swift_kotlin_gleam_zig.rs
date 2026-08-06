@@ -6,18 +6,16 @@ fn test_scaffold_swift() {
     let api = test_api();
     let all_files = scaffold(&api, &config, &[Language::Swift]).unwrap();
     let files = language_files(&all_files);
-    // Original 6 + root Package.swift + .editorconfig + .swiftformat + README.md + Examples/Demo/main.swift = 11
     assert_eq!(
         files.len(),
-        11,
-        "Expected 11 files for Swift scaffold (original 6 + root Package.swift + 4 extras)"
+        12,
+        "Expected 12 files for Swift scaffold (original 6 + root Package.swift + 4 extras + RustBridgeC.c)"
     );
 
     let package_swift = files
         .iter()
         .find(|f| f.path == Path::new("packages/swift/Package.swift"))
         .unwrap();
-    // Module name derives to PascalCase of "my-lib" → "MyLib"
     assert!(
         package_swift.content.contains("name: \"MyLib\""),
         "got: {}",
@@ -48,7 +46,6 @@ fn test_scaffold_swift() {
         "got: {}",
         package_swift.content
     );
-    // Must declare RustBridge and RustBridgeC targets
     assert!(
         package_swift.content.contains("\"RustBridge\""),
         "Package.swift must declare RustBridge target; got: {}",
@@ -59,7 +56,6 @@ fn test_scaffold_swift() {
         "Package.swift must declare RustBridgeC target; got: {}",
         package_swift.content
     );
-    // RustBridge target must exist with unsafeFlags for in-tree development
     assert!(
         package_swift.content.contains("name: \"RustBridge\""),
         "Package.swift must declare RustBridge target; got: {}",
@@ -70,17 +66,31 @@ fn test_scaffold_swift() {
         "In-tree Package.swift must include unsafeFlags for local development; got: {}",
         package_swift.content
     );
-    // The FFI dylib's install_name is @rpath/lib...dylib, so the manifest must emit a runtime
-    // rpath (not just `-L` compile-time search) or `swift test` fails to dlopen the library.
-    // The rpath path is resolved absolutely from the manifest location via Foundation/#filePath.
     assert!(
         package_swift.content.contains("import Foundation"),
         "Package.swift must import Foundation to resolve the absolute rpath; got: {}",
         package_swift.content
     );
     assert!(
-        package_swift.content.contains("\"-Xlinker\", \"-rpath\", \"-Xlinker\""),
-        "Package.swift must emit a runtime rpath via the swiftc-native -Xlinker -rpath spelling so the FFI dylib loads at runtime; got: {}",
+        package_swift
+            .content
+            .contains("func resolvedStaticLib(_ name: String) -> String"),
+        "Package.swift must resolve staticlibs by explicit .a path so ld64 cannot substitute the sibling .dylib; got: {}",
+        package_swift.content
+    );
+    assert!(
+        package_swift.content.contains("resolvedStaticLib(\"my_lib_swift\")"),
+        "Package.swift must link the swift-bridge staticlib via resolvedStaticLib; got: {}",
+        package_swift.content
+    );
+    assert!(
+        package_swift.content.contains("resolvedStaticLib(\"my_lib_ffi\")"),
+        "Package.swift must link the FFI staticlib via resolvedStaticLib; got: {}",
+        package_swift.content
+    );
+    assert!(
+        !package_swift.content.contains("\"-Xlinker\", \"-rpath\", \"-Xlinker\""),
+        "Package.swift must not rely on bare -rpath linking now that staticlibs are linked by explicit path; got: {}",
         package_swift.content
     );
     assert!(
@@ -106,7 +116,6 @@ fn test_scaffold_swift() {
     assert!(gitignore.content.contains(".build/"), "got: {}", gitignore.content);
     assert!(gitignore.content.contains(".swiftpm/"), "got: {}", gitignore.content);
 
-    // RustBridgeC placeholder header (pure C target)
     let header = files
         .iter()
         .find(|f| f.path == Path::new("packages/swift/Sources/RustBridgeC/RustBridgeC.h"))
@@ -117,11 +126,27 @@ fn test_scaffold_swift() {
         header.content
     );
 
-    // module.modulemap in RustBridge (kept as documentation comment)
+    let source = files
+        .iter()
+        .find(|f| f.path == Path::new("packages/swift/Sources/RustBridgeC/RustBridgeC.c"))
+        .expect("RustBridgeC.c must be generated so XCBuild has an object file to link (#449)");
+    assert!(
+        source.content.contains("#include \"RustBridgeC.h\""),
+        "got: {}",
+        source.content
+    );
+    assert!(
+        source
+            .content
+            .contains("void my_lib_swift_rust_bridge_c_anchor(void) {}"),
+        "RustBridgeC.c must define a namespaced anchor symbol so the object file is never \
+         stripped and cannot collide with another package's RustBridgeC target; got: {}",
+        source.content
+    );
+
     let modulemap = files.iter().find(|f| f.path.ends_with("module.modulemap")).unwrap();
     assert!(!modulemap.content.is_empty(), "module.modulemap must not be empty");
 
-    // RustBridge placeholder Swift source
     let rust_bridge_swift = files
         .iter()
         .find(|f| f.path == Path::new("packages/swift/Sources/RustBridge/RustBridge.swift"))
@@ -131,7 +156,6 @@ fn test_scaffold_swift() {
         "RustBridge.swift must not be empty"
     );
 
-    // Check for new production files
     let readme = files.iter().find(|f| f.path == Path::new("packages/swift/README.md"));
     assert!(readme.is_some(), "README.md should be generated");
     assert!(
@@ -147,8 +171,6 @@ fn test_scaffold_swift() {
         !readme_content.contains("cat \"$OUT/SwiftBridgeCore.h\""),
         "README.md must not imply manual copied bridge output is the generated-package contract: {readme_content}"
     );
-    // .editorconfig and .swiftformat must both declare 2-space indent to match
-    // `swift-format` defaults, so editors and the formatter stay in sync.
     let editorconfig = files
         .iter()
         .find(|f| f.path == Path::new("packages/swift/.editorconfig"))
@@ -168,13 +190,11 @@ fn test_scaffold_swift() {
         swiftformat.content
     );
 
-    // Package.swift must use 2-space indentation — `swift-format` rewrites 4-space to 2.
     assert!(
         package_swift.content.contains("\n  name:"),
         "Package.swift must use 2-space indentation; got: {}",
         package_swift.content
     );
-    // Single-element products array must not have a trailing comma (swift-format removes it).
     assert!(
         !package_swift
             .content
@@ -183,7 +203,6 @@ fn test_scaffold_swift() {
         package_swift.content
     );
 
-    // Test stub must emit a blank line between import groups (swift-format requirement).
     let test_stub = files
         .iter()
         .find(|f| f.path.to_string_lossy().contains("Tests") && f.path.extension().is_some_and(|e| e == "swift"))
@@ -194,7 +213,6 @@ fn test_scaffold_swift() {
         test_stub.content
     );
 
-    // Demo must use 2-space indentation.
     let demo = files
         .iter()
         .find(|f| f.path == Path::new("packages/swift/Examples/Demo/main.swift"))
@@ -217,41 +235,24 @@ fn test_scaffold_kotlin() {
     let api = test_api();
     let all_files = scaffold(&api, &config, &[Language::Kotlin]).unwrap();
     let files = language_files(&all_files);
-    // build.gradle.kts, settings.gradle.kts, .gitignore, .editorconfig, gradle.properties, README.md, Sample.kt
     assert_eq!(files.len(), 7, "Expected 7 files for Kotlin scaffold");
     assert_eq!(files[0].path, PathBuf::from("packages/kotlin/build.gradle.kts"));
     assert!(files[0].content.contains("kotlin(\"jvm\")"));
-    assert!(files[0].content.contains("org.jlleitschuh.gradle.ktlint"));
-    // jspecify is required by the alef-emitted Java facade.
     assert!(
         files[0].content.contains("org.jspecify:jspecify:"),
         "build.gradle.kts must declare jspecify; got:\n{}",
         files[0].content
     );
-    // ktlint must skip the Java facade and build/generated dirs.
     assert!(
-        files[0].content.contains("filter {")
-            && files[0].content.contains("/packages/java/")
-            && files[0].content.contains("**/build/**")
-            && files[0].content.contains("**/generated/**"),
-        "ktlint filter block missing or incomplete; got:\n{}",
+        !files[0].content.contains("ktlint"),
+        "ktlint must not be wired into the plain-kotlin build (single formatter is ktfmt); got:\n{}",
         files[0].content
     );
-    // ktlint must skip the alef-emitted binding-class file (pascal-cased crate name).
-    // The `my-lib` test crate becomes `MyLib.kt`.
-    assert!(
-        files[0].content.contains(r#"endsWith("/MyLib.kt")"#),
-        "ktlint filter must exclude alef-emitted binding-class file; got:\n{}",
-        files[0].content
-    );
-    // Maven artifactId override disambiguates Kotlin module from sibling Java module.
     assert!(
         files[0].content.contains("artifactId = \"my-lib-kotlin\""),
         "publication artifactId override missing; got:\n{}",
         files[0].content
     );
-    // Kotlin/JVM targets JDK 21 (KOTLIN_JVM_TARGET); JDK 25 is reserved for
-    // the Java/Panama backend via JAVA_JVM_TARGET.
     assert!(
         files[0].content.contains("JavaVersion.VERSION_21") && files[0].content.contains("JvmTarget.JVM_21"),
         "build.gradle.kts must target JDK 21; got:\n{}",
@@ -318,8 +319,6 @@ keywords = ["test"]
 
 #[test]
 fn test_scaffold_kotlin_android_mode_returns_helpful_error() {
-    // `mode = "android"` was removed in alef 0.16. Scaffolding must surface
-    // a clear migration message rather than silently fall back.
     let config = test_config_from_toml(
         r#"
 [crates.kotlin]
@@ -400,7 +399,6 @@ fn test_scaffold_gleam() {
     let api = test_api();
     let all_files = scaffold(&api, &config, &[Language::Gleam]).unwrap();
     let files = language_files(&all_files);
-    // gleam.toml + manifest.toml + .gitignore + test + .editorconfig + README.md + example
     assert_eq!(files.len(), 7, "Expected 7 files for Gleam scaffold");
 
     let gleam_toml = &files[0];
@@ -475,7 +473,6 @@ fn test_scaffold_zig() {
     let api = test_api();
     let all_files = scaffold(&api, &config, &[Language::Zig]).unwrap();
     let files = language_files(&all_files);
-    // build.zig + build.zig.zon + .gitignore + .editorconfig + README.md + example.zig + main.zig (re-export stub)
     assert_eq!(files.len(), 7, "Expected 7 files for Zig scaffold");
 
     let build_zig = &files[0];

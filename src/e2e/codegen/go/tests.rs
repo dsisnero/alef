@@ -1,3 +1,6 @@
+// Test module: debug output to stderr is expected here. ~keep
+#![allow(clippy::print_stdout, clippy::print_stderr)]
+
 use crate::e2e::config::{ArgMapping, CallConfig, E2eConfig};
 use crate::e2e::fixture::{Assertion, Fixture};
 
@@ -791,6 +794,52 @@ fn render_go_mod_without_extras() {
     assert!(
         !out.contains("github.com/tree-sitter"),
         "should not contain tree-sitter without extras"
+    );
+}
+
+#[test]
+fn render_go_mod_includes_testify_indirect_deps() {
+    // A go.mod that lists testify but omits its transitive deps makes `go test`
+    // abort with "updates to go.mod needed; ... go mod tidy". The generated
+    // test_app must carry a complete dependency graph so it builds without a
+    // manual tidy (and offline).
+    let out = render_go_mod("github.com/example/mylib", None, "v1.0.0", None);
+    for indirect in [
+        "github.com/davecgh/go-spew v1.1.1 // indirect",
+        "github.com/pmezard/go-difflib v1.0.0 // indirect",
+        "gopkg.in/yaml.v3 v3.0.1 // indirect",
+    ] {
+        assert!(
+            out.contains(indirect),
+            "go.mod must contain testify indirect dep `{indirect}`, got:\n{out}"
+        );
+    }
+}
+
+#[test]
+fn render_go_mod_registry_mode_uses_sibling_module_path() {
+    // Registry mode (no replace): the main module must NOT be a subpath of the
+    // module under test, or Go ignores the `require` directive and resolves a
+    // stray upstream tag instead of the pinned version.
+    let out = render_go_mod("github.com/example/mylib", None, "v1.0.0", None);
+    assert!(
+        out.contains("module github.com/example/mylib-e2e"),
+        "registry-mode main module must be a sibling path, got: {out}"
+    );
+    assert!(
+        !out.contains("module github.com/example/mylib/e2e"),
+        "registry-mode main module must not shadow the module under test, got: {out}"
+    );
+}
+
+#[test]
+fn render_go_mod_local_mode_uses_nested_module_path() {
+    // Local mode (replace present): a nested `/e2e` main module resolves via the
+    // replace directive, so keep the historical nested path.
+    let out = render_go_mod("github.com/example/mylib", Some("../../packages/go"), "v0.0.0", None);
+    assert!(
+        out.contains("module github.com/example/mylib/e2e"),
+        "local-mode main module should stay nested, got: {out}"
     );
 }
 

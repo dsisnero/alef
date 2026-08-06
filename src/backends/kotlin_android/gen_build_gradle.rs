@@ -23,9 +23,6 @@ use crate::scaffold::{parse_author, scaffold_meta, xml_escape};
 pub fn emit(config: &ResolvedCrateConfig) -> String {
     let kotlin_version = maven::KOTLIN_JVM_PLUGIN;
     let android_gradle_plugin = maven::ANDROID_GRADLE_PLUGIN;
-    // AGP 9.0+ ships built-in Kotlin support and rejects re-application of the
-    // `org.jetbrains.kotlin.android` plugin; AGP 8.x requires the explicit line.
-    // Emit it only for AGP < 9 (derived from the pin's major version).
     let agp_major: u32 = android_gradle_plugin
         .split('.')
         .next()
@@ -39,8 +36,6 @@ pub fn emit(config: &ResolvedCrateConfig) -> String {
     let junit_legacy = maven::JUNIT_LEGACY;
     let androidx_junit = maven::ANDROIDX_TEST_EXT_JUNIT;
     let espresso_core = maven::ANDROIDX_TEST_ESPRESSO_CORE;
-    let ktlint_gradle_plugin = maven::KTLINT_GRADLE_PLUGIN;
-    let ktlint_version = maven::KTLINT;
     let gradle_versions_plugin = maven::GRADLE_VERSIONS_PLUGIN;
     let kotlinx_coroutines = maven::KOTLINX_COROUTINES_CORE;
     let jackson = maven::JACKSON;
@@ -58,9 +53,6 @@ pub fn emit(config: &ResolvedCrateConfig) -> String {
     let jni_crate_path = config.jni_crate_path();
     let jni_lib_name = config.jni_lib_name();
 
-    // Host-native capsule (Language) passthrough: depend on ktreesitter so the generated
-    // facade can construct its `Language` from the native pointer. `package` is a Gradle
-    // `group:artifact` coordinate (e.g. `io.github.tree-sitter:ktreesitter`).
     let capsule_deps: String = {
         let mut deps: Vec<(String, String)> = config
             .kotlin_android
@@ -75,22 +67,13 @@ pub fn emit(config: &ResolvedCrateConfig) -> String {
             .unwrap_or_default();
         deps.sort();
         deps.dedup();
-        // Expose each capsule dependency via `api`, not `implementation`: the generated
-        // facade returns the host-native `Language` (e.g. ktreesitter), so the type is part
-        // of this library's PUBLIC API. `api` puts it on the compile classpath of the
-        // library's own test sources AND of downstream consumers (and emits it as a
-        // compile-scope POM dependency on the published AAR). With `implementation` it is
-        // hidden from consumers, so any caller of `getLanguage()` — including the e2e
-        // test_app — fails to compile with "Cannot access class 'Language'".
         deps.iter()
             .map(|(coord, ver)| format!("\n    api(\"{coord}:{ver}\")"))
             .collect()
     };
 
-    // Build pom metadata from config.scaffold
     let meta = scaffold_meta(config);
 
-    // Derive SCM URLs from repository URL
     let repo_url = meta.repository.as_deref().unwrap_or_else(|| {
         panic!("Kotlin Android scaffold requires package metadata repository; set package_metadata.repository or scaffold.repository")
     });
@@ -99,7 +82,6 @@ pub fn emit(config: &ResolvedCrateConfig) -> String {
         .or_else(|| repo_url.strip_prefix("http://github.com/"))
         .unwrap_or(repo_url.trim_start_matches("https://"));
 
-    // License URL mapping
     let license = meta.license.as_deref().unwrap_or_else(|| {
         panic!("Kotlin Android scaffold requires package metadata license; set package_metadata.license or scaffold.license")
     });
@@ -110,7 +92,6 @@ pub fn emit(config: &ResolvedCrateConfig) -> String {
         _ => "",
     };
 
-    // Build licenses block
     let licenses_block = if license_url.is_empty() {
         format!(
             "licenses {{\n            license {{\n                name.set(\"{}\")\n            }}\n        }}",
@@ -124,9 +105,8 @@ pub fn emit(config: &ResolvedCrateConfig) -> String {
         )
     };
 
-    // Build developers block from authors (if any)
     let developers_block = if meta.authors.is_empty() {
-        "\n".to_string() // Just newline if no developers
+        "\n".to_string()
     } else {
         let devs: Vec<String> = meta
             .authors
@@ -158,7 +138,6 @@ buildscript {{
 plugins {{
     id("com.android.library") version "{android_gradle_plugin}"{kotlin_android_plugin_line}
     id("com.vanniktech.maven.publish") version "{vanniktech_plugin}"
-    id("org.jlleitschuh.gradle.ktlint") version "{ktlint_gradle_plugin}"
     id("com.github.ben-manes.versions") version "{gradle_versions_plugin}"
 }}
 
@@ -187,12 +166,6 @@ kotlin {{
     compilerOptions {{
         jvmTarget.set(JvmTarget.JVM_{android_jvm_target})
     }}
-}}
-
-ktlint {{
-    version.set("{ktlint_version}")
-    android.set(true)
-    ignoreFailures.set(false)
 }}
 
 dependencies {{
@@ -247,7 +220,7 @@ tasks.register("copyHostJni", Copy::class) {{
         val libName = when (hostPlatform) {{
             "darwin" -> "lib{jni_lib_name}.dylib"
             "windows" -> "{jni_lib_name}.dll"
-            else -> "lib{jni_lib_name}.so"  // linux
+            else -> "lib{jni_lib_name}.so" // linux
         }}
 
         from(buildDir) {{
@@ -287,9 +260,16 @@ tasks.matching {{ it.name.startsWith("processDebug") || it.name.startsWith("proc
 // during the publish phase. The publish workflow must extract jniLibs from
 // pre-built AARs and stage them into src/main/jniLibs before invoking gradle.
 // This check catches the bug where jniLibs are lost during publish-time rebuild.
+// NOTE: gate on task *name* via allTasks.any, not gradle.taskGraph.hasTask(name),
+// because hasTask(String) matches the fully-qualified path (":assembleRelease")
+// and a bare name never matches — which silently disabled this guard and let a
+// jni-less AAR ship.
 tasks.register("validateJniLibsForRelease") {{
     doFirst {{
-        if (gradle.taskGraph.hasTask("assembleRelease") || gradle.taskGraph.hasTask("publishAndReleaseToMavenCentral")) {{
+        val releaseAssemble = gradle.taskGraph.allTasks.any {{
+            it.name == "assembleRelease" || it.name == "publishAndReleaseToMavenCentral"
+        }}
+        if (releaseAssemble) {{
             val jniLibsDir = file("src/main/jniLibs")
             if (!jniLibsDir.exists() || jniLibsDir.listFiles()?.isEmpty() != false) {{
                 throw GradleException(
@@ -298,6 +278,23 @@ tasks.register("validateJniLibsForRelease") {{
                     "Ensure the publish workflow stages jniLibs from pre-built AARs " +
                     "into src/main/jniLibs/{{arm64-v8a,x86_64}}/ before invoking assembleRelease. " +
                     "Aborting to prevent shipping a jni-less AAR to Maven Central."
+                )
+            }}
+            // Every ABI directory must also contain the JNI crate's own library.
+            // A non-empty jniLibs holding a differently-named .so (e.g. the C-FFI
+            // lib*_ffi.so instead of lib{jni_lib_name}.so) passes the emptiness
+            // check above but fails at runtime with UnsatisfiedLinkError, because
+            // System.loadLibrary("{jni_lib_name}") needs the JNI entry points.
+            val expectedJniLib = "lib{jni_lib_name}.so"
+            val abisMissingJniLib = (jniLibsDir.listFiles()?.filter {{ it.isDirectory }} ?: emptyList())
+                .filter {{ abiDir -> !abiDir.resolve(expectedJniLib).exists() }}
+            if (abisMissingJniLib.isNotEmpty()) {{
+                throw GradleException(
+                    "FATAL: " + expectedJniLib + " is missing from jniLibs ABI dir(s): " +
+                    abisMissingJniLib.joinToString(", ") {{ it.name }} + ". " +
+                    "A differently-named native library (e.g. the C-FFI lib*_ffi.so) does not " +
+                    "export the JNI symbols System.loadLibrary(\"{jni_lib_name}\") requires and " +
+                    "fails at runtime. Aborting to prevent shipping a broken AAR to Maven Central."
                 )
             }}
         }}
@@ -310,11 +307,13 @@ tasks.named("preBuild") {{
 }}
 
 mavenPublishing {{
-    configure(AndroidSingleVariantLibrary(
-        variant = "release",
-        sourcesJar = com.vanniktech.maven.publish.SourcesJar.Sources(),
-        javadocJar = com.vanniktech.maven.publish.JavadocJar.Empty(),
-    ))
+    configure(
+        AndroidSingleVariantLibrary(
+            variant = "release",
+            sourcesJar = com.vanniktech.maven.publish.SourcesJar.Sources(),
+            javadocJar = com.vanniktech.maven.publish.JavadocJar.Empty(),
+        ),
+    )
 
     publishToMavenCentral()
     signAllPublications()
@@ -338,11 +337,11 @@ mavenPublishing {{
     }}
 }}
 "#,
-        xml_escape(&meta.description), // description.set({})
-        xml_escape(repo_url),          // url.set({})
-        xml_escape(repo_url),          // url.set({}) in scm block
-        repo_path,                     // connection.set("scm:git:git://github.com/{}.git")
-        repo_path,                     // developerConnection.set("scm:git:ssh://git@github.com:{}.git")
+        xml_escape(&meta.description),
+        xml_escape(repo_url),
+        xml_escape(repo_url),
+        repo_path,
+        repo_path,
     )
 }
 
@@ -352,7 +351,6 @@ mod tests {
 
     #[test]
     fn build_gradle_includes_host_jni_tasks() {
-        // Create a minimal ResolvedCrateConfig for testing.
         use crate::core::config::new_config::NewAlefConfig;
 
         let toml_str = r#"
@@ -380,34 +378,134 @@ description = "Test library"
 
         let gradle = emit(config);
 
-        // Verify the emitted Gradle script contains the host JNI build task.
         assert!(
             gradle.contains(r#"tasks.register("buildHostJni", Exec::class)"#),
             "Gradle should contain buildHostJni task registration"
         );
 
-        // Verify the copyHostJni task is present.
         assert!(
             gradle.contains(r#"tasks.register("copyHostJni", Copy::class)"#),
             "Gradle should contain copyHostJni task registration"
         );
 
-        // Verify the Test task configuration is present.
         assert!(
             gradle.contains("tasks.withType<Test>"),
             "Gradle should configure tasks.withType<Test>"
         );
 
-        // Verify the java.library.path property is set for tests.
         assert!(
             gradle.contains("java.library.path"),
             "Gradle should set java.library.path system property"
         );
 
-        // Verify the opt-out property is documented.
         assert!(
             gradle.contains("alef.skipHostJni"),
             "Gradle should mention alef.skipHostJni opt-out"
+        );
+    }
+
+    #[test]
+    fn build_gradle_is_ktlint_clean_for_known_violations() {
+        use crate::core::config::new_config::NewAlefConfig;
+
+        let toml_str = r#"
+[workspace]
+languages = ["kotlin_android"]
+
+[[crates]]
+name = "test-lib"
+sources = ["src/lib.rs"]
+
+[crates.kotlin_android]
+package = "dev.example"
+
+[crates.jni]
+
+[crates.scaffold]
+repository = "https://github.com/example/test-lib"
+license = "MIT"
+description = "Test library"
+"#;
+
+        let cfg: NewAlefConfig = toml::from_str(toml_str).unwrap();
+        let resolved = cfg.resolve().unwrap();
+        let gradle = emit(&resolved[0]);
+
+        // ktlint "Unnecessary long whitespace": exactly one space before a trailing comment.
+        assert!(
+            !gradle.contains(".so\"  // linux"),
+            "ktlint rejects the double space before the trailing `// linux` comment"
+        );
+        assert!(
+            gradle.contains(".so\" // linux"),
+            "the else branch must keep a single-spaced trailing `// linux` comment"
+        );
+
+        // ktlint "Missing newline after (" / "before )": the outer configure(...) call wrapping ~keep
+        // the multi-line AndroidSingleVariantLibrary(...) argument must break after `configure(`. ~keep
+        assert!(
+            gradle.contains("configure(\n        AndroidSingleVariantLibrary("),
+            "configure(...) must wrap its multiline argument onto its own line for ktlint"
+        );
+        assert!(
+            !gradle.contains("configure(AndroidSingleVariantLibrary("),
+            "configure(AndroidSingleVariantLibrary( on one line trips ktlint's wrapping rule"
+        );
+    }
+
+    #[test]
+    fn build_gradle_validates_jni_lib_present_per_abi() {
+        use crate::core::config::new_config::NewAlefConfig;
+
+        let toml_str = r#"
+[workspace]
+languages = ["kotlin_android"]
+
+[[crates]]
+name = "test-lib"
+sources = ["src/lib.rs"]
+
+[crates.kotlin_android]
+package = "dev.example"
+
+[crates.jni]
+
+[crates.scaffold]
+repository = "https://github.com/example/test-lib"
+license = "MIT"
+description = "Test library"
+"#;
+
+        let cfg: NewAlefConfig = toml::from_str(toml_str).unwrap();
+        let resolved = cfg.resolve().unwrap();
+        let config = &resolved[0];
+        let jni_lib_name = config.jni_lib_name();
+
+        let gradle = emit(config);
+
+        // The release guard must assert the correctly-named JNI library is present in ~keep
+        // each ABI dir, not merely that jniLibs is non-empty (which a stray C-FFI ~keep
+        // lib*_ffi.so would satisfy while failing at runtime with UnsatisfiedLinkError). ~keep
+        assert!(
+            gradle.contains(&format!("val expectedJniLib = \"lib{jni_lib_name}.so\"")),
+            "guard must check for the JNI-named library per ABI"
+        );
+        assert!(
+            gradle.contains("abisMissingJniLib"),
+            "guard must collect ABI dirs missing the JNI library"
+        );
+        assert!(
+            gradle.contains("is missing from jniLibs ABI dir(s)"),
+            "guard must fail with an actionable message naming the missing ABI dirs"
+        );
+        assert!(
+            gradle.contains("gradle.taskGraph.allTasks.any"),
+            "guard must gate on task name via allTasks.any (hasTask(String) matches the \
+             qualified path and silently disabled the guard)"
+        );
+        assert!(
+            !gradle.contains("gradle.taskGraph.hasTask(\"assembleRelease\")"),
+            "guard must not use hasTask(String) (bare name never matches the qualified task path)"
         );
     }
 }

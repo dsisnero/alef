@@ -23,8 +23,6 @@ pub(crate) fn scaffold_php_cargo(api: &ApiSurface, config: &ResolvedCrateConfig)
         .adapters
         .iter()
         .any(|a| matches!(a.pattern, AdapterPattern::Streaming));
-    // ahash is needed when any function takes an AHashMap<Cow, _> param — the generated
-    // PHP wrapper emits a `let __<name>_ahash: ahash::AHashMap<...>` pre-call binding.
     let needs_ahash = api.functions.iter().any(|f| f.params.iter().any(|p| p.map_is_ahash));
     let mut all_deps = extra_deps;
     if needs_ahash {
@@ -39,6 +37,12 @@ pub(crate) fn scaffold_php_cargo(api: &ApiSurface, config: &ResolvedCrateConfig)
         }
         all_deps.push_str("async-trait = \"0.1\"");
     }
+    if has_trait_bridges && !all_deps.contains("tracing") {
+        if !all_deps.is_empty() {
+            all_deps.push('\n');
+        }
+        all_deps.push_str(&format!("tracing = \"{}\"", tv::cargo::TRACING));
+    }
     if has_streaming && !all_deps.contains("futures-util = ") && !all_deps.contains("futures-util =\"") {
         if !all_deps.is_empty() {
             all_deps.push('\n');
@@ -51,18 +55,11 @@ pub(crate) fn scaffold_php_cargo(api: &ApiSurface, config: &ResolvedCrateConfig)
     } else {
         format!("\n{all_deps}")
     };
-    // Build the cargo-machete ignored list. `tokio` is added to the
-    // dependency block unconditionally to keep the manifest layout stable
-    // across generated PHP crates, but consumers whose PHP surface exposes
-    // no async functions never reference it — list it as ignored. Same for
-    // `async-trait`, which is added when the umbrella declares
-    // `trait_bridges` but goes unreferenced when the resulting trait shim
     // does not use `#[async_trait]` after JSON-bridging. `ahash` is added when
-    // any parameter uses AHashMap<Cow, _>, but the PHP wrapper never directly
-    // uses ahash—it's used only in the Rust core for type field marshalling.
     let mut machete_ignored: Vec<&str> = vec!["tokio", "ahash"];
     if has_trait_bridges {
         machete_ignored.push("async-trait");
+        machete_ignored.push("tracing");
     }
     if has_streaming {
         machete_ignored.push("futures-util");
@@ -72,9 +69,6 @@ pub(crate) fn scaffold_php_cargo(api: &ApiSurface, config: &ResolvedCrateConfig)
         .map(|d| format!("\"{d}\""))
         .collect::<Vec<_>>()
         .join(", ");
-    // Build [dependencies] block alphabetically sorted to match cargo-sort.
-    // Order: async-trait?, ext-php-rs, futures-util?, <core-crate>,
-    // serde, serde_json, tokio.
     let core_overrides = config
         .php
         .as_ref()
@@ -112,14 +106,10 @@ pub(crate) fn scaffold_php_cargo(api: &ApiSurface, config: &ResolvedCrateConfig)
     let dep_block = dep_entries.join("\n");
     let _ = extra_deps_section;
 
-    // Collect every feature name referenced by a cfg attribute on any type, field,
-    // enum variant, or function in the API surface and emit forwarding entries so
-    // the binding crate can re-export them to the core dep. Without this,
     // `#[cfg(feature = "X")]` arms emitted by the codegen produce
-    // `error: unexpected cfg condition value: X` and, when the cfg'd item is a
     // method inside a `#[php_impl]` block, a fatal E0599. Enable them all by
     // default so `#[cfg(feature = "X")]` arms compile unconditionally.
-    let core_dep_name = &config.name; // e.g. "sample-core" — the Cargo dep key
+    let core_dep_name = &config.name;
     let cfg_forwarding: String = {
         let features = crate::codegen::cfg::collect_cfg_features(api);
         if features.is_empty() {
@@ -170,8 +160,6 @@ pub(crate) fn scaffold_php(_api: &ApiSurface, config: &ResolvedCrateConfig) -> a
     let meta = scaffold_meta(config);
     let ext_name = config.php_extension_name();
     let pkg_dir = config.package_dir(Language::Php);
-    // PSR-4 namespace derived from the extension name.
-    // Double backslashes for JSON string literal output.
     let php_namespace = php_autoload_namespace(config).replace('\\', "\\\\");
 
     let keywords_json = if meta.keywords.is_empty() {
@@ -191,15 +179,6 @@ pub(crate) fn scaffold_php(_api: &ApiSurface, config: &ResolvedCrateConfig) -> a
         composer_package_name(config, &meta)
     };
 
-    // Composer manifests are emitted twice with one structural difference: the
-    // PSR-4 autoload src path. The package manifest at `{pkg_dir}/composer.json`
-    // is the dev manifest used by phpunit inside the package directory and points
-    // at `src/` (lint+format are poly-native via mago — no phpstan/php-cs-fixer).
-    // The root manifest at
-    // `composer.json` is the one Packagist indexes and PIE installs read — it
-    // must point at `{pkg_dir}/src/` so the same PSR-4 classes resolve from
-    // the repo root. Everything else (name, php-ext block, require/require-dev,
-    // scripts) is byte-identical so the two manifests stay in sync without drift.
     let render_composer = |autoload_src: &str| -> String {
         let license_json = meta
             .license
@@ -207,15 +186,6 @@ pub(crate) fn scaffold_php(_api: &ApiSurface, config: &ResolvedCrateConfig) -> a
             .map(|license| format!("  \"license\": \"{license}\",\n"))
             .unwrap_or_default();
 
-        // PIE (PHP Installation Extension) uses extra.pie.binary.url-template to locate
-        // pre-packaged extension archives. Template tokens: {Version}, {PhpVersion}, {Arch},
-        // {OS}, {Libc}, {TSMode} (zts or nts). When no repository is configured, emit a
-        // placeholder; the URL is typically overridden by the package maintainer.
-        // PIE 1.4+ substitutes {Version} with `$package->version()` from Composer, which
-        // preserves the leading `v` from the source tag (e.g. `v0.3.0-rc.45`). PIE's {OS}
-        // placeholder resolves to PHP's PHP_OS_FAMILY (uppercase: Linux, Darwin, Windows),
-        // but published release assets use lowercase (linux, darwin). Use the {OSLower}
-        // placeholder (PIE 1.5+) to match actual GitHub Release asset names.
         let pie_binary_block = if let Some(repo_url) = meta.configured_repository.as_deref() {
             format!(
                 ",\n  \"extra\": {{\n    \"pie\": {{\n      \"binary\": {{\n        \"url-template\": \"{repo_url}/releases/download/{{Version}}/php_{ext_name}-{{Version}}_php{{PhpVersion}}-{{Arch}}-{{OSLower}}-{{Libc}}-{{TSMode}}.tgz\"\n      }}\n    }}\n  }}"
@@ -268,21 +238,27 @@ pub(crate) fn scaffold_php(_api: &ApiSurface, config: &ResolvedCrateConfig) -> a
         )
     };
 
-    let content = render_composer("src/");
-    let root_content = render_composer("packages/php/src/");
+    // When `[crates.output] php` is configured (or a language template resolves it), the
+    // generated classes co-locate with this composer.json in `pkg_dir` itself, so PSR-4
+    // autoload must point at the current directory rather than a nested `src/` folder that
+    // no longer exists. Unset config keeps the historical split layout. ~keep
+    let co_located = config.output_paths.contains_key("php");
+    let package_autoload_src = if co_located { "" } else { "src/" };
+    let root_autoload_src = if co_located {
+        format!("{}/", pkg_dir.trim_end_matches('/'))
+    } else {
+        "packages/php/src/".to_string()
+    };
 
-    // PHP linting + formatting are poly-native via mago (no PHP runtime): no
-    // phpstan.neon / phpstan-baseline.neon / .php-cs-fixer.dist.php is emitted.
-    // The mago ruleset lives in the repo-root poly.toml ([lint.php.mago]).
+    let content = render_composer(package_autoload_src);
+    let root_content = render_composer(&root_autoload_src);
+
     Ok(vec![
         GeneratedFile {
             path: PathBuf::from(format!("{pkg_dir}/composer.json")),
             content,
             generated_header: false,
         },
-        // Root composer.json is the Packagist/PIE manifest. Packagist indexes
-        // it from the repo root, so the autoload path must point at the package
-        // source directory.
         GeneratedFile {
             path: PathBuf::from("composer.json"),
             content: root_content,

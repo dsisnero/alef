@@ -16,10 +16,6 @@ use ahash::AHashSet;
 pub(super) fn gen_cargo_toml(api: &ApiSurface, config: &ResolvedCrateConfig) -> String {
     let core_crate_dir = config.core_crate_for_language(Language::Wasm);
     let crate_name = &config.name;
-    // Package-name prefix for `<prefix>-wasm`. Preserves prior behaviour
-    // (derived from sources) when no override is set; switches to the
-    // umbrella crate name when an override redirects the core dep elsewhere
-    // so the binding crate keeps its original published name.
     let pkg_prefix: String = if config
         .wasm
         .as_ref()
@@ -30,10 +26,6 @@ pub(super) fn gen_cargo_toml(api: &ApiSurface, config: &ResolvedCrateConfig) -> 
     } else {
         core_crate_dir.clone()
     };
-    // Cargo dep KEY for the core dependency: the override when set, otherwise
-    // the umbrella crate name. Must match `core_crate_dir` so
-    // `path = "../{core_crate_dir}"` resolves to a crate whose Cargo.toml
-    // `name` equals the dep key.
     let core_dep_key: String = config
         .wasm
         .as_ref()
@@ -60,10 +52,6 @@ pub(super) fn gen_cargo_toml(api: &ApiSurface, config: &ResolvedCrateConfig) -> 
     let features_clause = if features.is_empty() {
         String::new()
     } else {
-        // When the consumer pinned an explicit feature set for wasm, also
-        // disable default features so "download" or similar host-only
-        // defaults don't sneak in (mio/getrandom can't compile to
-        // wasm32-unknown-unknown).
         let quoted: Vec<String> = features.iter().map(|f| format!("\"{f}\"")).collect();
         format!(", default-features = false, features = [{}]", quoted.join(", "))
     };
@@ -86,34 +74,39 @@ pub(super) fn gen_cargo_toml(api: &ApiSurface, config: &ResolvedCrateConfig) -> 
         format!("\n{}", extra_dep_lines.join("\n"))
     };
 
-    // Collect every feature name referenced by a cfg attribute on a generated
-    // item. Each becomes a passthrough Cargo feature on the binding crate so
-    // rustc does not warn `unexpected cfg condition value` under `-D warnings`.
-    //
-    // Features are declared but NOT enabled by default. Items behind
     // `#[cfg(feature = X)]` on the binding crate intentionally evaluate false
-    // when the feature isn't enabled — they're forwarded to the core dep via
-    // the `dep features = [..]` clause, which makes the core types reachable,
-    // but the binding's own mirror items (DTOs, From impls) remain hidden so
-    // serde-Deserialize on trait-object handles like `VisitorHandle` does not
-    // surface in the binding's deserialization surface.
     let _ = features;
-    let cfg_features = collect_cfg_features(api);
-    let features_table = if cfg_features.is_empty() {
+    let mut declared_features = collect_cfg_features(api);
+    if let Some(wasm) = config.wasm.as_ref() {
+        declared_features.extend(wasm.extra_features.iter().filter(|name| !name.is_empty()).cloned());
+    }
+    let features_table = if declared_features.is_empty() {
         String::new()
     } else {
-        let lines: Vec<String> = cfg_features
+        let lines: Vec<String> = declared_features
             .iter()
             .map(|name| format!(r#"{name} = ["{core_dep_key}/{name}"]"#))
             .collect();
         format!("[features]\n{}\n\n", lines.join("\n"))
     };
 
+    // `[package.metadata.wasm-pack.profile.release] wasm-opt`: emit the configured ~keep
+    // pass args (e.g. `["-Oz"]`) when set, else `false` (wasm-pack skips wasm-opt). ~keep
+    let wasm_opt_line = config
+        .wasm
+        .as_ref()
+        .map(|c| c.wasm_opt.as_slice())
+        .filter(|args| !args.is_empty())
+        .map(|args| {
+            let quoted: Vec<String> = args.iter().map(|a| format!("\"{a}\"")).collect();
+            format!("wasm-opt = [{}]", quoted.join(", "))
+        })
+        .unwrap_or_else(|| "wasm-opt = false".to_string());
+
     let header = hash::header(CommentStyle::Hash);
 
-    // Layout follows cargo-sort canonical order: [package] -> [package.metadata.*]
-    // -> [lib] -> [dependencies] (alphabetical). Otherwise cargo-sort rewrites the
-    // file post-generate and breaks the alef hash header.
+    let has_trait_bridges = !config.trait_bridges.is_empty();
+
     let mut deps: Vec<(String, String)> = vec![
         (
             core_dep_key.clone(),
@@ -137,7 +130,9 @@ pub(super) fn gen_cargo_toml(api: &ApiSurface, config: &ResolvedCrateConfig) -> 
             format!(r#""{}""#, tv::cargo::WASM_BINDGEN_FUTURES),
         ),
     ];
-    // Parse extra deps into (name, value) pairs.
+    if has_trait_bridges {
+        deps.push(("tracing".to_string(), format!(r#""{}""#, tv::cargo::TRACING)));
+    }
     let mut extra_parsed: Vec<(String, String)> = Vec::new();
     for line in extra_deps_section.lines() {
         let trimmed = line.trim();
@@ -145,10 +140,6 @@ pub(super) fn gen_cargo_toml(api: &ApiSurface, config: &ResolvedCrateConfig) -> 
             extra_parsed.push((name.trim().to_string(), value.trim().to_string()));
         }
     }
-    // A dependency listed in `[crates.<lang>.extra_dependencies]` overrides the
-    // built-in of the same name rather than emitting a second key. Without this,
-    // re-declaring a built-in (e.g. `serde`) produces a duplicate key and cargo
-    // rejects the manifest with "duplicate key in dependencies".
     let extra_names: AHashSet<&str> = extra_parsed.iter().map(|(name, _)| name.as_str()).collect();
     deps.retain(|(name, _)| !extra_names.contains(name.as_str()));
     deps.extend(extra_parsed);
@@ -158,6 +149,30 @@ pub(super) fn gen_cargo_toml(api: &ApiSurface, config: &ResolvedCrateConfig) -> 
         .map(|(name, value)| format!("{name} = {value}"))
         .collect::<Vec<_>>()
         .join("\n");
+
+    // Hand-written test files in the binding crate (e.g. `#[wasm_bindgen_test]` ~keep
+    // suites) need test-only dependencies the generated manifest must carry. ~keep
+    let mut dev_dep_lines: Vec<String> = config
+        .wasm
+        .as_ref()
+        .map(|c| c.extra_dev_dependencies.iter().collect::<Vec<_>>())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(name, value)| {
+            if let Some(v) = value.as_str() {
+                format!("{name} = \"{v}\"")
+            } else {
+                format!("{name} = {value}")
+            }
+        })
+        .collect();
+    dev_dep_lines.sort();
+    let dev_deps_section = if dev_dep_lines.is_empty() {
+        String::new()
+    } else {
+        format!("\n[dev-dependencies]\n{}\n", dev_dep_lines.join("\n"))
+    };
+    let tracing_ignored_line = if has_trait_bridges { "    \"tracing\",\n" } else { "" };
 
     format!(
         r#"{header}
@@ -177,17 +192,17 @@ ignored = [
     "wasm-bindgen-futures",
     "serde",
     "serde_json",
-]
+{tracing_ignored_line}]
 
 [package.metadata.wasm-pack.profile.release]
-wasm-opt = false
+{wasm_opt_line}
 
 [lib]
 crate-type = ["cdylib"]
 
 {features_table}[dependencies]
 {deps_block}
-
+{dev_deps_section}
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = {{ version = "0.4", features = ["wasm_js"] }}
 getrandom_02 = {{ package = "getrandom", version = "0.2", features = ["js"] }}
@@ -200,7 +215,10 @@ getrandom_03 = {{ package = "getrandom", version = "0.3", features = ["wasm_js"]
         description = description,
         repository = repository,
         keywords_toml = keywords_toml,
+        wasm_opt_line = wasm_opt_line,
         deps_block = deps_block,
+        dev_deps_section = dev_deps_section,
         features_table = features_table,
+        tracing_ignored_line = tracing_ignored_line,
     )
 }

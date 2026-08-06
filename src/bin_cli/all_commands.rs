@@ -10,14 +10,8 @@ use super::helpers::*;
 pub(crate) fn handle(command: Commands, context: &DispatchContext) -> Result<Option<Commands>> {
     let config_path = &context.config_path;
     match command {
-        Commands::All {
-            clean,
-            format: _format,
-            skip_frb,
-        } => {
+        Commands::All { clean, skip_frb } => {
             if skip_frb {
-                // Propagate via the existing escape-hatch env var so run_run_command
-                // sees it without threading a new parameter through the call stack.
                 let existing = std::env::var("ALEF_SKIP_COMMANDS").unwrap_or_default();
                 let updated = if existing.is_empty() {
                     "flutter_rust_bridge_codegen".to_string()
@@ -27,19 +21,13 @@ pub(crate) fn handle(command: Commands, context: &DispatchContext) -> Result<Opt
                 // SAFETY: single-threaded CLI dispatch; no concurrent env access here.
                 unsafe { std::env::set_var("ALEF_SKIP_COMMANDS", updated) };
             }
-            let _ = skip_frb; // consumed above
+            let _ = skip_frb;
             let (workspace, resolved) = load_config(config_path)?;
             version_pin::check_alef_toml_version(&workspace)?;
             let crates_to_process = dispatch::select_crates(&resolved, &context.crate_filter)?;
             let multi = dispatch::is_multi_crate(&crates_to_process);
             let base_dir = std::env::current_dir()?;
 
-            // Stamp alef.toml with the CLI version BEFORE computing any hashes.
-            // `finalize_hashes` mixes alef.toml bytes into the embedded
-            // `alef:hash:` value; if we wrote the version pin after hashing, the
-            // bytes seen by `alef verify` would differ from the bytes used at
-            // generate time and every file would be reported stale right after a
-            // clean regen.
             if let Err(e) = version_pin::write_alef_toml_version(config_path) {
                 tracing::warn!("could not update alef.toml version pin: {e}");
             }
@@ -56,28 +44,27 @@ pub(crate) fn handle(command: Commands, context: &DispatchContext) -> Result<Opt
 
             for resolved_cfg in &crates_to_process {
                 let languages = resolve_languages(resolved_cfg, None)?;
+                pipeline::warn_missing_formatters(&languages);
                 if multi {
-                    eprintln!(
+                    tracing::info!(
                         "[{}] Running all for: {}",
                         resolved_cfg.name,
                         format_languages(&languages)
                     );
                 } else {
-                    eprintln!("Running all for: {}", format_languages(&languages));
+                    tracing::info!("Running all for: {}", format_languages(&languages));
                 }
 
                 let api = pipeline::extract(resolved_cfg, config_path, clean)?;
                 let sources_hash = cache::sources_hash(&resolved_cfg.sources)?;
 
-                // Collect all files generated in this run for cleanup pass
                 let mut current_gen_paths = std::collections::HashSet::new();
                 let mut changed_languages: std::collections::HashSet<crate::core::config::Language> =
                     std::collections::HashSet::new();
 
-                eprintln!("Generating bindings...");
+                tracing::info!("Generating bindings...");
                 let bindings = pipeline::generate(&api, resolved_cfg, &languages, clean, config_path)?;
 
-                // Per-language: hash content, skip writing if all hashes match.
                 let mut binding_count: usize = 0;
                 for (lang, lang_files) in &bindings {
                     let lang_str = lang.to_string();
@@ -100,12 +87,8 @@ pub(crate) fn handle(command: Commands, context: &DispatchContext) -> Result<Opt
                     let stored = cache::read_generation_hashes(&cache_key).unwrap_or_default();
                     let cache_match = !hashes.is_empty() && hashes.iter().all(|(p, h)| stored.get(p) == Some(h));
 
-                    // The side cache is not authoritative on its own: confirm the
-                    // generated output also matches what is actually on disk, so a
-                    // file reverted or edited out-of-band is regenerated rather than
-                    // silently left stale.
                     if cache_match && !clean && generated_files_match_disk(lang_files, &base_dir) {
-                        eprintln!("  [{lang_str}] up to date (skipping)");
+                        tracing::info!("  [{lang_str}] up to date (skipping)");
                         continue;
                     }
 
@@ -115,11 +98,6 @@ pub(crate) fn handle(command: Commands, context: &DispatchContext) -> Result<Opt
                     let _ = cache::write_generation_hashes(&cache_key, &hashes);
                 }
 
-                // Generate service API (idiomatic app/handler bridge) for backends
-                // that support it — only runs when surface.services is non-empty.
-                // Must run BEFORE post-build because some backends (e.g. swift) invoke
-                // `cargo build` during post-build, and lib.rs may declare `pub mod service;`
-                // — the service.rs file must exist on disk by that point.
                 if !api.services.is_empty() {
                     let svc_files = pipeline::generate_service_api(&api, resolved_cfg, &languages)?;
                     if !svc_files.is_empty() {
@@ -129,34 +107,21 @@ pub(crate) fn handle(command: Commands, context: &DispatchContext) -> Result<Opt
                             }
                         }
                         let svc_count = pipeline::write_files(&svc_files, &base_dir)?;
-                        eprintln!("Generated {svc_count} service API files");
+                        tracing::info!("Generated {svc_count} service API files");
                         for (lang, _) in &svc_files {
                             changed_languages.insert(*lang);
                         }
                     }
                 }
 
-                // Generate package scaffolding (Cargo.toml / package.json / pyproject /
-                // etc.) BEFORE post-build. Post-build invokes `cargo` on the whole
-                // workspace for some backends (swift/dart), so every crate manifest —
-                // notably the scaffold-emitted `<crate>-jni/Cargo.toml` whose `src/lib.rs`
-                // was just written by the generate phase — must already be on disk;
-                // otherwise the `crates/*` glob matches a manifest-less crate dir and the
-                // cargo invocation aborts with "failed to load manifest for workspace
-                // member". Same precedent as the service-API generation above.
-                eprintln!("Generating scaffolding...");
+                tracing::info!("Generating scaffolding...");
                 let scaffold_files = pipeline::scaffold(&api, resolved_cfg, &languages, config_path)?;
                 let scaffold_count = pipeline::write_scaffold_files_with_overwrite(&scaffold_files, &base_dir, clean)?;
                 for file in &scaffold_files {
                     current_gen_paths.insert(base_dir.join(&file.path));
                 }
 
-                // Run post-build processing (e.g., FRB codegen, post-processing rewrites).
-                // Emit a "starting" line BEFORE each step so silent backends (post_build
-                // empty) and long-running subprocess steps (FRB codegen) are visible to
-                // the user; otherwise the loop appears to hang between the last printed
-                // backend and the next one with actual work.
-                eprintln!("Running post-build processing...");
+                tracing::info!("Running post-build processing...");
                 for &lang in &languages {
                     let Some(backend) = registry::try_get_backend(lang) else {
                         continue;
@@ -167,19 +132,19 @@ pub(crate) fn handle(command: Commands, context: &DispatchContext) -> Result<Opt
                     if bc.post_build.is_empty() {
                         continue;
                     }
-                    eprintln!("  [{lang}] running post-build...");
+                    tracing::info!("  [{lang}] running post-build...");
                     match pipeline::run_post_build(lang, &bc, resolved_cfg, &base_dir) {
                         Ok(()) => {
-                            eprintln!("  [{lang}] post-build processing complete");
+                            tracing::info!("  [{lang}] post-build processing complete");
                         }
                         Err(e) => {
-                            eprintln!("  [{lang}] post-build processing failed: {e}");
+                            tracing::error!("  [{lang}] post-build processing failed: {e}");
                             return Err(e);
                         }
                     }
                 }
 
-                eprintln!("Generating type stubs...");
+                tracing::info!("Generating type stubs...");
                 let stubs = pipeline::generate_stubs(&api, resolved_cfg, &languages)?;
 
                 let stub_hashes: Vec<(String, String)> = stubs
@@ -202,13 +167,11 @@ pub(crate) fn handle(command: Commands, context: &DispatchContext) -> Result<Opt
                     let count = pipeline::write_files(&stubs, &base_dir)?;
                     let _ = cache::write_generation_hashes(&stubs_cache_key, &stub_hashes);
                     for (lang, _) in &stubs {
-                        // Track stub-changed languages so formatters run even when
-                        // no bindings changed for this language (e.g. ruff on .pyi).
                         changed_languages.insert(*lang);
                     }
                     count
                 } else {
-                    eprintln!("  [stubs] up to date (skipping)");
+                    tracing::info!("  [stubs] up to date (skipping)");
                     0
                 };
 
@@ -247,25 +210,14 @@ pub(crate) fn handle(command: Commands, context: &DispatchContext) -> Result<Opt
 
                         if !api_match || clean {
                             api_count = pipeline::write_files(&public_api_files, &base_dir)?;
-                            eprintln!("Generated {api_count} public API files");
+                            tracing::info!("Generated {api_count} public API files");
                             let _ = cache::write_generation_hashes(&api_cache_key, &api_hashes);
                         } else {
-                            eprintln!("  [public_api] up to date (skipping)");
+                            tracing::info!("  [public_api] up to date (skipping)");
                         }
                     }
                 }
 
-                // scaffold_swift emits the root Package.swift with the
-                // `v__ALEF_SWIFT_VERSION__` placeholder so the VCS file stays
-                // stable across version bumps. SwiftPM consumers using
-                // `.package(url: ..., from: "X.Y.Z")` read the tag's checked-in
-                // Package.swift, so the placeholder must be substituted before
-                // the release commit — otherwise the .binaryTarget URL still
-                // resolves to `…/releases/download/v__ALEF_SWIFT_VERSION__/…`
-                // and SwiftPM fails with HTTP 404. `alef sync-versions` also
-                // applies this substitution, but `alef all --clean` regenerates
-                // the scaffold after sync, overwriting the substituted file.
-                // Re-apply it here as the final step.
                 if !api.version.is_empty() {
                     let pkg = base_dir.join("Package.swift");
                     if let Ok(content) = std::fs::read_to_string(&pkg) {
@@ -276,7 +228,7 @@ pub(crate) fn handle(command: Commands, context: &DispatchContext) -> Result<Opt
                     }
                 }
 
-                eprintln!("Generating READMEs...");
+                tracing::info!("Generating READMEs...");
                 let readme_languages = crate::readme::expand_configured_readme_languages(resolved_cfg, &languages);
                 let readme_files = pipeline::readme(&api, resolved_cfg, &readme_languages)?;
                 let readme_count = pipeline::write_scaffold_files_with_overwrite(&readme_files, &base_dir, true)?;
@@ -286,18 +238,12 @@ pub(crate) fn handle(command: Commands, context: &DispatchContext) -> Result<Opt
 
                 let mut e2e_count = 0;
                 if let Some(e2e_config) = &resolved_cfg.e2e {
-                    // Validate that every call config's (module, function) pair is
-                    // actually exported at the declared path in the IR. This catches
-                    // C1 (unexported function) and C2 (wrong definition selected) early
-                    // so codegen never emits an unresolvable use statement.
                     let all_calls = std::iter::once(("_default", &e2e_config.call))
                         .chain(e2e_config.calls.iter().map(|(k, v)| (k.as_str(), v)));
                     for (call_name, call_config) in all_calls {
                         if call_config.function.is_empty() || call_config.module.is_empty() {
                             continue;
                         }
-                        // Derive the Rust module path from the module field:
-                        // replace hyphens with underscores to match rust_path convention.
                         let module_path = call_config.module.replace('-', "_");
                         let function_name = &call_config.function;
                         match crate::extract::validate_call_export(&api, &module_path, function_name) {
@@ -326,23 +272,17 @@ pub(crate) fn handle(command: Commands, context: &DispatchContext) -> Result<Opt
                         }
                     }
 
-                    // Check e2e stage cache: skip regeneration if fixtures + IR + config
-                    // are all unchanged (unless --clean forces a full regeneration).
                     let fixtures_dir = std::path::Path::new(&e2e_config.fixtures);
                     let fixture_hash = cache::hash_directory(fixtures_dir).unwrap_or_default();
                     let ir_json = serde_json::to_string(&api)?;
                     let e2e_stage_hash = cache::compute_stage_hash(&ir_json, "e2e", &config_toml, &fixture_hash);
                     if !clean && cache::is_stage_cached(&resolved_cfg.name, "e2e", &e2e_stage_hash) {
-                        eprintln!("  [e2e] up to date (skipping)");
-                        // Repopulate `current_gen_paths` from the cached manifest so the
-                        // orphan-cleanup pass below does not treat previously-generated
-                        // e2e files as stale. Without this, every cached `alef all` run
-                        // would delete every e2e file in the workspace.
+                        tracing::info!("  [e2e] up to date (skipping)");
                         for path in cache::read_stage_paths(&resolved_cfg.name, "e2e") {
                             current_gen_paths.insert(path);
                         }
                     } else {
-                        eprintln!("Generating e2e test suites...");
+                        tracing::info!("Generating e2e test suites...");
                         let files = crate::e2e::generate_e2e(resolved_cfg, e2e_config, None, &api.types, &api.enums)?;
                         e2e_count = pipeline::write_scaffold_files_with_overwrite(&files, &base_dir, true)?;
                         crate::e2e::format::run_formatters(&files, e2e_config);
@@ -350,8 +290,6 @@ pub(crate) fn handle(command: Commands, context: &DispatchContext) -> Result<Opt
                         let output_paths: Vec<PathBuf> = files.iter().map(|f| base_dir.join(&f.path)).collect();
                         let path_set: std::collections::HashSet<PathBuf> = output_paths.iter().cloned().collect();
 
-                        // Sweep orphan alef-generated e2e files from e2e/ only —
-                        // never touches test_apps/ (owned by the test-apps stage below).
                         let e2e_output_root = base_dir.join(&e2e_config.output);
                         pipeline::sweep_orphans(&[e2e_output_root], &path_set)?;
 
@@ -362,18 +300,15 @@ pub(crate) fn handle(command: Commands, context: &DispatchContext) -> Result<Opt
                         }
                     }
 
-                    // Test-apps stage: regenerate registry-mode test apps in test_apps/.
-                    // Runs as a distinct pipeline stage so its stale-file sweep is scoped
-                    // to test_apps/ and cannot delete e2e/ files (and vice versa).
                     let test_apps_stage_hash =
                         cache::compute_stage_hash(&ir_json, "test-apps", &config_toml, &fixture_hash);
                     if !clean && cache::is_stage_cached(&resolved_cfg.name, "test-apps", &test_apps_stage_hash) {
-                        eprintln!("  [test-apps] up to date (skipping)");
+                        tracing::info!("  [test-apps] up to date (skipping)");
                         for path in cache::read_stage_paths(&resolved_cfg.name, "test-apps") {
                             current_gen_paths.insert(path);
                         }
                     } else {
-                        eprintln!("Generating registry-mode test apps...");
+                        tracing::info!("Generating registry-mode test apps...");
                         let mut registry_e2e_config = e2e_config.clone();
                         registry_e2e_config.dep_mode = crate::core::config::e2e::DependencyMode::Registry;
                         let registry_e2e_ref = &registry_e2e_config;
@@ -387,7 +322,6 @@ pub(crate) fn handle(command: Commands, context: &DispatchContext) -> Result<Opt
                         let output_paths: Vec<PathBuf> = files.iter().map(|f| base_dir.join(&f.path)).collect();
                         let path_set: std::collections::HashSet<PathBuf> = output_paths.iter().cloned().collect();
 
-                        // Sweep orphans scoped to test_apps/ only — never touches e2e/.
                         let test_apps_root = base_dir.join(registry_e2e_ref.effective_output());
                         pipeline::sweep_orphans(&[test_apps_root], &path_set)?;
 
@@ -399,7 +333,7 @@ pub(crate) fn handle(command: Commands, context: &DispatchContext) -> Result<Opt
                     }
                 }
 
-                eprintln!("Generating docs...");
+                tracing::info!("Generating docs...");
                 let docs_api = pipeline::extract(resolved_cfg, config_path, false)?;
                 let doc_languages = resolve_doc_languages(resolved_cfg, None)?;
                 let doc_files =
@@ -409,49 +343,46 @@ pub(crate) fn handle(command: Commands, context: &DispatchContext) -> Result<Opt
                     current_gen_paths.insert(base_dir.join(&file.path));
                 }
 
+                // Protect committed reference-doc pages from host-dependent deletion (#184): ~keep
+                // the pages `generate_docs_stage` emits vary with host state (CLI/MCP source ~keep
+                // presence, doc languages), so a host that regenerates fewer pages must not let ~keep
+                // orphan cleanup delete the committed pages it simply did not produce this run. ~keep
+                let docs_reference_dir = base_dir.join(crate::docs::reference_output_dir(resolved_cfg));
+                for path in pipeline::collect_alef_headered_paths(&docs_reference_dir) {
+                    current_gen_paths.insert(path);
+                }
+
                 if let Ok(removed) = pipeline::cleanup_orphaned_files(&current_gen_paths) {
                     if removed > 0 {
-                        eprintln!("Removed {removed} stale alef-generated file(s)");
+                        tracing::info!("Removed {removed} stale alef-generated file(s)");
                     }
                 }
 
-                // Sweep language package directories to catch stale alef-generated files
-                // in directories the current run no longer writes to (same rationale as
-                // in Commands::Generate above).
                 {
-                    let mut sweep_roots: std::collections::HashSet<std::path::PathBuf> =
-                        std::collections::HashSet::new();
-                    for &lang in &languages {
-                        let pkg = base_dir.join(resolved_cfg.package_dir(lang));
-                        sweep_roots.insert(pkg);
-                        if let Some(out) = resolved_cfg.output_for(&lang.to_string()) {
-                            sweep_roots.insert(base_dir.join(out));
-                        }
-                    }
-                    sweep_roots.insert(base_dir.join("packages/wasm"));
-                    sweep_roots.insert(base_dir.join("packages/typescript"));
-                    let roots: Vec<std::path::PathBuf> = sweep_roots.into_iter().filter(|d| d.exists()).collect();
+                    // `alef all` always processes the full language set (no `--lang` ~keep
+                    // filter), so the sweep is unfiltered and reclaims orphans across the ~keep
+                    // whole binding tree, including the conventional wasm/typescript roots. ~keep
+                    let roots: Vec<std::path::PathBuf> =
+                        pipeline::generate_sweep_roots(&languages, false, resolved_cfg, &base_dir)
+                            .into_iter()
+                            .filter(|d| d.exists())
+                            .collect();
                     if let Ok(removed) = pipeline::sweep_orphans(&roots, &current_gen_paths) {
                         if removed > 0 {
-                            eprintln!("Removed {removed} stale alef-generated file(s)");
+                            tracing::info!("Removed {removed} stale alef-generated file(s)");
                         }
                     }
                 }
 
-                // Formatting runs via poly (polylint) in-process. It is
-                // best-effort: a poly error must not abort the pipeline. Scoped to
-                // the languages that actually regenerated this run.
                 if !changed_languages.is_empty() {
-                    eprintln!("Formatting generated files...");
-                    // Include stubs in the format pass so that languages where only
-                    // stubs changed (no bindings written) still trigger their formatter.
+                    tracing::info!("Formatting generated files...");
                     let mut files_to_format = bindings.clone();
                     files_to_format.extend(stubs.clone());
-                    pipeline::format_generated(&files_to_format, resolved_cfg, &base_dir, Some(&changed_languages));
+                    let only_languages = if clean { None } else { Some(&changed_languages) };
+                    pipeline::format_generated(&files_to_format, resolved_cfg, &base_dir, only_languages);
                 }
 
-                // Finalise per-file hashes after every formatter has run.
-                eprintln!("Finalising hashes...");
+                tracing::info!("Finalising hashes...");
                 let alef_toml_bytes = cache::read_alef_toml_bytes(config_path);
                 pipeline::finalize_hashes(&current_gen_paths, &sources_hash, &alef_toml_bytes)?;
 
@@ -462,13 +393,11 @@ pub(crate) fn handle(command: Commands, context: &DispatchContext) -> Result<Opt
                 grand_readme_count += readme_count;
                 grand_e2e_count += e2e_count;
                 grand_doc_count += doc_count;
-            } // end for resolved_cfg in crates_to_process
+            }
 
-            // Wire poly's git hooks (pre-commit lint/format/cargo + commit-msg)
-            // from the scaffolded poly.toml. Best-effort, idempotent.
             pipeline::install_poly_hooks(&base_dir);
 
-            println!(
+            tracing::info!(
                 "Done: {grand_binding_count} binding files, {grand_stub_count} stub files, {grand_api_count} API files, {grand_scaffold_count} scaffold files, {grand_readme_count} readme files, {grand_e2e_count} e2e files, {grand_doc_count} doc files"
             );
             Ok(None)

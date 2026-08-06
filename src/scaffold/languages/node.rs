@@ -48,11 +48,20 @@ const NAPI_DISPATCH_ROWS: &[(&str, &str, &str, Option<&str>)] = &[
 ];
 
 fn excluded_node_platforms(config: &ResolvedCrateConfig) -> Vec<String> {
-    config
+    let mut excluded = config
         .node
         .as_ref()
         .map(|c| c.exclude_platforms.clone())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    // Also drop any napi platform whose target triple is disabled via the ~keep
+    // workspace `[targets]` opt-out table, so a single toggle stays consistent ~keep
+    // with the language-specific `exclude_platforms` list. ~keep
+    for (platform, triple) in NAPI_PLATFORMS.iter().zip(NAPI_TARGETS.iter()) {
+        if !config.target_enabled(triple) && !excluded.iter().any(|e| e == platform) {
+            excluded.push((*platform).to_string());
+        }
+    }
+    excluded
 }
 
 fn napi_platforms_filtered(excluded: &[String]) -> Vec<(&'static str, &'static str)> {
@@ -86,14 +95,12 @@ fn type_ref_contains_json(ty: &TypeRef) -> bool {
 
 /// Check if the API surface has any Json fields
 fn api_has_json_fields(api: &ApiSurface) -> bool {
-    // Check struct fields
     for type_def in &api.types {
         for field in &type_def.fields {
             if type_ref_contains_json(&field.ty) {
                 return true;
             }
         }
-        // Check method parameters and return types
         for method in &type_def.methods {
             if type_ref_contains_json(&method.return_type) {
                 return true;
@@ -106,7 +113,6 @@ fn api_has_json_fields(api: &ApiSurface) -> bool {
         }
     }
 
-    // Check function parameters and return types
     for func in &api.functions {
         if type_ref_contains_json(&func.return_type) {
             return true;
@@ -118,7 +124,6 @@ fn api_has_json_fields(api: &ApiSurface) -> bool {
         }
     }
 
-    // Check enum fields
     for enum_def in &api.enums {
         for variant in &enum_def.variants {
             for field in &variant.fields {
@@ -181,6 +186,12 @@ pub(crate) fn scaffold_node_cargo(
         }
         all_deps.push_str("futures-util = \"0.3\"");
     }
+    if has_trait_bridges && !all_deps.contains("tracing") {
+        if !all_deps.is_empty() {
+            all_deps.push('\n');
+        }
+        all_deps.push_str(&format!("tracing = \"{}\"", tv::cargo::TRACING));
+    }
 
     let extra_deps_section = if all_deps.is_empty() {
         String::new()
@@ -198,16 +209,11 @@ pub(crate) fn scaffold_node_cargo(
         .collect::<Vec<_>>()
         .join(", ");
 
-    // Build the cargo-machete ignored list. `serde_json` is always emitted
-    // unconditionally above so we always ignore it. Conditional deps
-    // (`async-trait` and `tokio-util` for trait bridges, `futures-util` for streaming) are
-    // appended only when the scaffold actually adds them to `[dependencies]`,
-    // so cargo-machete doesn't flap on umbrellas whose API surface doesn't
-    // exercise the trait-bridge / streaming codepath.
     let mut machete_ignored: Vec<&str> = vec!["serde_json"];
     if has_trait_bridges {
         machete_ignored.push("async-trait");
         machete_ignored.push("tokio-util");
+        machete_ignored.push("tracing");
     }
     if has_streaming {
         machete_ignored.push("futures-util");
@@ -218,9 +224,6 @@ pub(crate) fn scaffold_node_cargo(
         .collect::<Vec<_>>()
         .join(", ");
 
-    // Build [dependencies] block alphabetically sorted to match cargo-sort.
-    // Order: async-trait?, futures-util?, <core-crate>, napi,
-    // napi-derive, serde, serde_json, + any extra deps.
     let core_overrides = config
         .node
         .as_ref()
@@ -259,16 +262,9 @@ pub(crate) fn scaffold_node_cargo(
     }
     dep_entries.sort();
     let dep_block = dep_entries.join("\n");
-    // Silence unused vars from the prior template wiring; the new dep block
-    // collapses extra_deps_section into dep_entries directly.
     let _ = extra_deps_section;
 
-    // Collect every feature name referenced by a cfg attribute on any type, field,
-    // enum variant, or function in the API surface and emit a forwarding `[features]`
-    // table so the binding crate can re-export them to the core dep. Without this,
     // `#[cfg(feature = "X")]` arms emitted by the codegen produce
-    // `error: unexpected cfg condition value: X` because the binding crate's
-    // `Cargo.toml` does not declare that feature.
     let cfg_features = shared_cfg::collect_cfg_features(api);
     let features_table = if cfg_features.is_empty() {
         String::new()
@@ -350,7 +346,6 @@ module.exports = { ...nativeBinding, ..._service };"#
         r#""use strict";
 
 const {{ platform, arch }} = process;
-const isWindows = platform === "win32";
 const isMusl = () => {{
   // Prefer the report-header `glibcVersion` string when present — fastest and
   // unambiguous on Node builds that populate it. On Node 22+, certain CI
@@ -533,10 +528,6 @@ pub(crate) fn scaffold_node(api: &ApiSurface, config: &ResolvedCrateConfig) -> a
         .collect::<Vec<_>>()
         .join(",\n");
 
-    // When services are defined, include service.cjs + the stable wrapper
-    // entrypoint in the published files. `napi build` regenerates index.js as a
-    // raw platform loader, dropping the service-API class merge, so the package
-    // entrypoint must be a wrapper file that napi never overwrites.
     let has_service_api = !api.services.is_empty();
     let entrypoint = if has_service_api {
         "index-wrapper.cjs"
@@ -548,8 +539,37 @@ pub(crate) fn scaffold_node(api: &ApiSurface, config: &ResolvedCrateConfig) -> a
     } else {
         "[\"index.js\", \"index.d.ts\", \"*.node\"]".to_string()
     };
+    // When a service API is present, `service.cjs` is a real module (the low-level ~keep
+    // service `App`); expose it as a `./service` subpath so consumers can ~keep
+    // `import ... from '<pkg>/service'`. Without this the subpath is unresolvable ~keep
+    // under the `exports` map even though the file ships in `files`. ~keep
+    let exports_map = if has_service_api {
+        format!(
+            r#"{{
+    ".": {{
+      "types": "./index.d.ts",
+      "require": "./{entrypoint}",
+      "default": "./{entrypoint}"
+    }},
+    "./service": {{
+      "types": "./index.d.ts",
+      "require": "./service.cjs",
+      "default": "./service.cjs"
+    }}
+  }}"#
+        )
+    } else {
+        format!(
+            r#"{{
+    ".": {{
+      "types": "./index.d.ts",
+      "require": "./{entrypoint}",
+      "default": "./{entrypoint}"
+    }}
+  }}"#
+        )
+    };
 
-    // Crate-level package.json required by `napi build`
     let crate_pkg = format!(
         r#"{{
   "name": "{package_name}",
@@ -557,13 +577,7 @@ pub(crate) fn scaffold_node(api: &ApiSurface, config: &ResolvedCrateConfig) -> a
   "description": "{description}"{license_block}{repository_block},
   "main": "{entrypoint}",
   "types": "index.d.ts",
-  "exports": {{
-    ".": {{
-      "types": "./index.d.ts",
-      "require": "./{entrypoint}",
-      "default": "./{entrypoint}"
-    }}
-  }},
+  "exports": {exports_map},
   "files": {files_list},
   "optionalDependencies": {{
 {optional_dependencies}
@@ -591,6 +605,7 @@ pub(crate) fn scaffold_node(api: &ApiSurface, config: &ResolvedCrateConfig) -> a
         license_block = license_block,
         repository_block = repository_block,
         crate_dir = crate_dir,
+        exports_map = exports_map,
         files_list = files_list,
         optional_dependencies = optional_dependencies,
         targets = targets,
@@ -607,10 +622,6 @@ pub(crate) fn scaffold_node(api: &ApiSurface, config: &ResolvedCrateConfig) -> a
     );
     let binary_name = format!("{crate_dir}-node");
 
-    // The npm publish target lives at `crates/{crate_dir}-node/` and is built by
-    // NAPI-RS. We only emit the crate-level `package.json` + platform-dispatch
-    // `index.js` here — the historical `packages/node/` scaffold was dead weight
-    // that defined a parallel unscoped npm package that was never published.
     let mut files = vec![
         GeneratedFile {
             path: PathBuf::from(format!("crates/{crate_dir}-node/package.json")),
@@ -624,10 +635,6 @@ pub(crate) fn scaffold_node(api: &ApiSurface, config: &ResolvedCrateConfig) -> a
         },
     ];
     if has_service_api {
-        // Stable entrypoint: `napi build` overwrites index.js with a raw platform
-        // loader that drops the service-API merge, so the package `main`/`exports`
-        // point here instead. This re-applies the service classes over whatever
-        // index.js currently exports.
         files.push(GeneratedFile {
             path: PathBuf::from(format!("crates/{crate_dir}-node/index-wrapper.cjs")),
             content: "// DO NOT EDIT - auto-generated by alef\n\"use strict\";\nconst _native = require(\"./index.js\");\nconst _service = require(\"./service.cjs\");\nmodule.exports = { ..._native, ..._service };\n".to_string(),

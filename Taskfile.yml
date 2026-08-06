@@ -12,6 +12,7 @@ tasks:
       - cargo install cargo-machete || true
       - cargo install cargo-sort || true
       - cargo install cargo-edit || true
+      - command -v poly >/dev/null 2>&1 || brew install goldziher/tap/poly
       - poly hooks install
 
   update:
@@ -86,7 +87,6 @@ tasks:
     requires:
       vars: [CLI_ARGS]
     cmds:
-      # Use `sed -i.bak ... && rm -f` for portability between BSD sed (macOS) and GNU sed (Linux CI).
       - |
         version="{{.CLI_ARGS}}"
         version="${version#v}"

@@ -131,7 +131,10 @@ pub fn render_cargo_toml(
     let mut dep_entries: Vec<(String, String)> = Vec::new();
     dep_entries.push((dep_name.to_string(), dep_spec.clone()));
     if effective_needs_serde_json {
-        dep_entries.push(("serde_json".to_string(), "serde_json = \"1\"".to_string()));
+        dep_entries.push((
+            "serde_json".to_string(),
+            format!("serde_json = \"{}\"", tv::cargo::SERDE_JSON),
+        ));
     }
     if needs_anyhow {
         dep_entries.push(("anyhow".to_string(), "anyhow = \"1\"".to_string()));
@@ -144,7 +147,10 @@ pub fn render_cargo_toml(
         dep_entries.push(("axum".to_string(), format!("axum = \"{axum}\"", axum = tv::cargo::AXUM)));
         dep_entries.push((
             "serde".to_string(),
-            "serde = { version = \"1\", features = [\"derive\"] }".to_string(),
+            format!(
+                "serde = {{ version = \"{}\", features = [\"derive\"] }}",
+                tv::cargo::SERDE
+            ),
         ));
         dep_entries.push((
             "walkdir".to_string(),
@@ -180,7 +186,10 @@ pub fn render_cargo_toml(
     if needs_tokio {
         dep_entries.push((
             "tokio".to_string(),
-            "tokio = { version = \"1\", features = [\"full\"] }".to_string(),
+            format!(
+                "tokio = {{ version = \"{}\", features = [\"full\"] }}",
+                tv::cargo::TOKIO
+            ),
         ));
     }
     dep_entries.sort_by(|a, b| a.0.cmp(&b.0));
@@ -203,7 +212,7 @@ pub fn render_cargo_toml(
     let middle_separator = if middle_block.is_empty() { "" } else { "\n\n" };
 
     format!(
-        "{header}\n[workspace]\n\n[package]\nname = \"{e2e_name}\"\nversion = \"{pkg_version}\"\nedition = \"2021\"\nlicense = \"MIT\"\npublish = false{middle_separator}{middle_block}\n\n[dependencies]\n{dep_block}\n"
+        "{header}\n[workspace]\n\n[package]\nname = \"{e2e_name}\"\nversion = \"{pkg_version}\"\nedition = \"2024\"\nlicense = \"MIT\"\npublish = false{middle_separator}{middle_block}\n\n[dependencies]\n{dep_block}\n"
     )
 }
 
@@ -234,7 +243,7 @@ mod tests {
             out.contains("my_crate = { package = \"my-crate\", path = \"../../crates/my-crate\" }"),
             "got:\n{out}"
         );
-        assert!(out.contains("edition = \"2021\""));
+        assert!(out.contains("edition = \"2024\""));
     }
 
     #[test]

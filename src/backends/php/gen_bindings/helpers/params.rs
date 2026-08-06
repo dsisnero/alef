@@ -73,7 +73,6 @@ pub(crate) fn gen_php_function_params(
             let base_ty = mapper.map_type(&p.ty);
             let ty = match &p.ty {
                 TypeRef::Named(name) => {
-                    // Bridge type aliases: map to &mut ZendObject for direct PHP object access
                     if bridge_type_aliases.contains(name.as_str()) {
                         if p.optional {
                             "Option<&mut ext_php_rs::types::ZendObject>".to_string()
@@ -81,9 +80,6 @@ pub(crate) fn gen_php_function_params(
                             "&mut ext_php_rs::types::ZendObject".to_string()
                         }
                     } else if mapper.enum_names.contains(name.as_str()) {
-                        // Enum types are mapped to String in PHP — use owned String, not &String.
-                        // Only php_class struct types need &T (ext-php-rs only provides
-                        // FromZvalMut for &T/&mut T, not owned T, for php_class types).
                         if p.optional {
                             format!("Option<{base_ty}>")
                         } else {
@@ -96,9 +92,7 @@ pub(crate) fn gen_php_function_params(
                     }
                 }
                 TypeRef::Vec(inner) => {
-                    // Vec<NonOpaqueCustomType>: ext-php-rs cannot implement FromZvalMut for
                     // Vec<T> when T is a #[php_class] type. Use &ZendHashTable instead and
-                    // convert element-by-element in a let binding via php_vec_named_struct_let_binding.
                     if let TypeRef::Named(name) = inner.as_ref() {
                         if !opaque_types.contains(name.as_str()) && !mapper.enum_names.contains(name.as_str()) {
                             if p.optional {
@@ -107,7 +101,6 @@ pub(crate) fn gen_php_function_params(
                                 "&ext_php_rs::types::ZendHashTable".to_string()
                             }
                         } else {
-                            // Opaque or enum named type inside Vec: use owned Vec.
                             if p.optional {
                                 format!("Option<{base_ty}>")
                             } else {
@@ -115,7 +108,6 @@ pub(crate) fn gen_php_function_params(
                             }
                         }
                     } else {
-                        // Primitive types inside Vec: use owned Vec.
                         if p.optional {
                             format!("Option<{base_ty}>")
                         } else {
@@ -124,8 +116,6 @@ pub(crate) fn gen_php_function_params(
                     }
                 }
                 TypeRef::Bytes => {
-                    // PhpBytes is the local wrapper that accepts PHP binary strings without
-                    // UTF-8 validation (ext-php-rs's String FromZval rejects non-UTF-8 bytes).
                     if p.optional {
                         "Option<PhpBytes>".to_string()
                     } else {
@@ -133,9 +123,6 @@ pub(crate) fn gen_php_function_params(
                     }
                 }
                 TypeRef::Map(_, _) if p.map_is_ahash && p.map_key_is_cow => {
-                    // AHashMap<Cow<'static, str>, Value> params: PHP cannot provide FromZvalMut
-                    // for this type directly. Receive as HashMap<String, String> (PHP hash with
-                    // string values) and convert in the pre-call binding in the function body.
                     if p.optional {
                         "Option<std::collections::HashMap<String, String>>".to_string()
                     } else {
@@ -143,8 +130,6 @@ pub(crate) fn gen_php_function_params(
                     }
                 }
                 TypeRef::Json => {
-                    // serde_json::Value params: ext-php-rs cannot implement FromZvalMut for serde_json::Value.
-                    // Receive as String (JSON-encoded) and parse in the function body binding.
                     if p.optional {
                         "Option<String>".to_string()
                     } else {
@@ -168,8 +153,12 @@ pub(crate) fn gen_php_function_params(
 /// Generate PHP-specific call arguments.
 /// Non-opaque Named types are passed as `&T`, so we clone before `.into()`.
 /// Handles i64->usize/u64 casts for primitive types that need conversion.
-pub(crate) fn gen_php_call_args(params: &[crate::core::ir::ParamDef], opaque_types: &AHashSet<String>) -> String {
-    gen_php_call_args_vec(params, opaque_types).join(", ")
+pub(crate) fn gen_php_call_args(
+    params: &[crate::core::ir::ParamDef],
+    opaque_types: &AHashSet<String>,
+    enum_names: &AHashSet<String>,
+) -> String {
+    gen_php_call_args_vec(params, opaque_types, enum_names).join(", ")
 }
 
 /// Per-parameter form of [`gen_php_call_args`]. Use this when each expression must be paired with its
@@ -178,12 +167,12 @@ pub(crate) fn gen_php_call_args(params: &[crate::core::ir::ParamDef], opaque_typ
 pub(crate) fn gen_php_call_args_vec(
     params: &[crate::core::ir::ParamDef],
     opaque_types: &AHashSet<String>,
+    enum_names: &AHashSet<String>,
 ) -> Vec<String> {
     params
         .iter()
         .map(|p| {
             let php_name = to_php_name(&p.name);
-            // Newtype params (e.g. NodeIndex(u32)→u32): re-wrap the raw binding value.
             if let Some(newtype_path) = &p.newtype_wrapper {
                 return if p.optional {
                     format!("{php_name}.map({newtype_path})")
@@ -207,8 +196,18 @@ pub(crate) fn gen_php_call_args_vec(
                         format!("&{php_name}.inner")
                     }
                 }
+                TypeRef::Named(name) if enum_names.contains(name.as_str()) => {
+                    if p.optional {
+                        format!(
+                            "{php_name}.as_deref().and_then(|s| serde_json::from_str(&serde_json::to_string(s).unwrap_or_default()).ok())"
+                        )
+                    } else {
+                        format!(
+                            "serde_json::from_str(&serde_json::to_string(&{php_name}).unwrap_or_default()).unwrap_or_default()"
+                        )
+                    }
+                }
                 TypeRef::Named(_) => {
-                    // Non-opaque: param is &T, clone then convert
                     if p.optional {
                         format!("{php_name}.map(|v| v.clone().into())")
                     } else {
@@ -216,8 +215,6 @@ pub(crate) fn gen_php_call_args_vec(
                     }
                 }
                 TypeRef::String | TypeRef::Char => {
-                    // For optional params, only use as_deref() when core expects &str (is_ref=true).
-                    // When is_ref=false, core takes Option<String> — pass owned.
                     if p.optional {
                         if p.is_ref {
                             format!("{php_name}.as_deref()")
@@ -244,8 +241,6 @@ pub(crate) fn gen_php_call_args_vec(
                     }
                 }
                 TypeRef::Bytes => {
-                    // PHP-side param is PhpBytes (binary-safe wrapper). Convert to
-                    // &[u8] / Vec<u8> when passing to core.
                     if p.optional {
                         if p.is_ref {
                             format!("{php_name}.as_ref().map(|s| &s.0[..])")
@@ -259,11 +254,8 @@ pub(crate) fn gen_php_call_args_vec(
                     }
                 }
                 TypeRef::Vec(inner) => {
-                    // Vec<NonOpaqueCustomType> is passed as &Vec when inner is non-opaque Named.
-                    // Use let bindings for conversion (handled in gen_php_named_let_bindings).
                     if let TypeRef::Named(name) = inner.as_ref() {
                         if !opaque_types.contains(name.as_str()) {
-                            // Non-opaque named type inside Vec: use the _core binding
                             if p.is_ref {
                                 if p.optional {
                                     format!("{php_name}_core.as_ref().map(|v| &v[..])")
@@ -274,7 +266,6 @@ pub(crate) fn gen_php_call_args_vec(
                                 format!("{php_name}_core")
                             }
                         } else {
-                            // Opaque or enum named type inside Vec
                             if p.optional {
                                 if p.is_ref {
                                     format!("{php_name}.as_deref()")
@@ -288,7 +279,6 @@ pub(crate) fn gen_php_call_args_vec(
                             }
                         }
                     } else {
-                        // Primitive types inside Vec
                         if p.optional {
                             if p.is_ref {
                                 format!("{php_name}.as_deref()")
@@ -303,7 +293,6 @@ pub(crate) fn gen_php_call_args_vec(
                     }
                 }
                 TypeRef::Map(_, _) if p.map_is_ahash && p.map_key_is_cow => {
-                    // AHashMap<Cow, Value>: use the __<name>_ahash pre-bound variable.
                     let bound_name = format!("__{}_ahash", p.name);
                     if p.optional && p.is_ref {
                         format!("{bound_name}.as_ref()")
@@ -314,8 +303,6 @@ pub(crate) fn gen_php_call_args_vec(
                     }
                 }
                 TypeRef::Map(_, _) if p.map_is_btree => {
-                    // Core expects a `BTreeMap`; PHP receives the hash as `HashMap`. Collect
-                    // into a `BTreeMap` at the call site to match the core signature.
                     let collect = "iter().map(|(k, v)| (k.clone(), v.clone()))\
                         .collect::<std::collections::BTreeMap<_, _>>()";
                     if p.optional {
@@ -334,9 +321,11 @@ pub(crate) fn gen_php_call_args_vec(
                     }
                 }
                 TypeRef::Json => {
-                    // JSON param is received as String from PHP, use the _json binding for parsing.
-                    let bound_name = format!("{php_name}_json");
-                    bound_name
+                    if p.optional {
+                        format!("{php_name}.as_deref().and_then(|s| serde_json::from_str(s).ok())")
+                    } else {
+                        format!("serde_json::from_str(&{php_name}).unwrap_or_default()")
+                    }
                 }
                 _ => php_name,
             }
@@ -358,8 +347,6 @@ pub(crate) fn gen_php_named_let_bindings(
     let mut out = String::new();
 
     for p in params {
-        // AHashMap<Cow<'static, str>, Value> params: PHP receives as HashMap<String, String>.
-        // Convert to ahash::AHashMap<Cow, Value> so core can be called with correct types.
         if let TypeRef::Map(_, _) = &p.ty {
             if p.map_is_ahash && p.map_key_is_cow {
                 let php_name = to_php_name(&p.name);
@@ -374,10 +361,19 @@ pub(crate) fn gen_php_named_let_bindings(
                 continue;
             }
         }
-        // PHP parameter names are camelCase (via to_php_name). Let bindings must
-        // use the same PHP-side name as the parameter so the generated code compiles.
         let php_param_name = to_php_name(&p.name);
         match &p.ty {
+            TypeRef::Named(name) if !opaque_types.contains(name.as_str()) && enum_names.contains(name.as_str()) => {
+                out.push_str(&crate::backends::php::template_env::render(
+                    "php_named_enum_serde_let_binding.jinja",
+                    context! {
+                        php_name => &php_param_name,
+                        core_import => core_import,
+                        type_name => name.as_str(),
+                        is_optional => p.optional,
+                    },
+                ));
+            }
             TypeRef::Named(name) if !opaque_types.contains(name.as_str()) => {
                 out.push_str(&crate::backends::php::template_env::render(
                     "php_named_let_binding.jinja",
@@ -389,8 +385,6 @@ pub(crate) fn gen_php_named_let_bindings(
                         is_mut => p.is_mut,
                     },
                 ));
-                // For optional+is_mut params: unwrap into a mutable intermediate so
-                // &mut {name}_unwrapped can be passed to functions taking &mut T.
                 if p.optional && p.is_mut {
                     out.push_str(&crate::backends::php::template_env::render(
                         "php_optional_mut_unwrap_binding.jinja",
@@ -402,8 +396,6 @@ pub(crate) fn gen_php_named_let_bindings(
                 if let TypeRef::Named(name) = inner.as_ref() {
                     if !opaque_types.contains(name.as_str()) {
                         if enum_names.contains(name.as_str()) {
-                            // Vec<EnumType>: the PHP param is Vec<String>; convert each element
-                            // via `From<String>` (enum discriminant round-trip).
                             out.push_str(&crate::backends::php::template_env::render(
                                 "php_let_binding_vec_named.jinja",
                                 context! {
@@ -413,8 +405,6 @@ pub(crate) fn gen_php_named_let_bindings(
                                 },
                             ));
                         } else {
-                            // Vec<StructType>: the PHP param is &ZendHashTable; iterate and convert
-                            // each element via FromZval.
                             out.push_str(&crate::backends::php::template_env::render(
                                 "php_vec_named_struct_let_binding.jinja",
                                 context! {
@@ -427,8 +417,6 @@ pub(crate) fn gen_php_named_let_bindings(
                         }
                     }
                 } else if matches!(inner.as_ref(), TypeRef::String) && p.sanitized && p.original_type.is_some() {
-                    // Sanitized Vec<tuple>: each item is a JSON-encoded tuple string.
-                    // Deserialize so the core function can be called with its native signature.
                     out.push_str(&crate::backends::php::template_env::render(
                         "php_sanitized_vec_let_binding.jinja",
                         context! {
@@ -437,9 +425,6 @@ pub(crate) fn gen_php_named_let_bindings(
                         },
                     ));
                 } else if matches!(inner.as_ref(), TypeRef::String | TypeRef::Char) && p.is_ref && p.vec_inner_is_ref {
-                    // Vec<String> with is_ref=true AND vec_inner_is_ref=true: core expects &[&str].
-                    // When vec_inner_is_ref=false the core expects &[String], which Vec<String>
-                    // already satisfies via &[..] coercion — no _refs binding needed.
                     out.push_str(&crate::backends::php::template_env::render(
                         "php_vec_string_refs_let_binding.jinja",
                         context! {
@@ -500,14 +485,9 @@ pub(crate) fn gen_php_call_args_with_let_bindings_vec(
                     }
                 }
                 TypeRef::Named(_) => {
-                    // Non-opaque Named: use the _core binding.
-                    // If core expects a reference (is_ref=true), add & for optional or &val for non-optional.
                     if p.is_ref {
                         if p.optional {
                             if p.is_mut {
-                                // gen_php_named_let_bindings emits an extra
-                                // `let mut {name}_unwrapped = {name}_core.unwrap_or_default();`
-                                // for optional+is_mut params, so we can borrow it mutably here.
                                 format!("&mut {php_name}_unwrapped")
                             } else {
                                 format!("{php_name}_core.as_ref()")
@@ -548,8 +528,6 @@ pub(crate) fn gen_php_call_args_with_let_bindings_vec(
                     }
                 }
                 TypeRef::Bytes => {
-                    // PHP-side param is PhpBytes (binary-safe wrapper). Convert to
-                    // &[u8] / Vec<u8> when passing to core.
                     if p.optional {
                         if p.is_ref {
                             format!("{php_name}.as_ref().map(|s| &s.0[..])")
@@ -563,19 +541,15 @@ pub(crate) fn gen_php_call_args_with_let_bindings_vec(
                     }
                 }
                 TypeRef::Vec(inner) => {
-                    // Check if inner is a non-opaque Named type that needs let binding
                     let uses_binding = if let TypeRef::Named(name) = inner.as_ref() {
                         !opaque_types.contains(name.as_str())
                     } else {
                         false
                     };
-                    // Sanitized Vec<String> originating from a tuple type also has a `_core` binding
-                    // (JSON-decoded items). Treat it like the named case.
                     let uses_sanitized_binding =
                         matches!(inner.as_ref(), TypeRef::String) && p.sanitized && p.original_type.is_some();
 
                     if uses_binding || uses_sanitized_binding {
-                        // Use the _core binding
                         if p.is_ref {
                             if p.optional {
                                 format!("{php_name}_core.as_ref().map(|v| &v[..])")
@@ -589,11 +563,8 @@ pub(crate) fn gen_php_call_args_with_let_bindings_vec(
                         && p.is_ref
                         && p.vec_inner_is_ref
                     {
-                        // Vec<String> with is_ref and vec_inner_is_ref: core expects &[&str].
-                        // Use the pre-built _refs binding (Vec<&str>).
                         format!("&{php_name}_refs")
                     } else {
-                        // Opaque or primitive types: no binding needed
                         if p.optional {
                             if p.is_ref {
                                 format!("{php_name}.as_deref()")
@@ -601,7 +572,6 @@ pub(crate) fn gen_php_call_args_with_let_bindings_vec(
                                 php_name
                             }
                         } else if p.is_ref {
-                            // Core expects &[T], so convert Vec<T> to &[T]
                             format!("&{php_name}[..]")
                         } else {
                             php_name
@@ -609,8 +579,6 @@ pub(crate) fn gen_php_call_args_with_let_bindings_vec(
                     }
                 }
                 TypeRef::Map(_, _) if p.map_is_ahash && p.map_key_is_cow => {
-                    // AHashMap<Cow, Value> param: use the pre-bound __<name>_ahash variable
-                    // from gen_php_named_let_bindings.
                     let bound_name = format!("__{}_ahash", p.name);
                     if p.optional && p.is_ref {
                         format!("{bound_name}.as_ref()")
@@ -621,9 +589,6 @@ pub(crate) fn gen_php_call_args_with_let_bindings_vec(
                     }
                 }
                 TypeRef::Map(_, _) if p.map_is_btree => {
-                    // Core expects a `BTreeMap`, but PHP receives the hash as `HashMap`.
-                    // Collect into a `BTreeMap` at the call site so the key ordering and
-                    // concrete type match the core signature.
                     let collect = "iter().map(|(k, v)| (k.clone(), v.clone()))\
                         .collect::<std::collections::BTreeMap<_, _>>()";
                     if p.optional {
@@ -655,9 +620,11 @@ pub(crate) fn gen_php_call_args_with_let_bindings_vec(
                     }
                 }
                 TypeRef::Json => {
-                    // JSON param is received as String from PHP, use the _json binding for parsing.
-                    let bound_name = format!("{php_name}_json");
-                    bound_name
+                    if p.optional {
+                        format!("{php_name}.as_deref().and_then(|s| serde_json::from_str(s).ok())")
+                    } else {
+                        format!("serde_json::from_str(&{php_name}).unwrap_or_default()")
+                    }
                 }
                 _ => php_name,
             }

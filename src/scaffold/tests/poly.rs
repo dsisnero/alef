@@ -58,14 +58,12 @@ fn emits_a_generated_poly_toml_replacing_precommit() {
     let api = test_api();
     let files = scaffold(&api, &config, &[Language::Python, Language::Node]).unwrap();
 
-    // poly.toml is emitted, alef-managed (hash-tracked, overwritten on regen).
     let poly = poly_toml(&files);
     assert!(
         poly.generated_header,
         "poly.toml must be alef-managed (generated_header)"
     );
 
-    // The former per-tool / pre-commit configs are gone.
     let paths: Vec<String> = files.iter().map(|f| f.path.to_string_lossy().into_owned()).collect();
     assert!(
         !paths.iter().any(|p| p.ends_with(".pre-commit-config.yaml")),
@@ -102,18 +100,16 @@ fn poly_toml_drives_hooks_builtins_and_excludes() {
     let files = scaffold(&api, &config, &[Language::Python]).unwrap();
     let c = &poly_toml(&files).content;
 
-    // Single-config hook orchestration: builtins + commit-msg stage.
-    assert!(c.contains("[hooks]") && c.contains("stages = [ \"pre-commit\" ]"));
+    assert!(c.contains("[hooks]") && c.contains("stages = [\"pre-commit\"]"));
     assert!(c.contains("[hooks.builtin]"));
     assert!(c.contains("cargo = true"), "cargo builtin must be enabled");
     assert!(
-        c.contains("commit = { stages = [ \"commit-msg\" ] }"),
+        c.contains("commit = { stages = [\"commit-msg\"] }"),
         "commit builtin must run on commit-msg"
     );
-    // Excludes appear in discovery (direct CLI) and the builtin hook path.
     assert!(c.contains("[discovery]") && c.contains("\"target/**\""));
-    assert!(c.contains("polylint = { exclude = ["));
-    assert!(c.contains("polyfmt = { exclude = ["));
+    assert!(c.contains("lint = { exclude = ["));
+    assert!(c.contains("fmt = { exclude = ["));
     assert!(c.contains("file_safety = { exclude = ["));
 }
 
@@ -124,16 +120,75 @@ fn poly_toml_python_ruff_pyrefly_and_per_file_ignores() {
     let files = scaffold(&api, &config, &[Language::Python]).unwrap();
     let c = &poly_toml(&files).content;
 
-    // ruff rule selection (ported from the dropped [tool.ruff]).
-    assert!(c.contains("[lint.python.ruff]") && c.contains("select = [ \"ALL\" ]"));
-    assert!(c.contains("\"ANN401\","), "ruff ignore list must be ported");
-    // Forward-compat ruff params poly will honor once landed.
+    assert!(c.contains("[lint.python.ruff]"));
+    assert!(
+        c.contains("select = [\n") && c.contains("\"ANN\",") && !c.contains("\"ALL\""),
+        "ruff select must be an explicit allowlist, not the ALL catch-all"
+    );
+    assert!(
+        !c.contains("\"CPY\",") && !c.contains("\"CPY001\","),
+        "the copyright-header family must not be selected or ignored"
+    );
+    assert!(c.contains("\"ANN401\","), "in-family ruff ignores must be preserved");
     assert!(c.contains("pydocstyle_convention = \"google\""));
     assert!(c.contains("pylint_max_args = 10"));
-    // Cross-engine per-file ignores for the alef wrappers.
     assert!(c.contains("[per-file-ignores]") && c.contains("\"**/api.py\""));
-    // pyrefly type-check hook in project mode (replaces mypy).
     assert!(c.contains("[hooks.pre-commit.commands.pyrefly]") && c.contains("pyrefly check packages/python"));
+    assert!(
+        c.contains("workspace = true"),
+        "pyrefly must be a workspace hook so `poly lint .` runs it once over the whole project"
+    );
+}
+
+#[test]
+fn poly_toml_emits_workspace_lint_hooks_for_non_bundled_linters() {
+    let config = test_config();
+    let files = scaffold_poly_config(
+        &config,
+        &[
+            Language::Python,
+            Language::Ruby,
+            Language::Go,
+            Language::Java,
+            Language::Dart,
+            Language::Elixir,
+            Language::KotlinAndroid,
+        ],
+    );
+    let c = &files
+        .iter()
+        .find(|f| f.path.to_str() == Some("poly.toml"))
+        .expect("poly.toml emitted")
+        .content;
+
+    // Each linter poly does not bundle is delegated as a workspace hook so a
+    // single `poly lint .` invokes it once over its package, respecting the
+    // tool's native config.
+    for (table, cmd) in [
+        ("[hooks.pre-commit.commands.rubocop]", "bundle exec rubocop"),
+        ("[hooks.pre-commit.commands.steep]", "bundle exec steep check"),
+        ("[hooks.pre-commit.commands.golangci-lint]", "golangci-lint run ./..."),
+        ("[hooks.pre-commit.commands.checkstyle]", "mvn -q checkstyle:check"),
+        ("[hooks.pre-commit.commands.dart-analyze]", "dart analyze"),
+        // credo is primed with `mix deps.get` because poly's staged snapshot has no
+        // gitignored `deps/` for Elixir to resolve credo itself from. ~keep
+        (
+            "[hooks.pre-commit.commands.credo]",
+            "mix deps.get && mix credo --strict",
+        ),
+    ] {
+        assert!(c.contains(table), "missing workspace hook {table}");
+        assert!(c.contains(cmd), "missing command `{cmd}` for {table}");
+    }
+    // Ruby tools must run from the ruby package so they discover .rubocop.yml.
+    assert!(c.contains("root = \"packages/ruby\""));
+    // The flag that makes `poly lint .` run these once (not per file).
+    assert!(
+        c.matches("workspace = true").count() >= 6,
+        "every delegated linter must be workspace-scoped"
+    );
+    // The whole document, with every hook table, must be valid TOML.
+    toml::from_str::<toml::Value>(c).expect("generated poly.toml must parse");
 }
 
 #[test]
@@ -144,7 +199,7 @@ fn poly_toml_php_uses_mago_correctness_security() {
     let c = &poly_toml(&files).content;
 
     assert!(
-        c.contains("[lint.php.mago]") && c.contains("select = [ \"correctness\", \"security\" ]"),
+        c.contains("[lint.php.mago]") && c.contains("select = [\"correctness\", \"security\"]"),
         "PHP must use mago correctness/security ruleset (replacing phpstan/php-cs-fixer)"
     );
 }
@@ -153,15 +208,12 @@ fn poly_toml_php_uses_mago_correctness_security() {
 fn poly_toml_omits_language_tables_when_language_absent() {
     let config = test_config();
     let api = test_api();
-    // No Python, no PHP.
     let files = scaffold(&api, &config, &[Language::Node]).unwrap();
     let c = &poly_toml(&files).content;
 
     assert!(!c.contains("[lint.python.ruff]"), "no python table without python");
     assert!(!c.contains("[lint.php.mago]"), "no php table without php");
     assert!(!c.contains("pyrefly"), "no pyrefly hook without python");
-    // per-file-ignores is always emitted (generated test/e2e suites exist in
-    // every repo), but the python-wrapper entries must be absent without python.
     assert!(
         !c.contains("\"**/api.py\""),
         "no python wrapper per-file-ignores without python"
@@ -169,14 +221,8 @@ fn poly_toml_omits_language_tables_when_language_absent() {
     assert!(c.contains("\"**/e2e/**\""), "test/e2e per-file-ignores always emitted");
 }
 
-// ── opt-in native-tool FORMAT enables + format excludes ─────────────────────
-
 #[test]
 fn poly_toml_never_enables_system_native_formatters() {
-    // Pure-Rust policy: alef never enables poly's opt-in system-toolchain
-    // formatters (they'd make output environment-dependent and break `alef
-    // verify`). Even with every relevant language present, none is enabled —
-    // poly formats them via its deterministic tier-2 tree-sitter tier.
     let config = test_config();
     let api = test_api();
     let files = scaffold(
@@ -218,8 +264,6 @@ fn poly_toml_excludes_only_cargo_toml_from_formatting() {
     let api = test_api();
     let files = scaffold(&api, &config, &[Language::Python]).unwrap();
     let c = &poly_toml(&files).content;
-    // Cargo.toml is excluded (cargo sort owns it); Elixir is NOT excluded —
-    // poly's tier-2 formats `.ex`/`.exs` now (no `mix format` residual).
     assert!(
         c.contains("\"**/Cargo.toml\","),
         "Cargo.toml must be excluded from poly; got:\n{c}"
@@ -228,15 +272,61 @@ fn poly_toml_excludes_only_cargo_toml_from_formatting() {
         !c.contains("packages/elixir/**/*.ex"),
         "Elixir must NOT be excluded (poly tier-2 formats it now); got:\n{c}"
     );
-    // Mirrored into the builtin hook excludes too (git-hook path).
-    let polyfmt_pos = c.find("polyfmt = { exclude =").expect("polyfmt builtin present");
+    let fmt_pos = c.find("fmt = { exclude =").expect("fmt builtin present");
     assert!(
-        c[polyfmt_pos..].contains("\"**/Cargo.toml\","),
-        "Cargo.toml exclude must be mirrored into the polyfmt builtin"
+        c[fmt_pos..].contains("\"**/Cargo.toml\","),
+        "Cargo.toml exclude must be mirrored into the fmt builtin"
     );
 }
 
-// ── [workspace.poly] merge tests ────────────────────────────────────────────
+/// Arrays must use taplo's 2-space indent. A 4-space indent means the freshly
+/// written `poly.toml` fails the consumer's own `poly fmt --check`, and — since
+/// the byte-equality skip then never fires — alef rewrites the file on every run.
+#[test]
+fn poly_toml_arrays_use_taplos_two_space_indent() {
+    let config = test_config();
+    let api = test_api();
+    let files = scaffold(&api, &config, &[Language::Python]).unwrap();
+    let c = &poly_toml(&files).content;
+
+    assert!(
+        c.contains("\n  \"target/**\","),
+        "multi-line array entries must be indented 2 spaces; got:\n{c}"
+    );
+    assert!(
+        !c.contains("\n    \"target/**\","),
+        "4-space indent is not taplo-canonical and never survives `poly fmt`; got:\n{c}"
+    );
+}
+
+/// poly has no native Elixir formatter, so without this opt-in it reindents
+/// `.ex`/`.exs` with its own tree-sitter query and fights `mix format` forever.
+#[test]
+fn poly_toml_hands_elixir_to_mix_format() {
+    let config = test_config();
+    let api = test_api();
+    let files = scaffold(&api, &config, &[Language::Elixir]).unwrap();
+    let c = &poly_toml(&files).content;
+
+    assert!(
+        c.contains("[tools.mix]") && c.contains("enabled = true"),
+        "Elixir repos must declare the mix catalog formatter; got:\n{c}"
+    );
+    assert!(
+        c.contains("root = \"packages/elixir\""),
+        "mix must run from the mix project root so it reads .formatter.exs; got:\n{c}"
+    );
+}
+
+#[test]
+fn poly_toml_omits_mix_tool_without_elixir() {
+    let config = test_config();
+    let api = test_api();
+    let files = scaffold(&api, &config, &[Language::Python]).unwrap();
+    let c = &poly_toml(&files).content;
+
+    assert!(!c.contains("[tools.mix]"), "no mix tool without Elixir; got:\n{c}");
+}
 
 #[test]
 fn poly_toml_extra_excludes_appear_in_discovery_and_hooks() {
@@ -245,7 +335,6 @@ fn poly_toml_extra_excludes_appear_in_discovery_and_hooks() {
     let files = scaffold(&api, &config, &[Language::Python]).unwrap();
     let c = &poly_toml(&files).content;
 
-    // Extra globs must appear in [discovery] exclude.
     assert!(
         c.contains("\"vendor/generated/**\","),
         "[discovery] exclude must contain repo-extra glob"
@@ -255,17 +344,13 @@ fn poly_toml_extra_excludes_appear_in_discovery_and_hooks() {
         "[discovery] exclude must contain second repo-extra glob"
     );
 
-    // The same extra globs must be mirrored into all three builtin excludes.
-    let polylint_pos = c.find("polylint = { exclude =").expect("polylint builtin present");
-    let polyfmt_pos = c.find("polyfmt = { exclude =").expect("polyfmt builtin present");
+    let lint_pos = c.find("lint = { exclude =").expect("lint builtin present");
+    let fmt_pos = c.find("fmt = { exclude =").expect("fmt builtin present");
     let filesafety_pos = c
         .find("file_safety = { exclude =")
         .expect("file_safety builtin present");
 
-    // A simple content check: the string appears after each builtin key.
-    // Because the same merged `excludes` variable is used for all three, a
-    // substring check across the whole document is sufficient.
-    for builtin_pos in [polylint_pos, polyfmt_pos, filesafety_pos] {
+    for builtin_pos in [lint_pos, fmt_pos, filesafety_pos] {
         let after = &c[builtin_pos..];
         assert!(
             after.contains("\"vendor/generated/**\","),
@@ -273,7 +358,6 @@ fn poly_toml_extra_excludes_appear_in_discovery_and_hooks() {
         );
     }
 
-    // Default globs must still be present (defaults come first).
     assert!(c.contains("\"target/**\","), "built-in excludes must be preserved");
 }
 
@@ -288,7 +372,6 @@ fn poly_toml_extra_per_file_ignores_appended() {
     let files = scaffold(&api, &config, &[Language::Python]).unwrap();
     let c = &poly_toml(&files).content;
 
-    // Both repo-specific per-file-ignore globs and their codes must appear.
     assert!(
         c.contains("\"**/legacy_api.py\""),
         "repo per-file-ignore glob must be emitted"
@@ -301,7 +384,6 @@ fn poly_toml_extra_per_file_ignores_appended() {
     );
     assert!(c.contains("\"UP035\","), "rule code UP035 must appear for compat.py");
 
-    // Repo globs must come AFTER the generated test/e2e globs.
     let e2e_pos = c.find("\"**/e2e/**\"").expect("e2e glob present");
     let legacy_pos = c.find("\"**/legacy_api.py\"").expect("legacy_api.py glob present");
     assert!(
@@ -312,10 +394,8 @@ fn poly_toml_extra_per_file_ignores_appended() {
 
 #[test]
 fn poly_toml_empty_poly_config_leaves_output_unchanged() {
-    // A config with an explicit empty [workspace.poly] section must produce
-    // output byte-identical to one with no [workspace.poly] at all.
     let config_default = test_config();
-    let config_explicit_empty = test_config_with_poly(""); // empty poly section
+    let config_explicit_empty = test_config_with_poly("");
 
     let api = test_api();
     let files_default = scaffold(&api, &config_default, &[Language::Python, Language::Node]).unwrap();
@@ -330,8 +410,6 @@ fn poly_toml_empty_poly_config_leaves_output_unchanged() {
     );
 }
 
-// ── [workspace.poly.typos] merge tests ───────────────────────────────────────
-
 #[test]
 fn poly_toml_typos_extend_words_emitted_before_per_file_ignores() {
     let config = test_config_with_workspace_toml(
@@ -344,16 +422,13 @@ arange = "arange"
     let files = scaffold(&api, &config, &[Language::Python]).unwrap();
     let c = &poly_toml(&files).content;
 
-    // Section header must be present.
     assert!(
         c.contains("[lint.typos.extend_words]\n"),
         "[lint.typos.extend_words] section must be emitted; got:\n{c}"
     );
-    // Entries appear in BTreeMap (alphabetical) order.
     assert!(c.contains("arange = \"arange\""), "arange entry must appear");
     assert!(c.contains("flate = \"flate\""), "flate entry must appear");
 
-    // Typos tables must precede [per-file-ignores].
     let typos_pos = c.find("[lint.typos.extend_words]").expect("extend_words present");
     let per_file_pos = c.find("[per-file-ignores]").expect("per-file-ignores present");
     assert!(
@@ -381,7 +456,6 @@ PDFium = "PDFium"
     assert!(c.contains("PDFium = \"PDFium\""), "PDFium identifier must appear");
     assert!(c.contains("PyMuPDF = \"PyMuPDF\""), "PyMuPDF identifier must appear");
 
-    // No extend_words section when it is empty.
     assert!(
         !c.contains("[lint.typos.extend_words]"),
         "extend_words must not be emitted when empty"
@@ -411,7 +485,6 @@ PyMuPDF = "PyMuPDF"
         "extend_identifiers must be emitted"
     );
 
-    // extend_words comes before extend_identifiers.
     let words_pos = c.find("[lint.typos.extend_words]").expect("extend_words present");
     let idents_pos = c
         .find("[lint.typos.extend_identifiers]")
@@ -423,7 +496,6 @@ PyMuPDF = "PyMuPDF"
 
 #[test]
 fn poly_toml_empty_typos_config_emits_no_typos_tables() {
-    // Default config (no [workspace.poly.typos]) must not emit any [lint.typos.*] tables.
     let config = test_config();
     let api = test_api();
     let files = scaffold(&api, &config, &[Language::Python]).unwrap();
@@ -436,8 +508,154 @@ fn poly_toml_empty_typos_config_emits_no_typos_tables() {
 }
 
 #[test]
+fn poly_toml_omits_uncomment_table_by_default() {
+    let config = test_config();
+    let api = test_api();
+    let files = scaffold(&api, &config, &[Language::Python]).unwrap();
+    let c = &poly_toml(&files).content;
+
+    assert!(
+        !c.contains("[lint.uncomment]"),
+        "no [lint.uncomment] table when [workspace.poly.uncomment] is absent; got:\n{c}"
+    );
+}
+
+#[test]
+fn poly_toml_empty_poly_config_still_omits_uncomment() {
+    let config = test_config_with_poly("");
+    let api = test_api();
+    let files = scaffold(&api, &config, &[Language::Python]).unwrap();
+    let c = &poly_toml(&files).content;
+    assert!(!c.contains("[lint.uncomment]"), "empty poly config must omit uncomment");
+}
+
+#[test]
+fn poly_toml_uncomment_table_emitted_with_snake_case_keys() {
+    let config = test_config_with_workspace_toml(
+        r#"[workspace.poly.uncomment]
+enabled = true
+remove-todos = true
+remove-fixme = false
+remove-docs = true
+use-default-ignores = false
+preserve-patterns = ["SAFETY:", "allow("]
+"#,
+    );
+    let api = test_api();
+    let files = scaffold(&api, &config, &[Language::Python]).unwrap();
+    let c = &poly_toml(&files).content;
+
+    assert!(c.contains("[lint.uncomment]\n"), "uncomment table must be emitted");
+    assert!(c.contains("enabled = true\n"), "enabled key must render");
+    assert!(c.contains("remove_todos = true\n"), "remove_todos snake_case key");
+    assert!(c.contains("remove_fixme = false\n"), "remove_fixme snake_case key");
+    assert!(c.contains("remove_docs = true\n"), "remove_docs snake_case key");
+    assert!(
+        c.contains("use_default_ignores = false\n"),
+        "use_default_ignores snake_case key"
+    );
+    assert!(c.contains("\"SAFETY:\","), "preserve_patterns entries must render");
+    assert!(c.contains("\"allow(\","), "second preserve_patterns entry must render");
+
+    assert!(!c.contains("remove-todos"), "must not leak kebab-case keys");
+    assert!(!c.contains("use-default-ignores"), "must not leak kebab-case keys");
+
+    let uncomment_pos = c.find("[lint.uncomment]").expect("uncomment present");
+    let per_file_pos = c.find("[per-file-ignores]").expect("per-file-ignores present");
+    assert!(
+        uncomment_pos < per_file_pos,
+        "[lint.uncomment] must precede [per-file-ignores]"
+    );
+}
+
+#[test]
+fn poly_toml_uncomment_empty_table_fills_poly_defaults() {
+    let config = test_config_with_workspace_toml("[workspace.poly.uncomment]\n");
+    let api = test_api();
+    let files = scaffold(&api, &config, &[Language::Python]).unwrap();
+    let c = &poly_toml(&files).content;
+
+    assert!(
+        c.contains("[lint.uncomment]\n"),
+        "empty table still emits [lint.uncomment]"
+    );
+    assert!(c.contains("enabled = true\n"), "enabled defaults true");
+    assert!(
+        c.contains("use_default_ignores = true\n"),
+        "use_default_ignores defaults true"
+    );
+    assert!(c.contains("remove_todos = false\n"), "remove_todos defaults false");
+    assert!(c.contains("preserve_patterns = []\n"), "empty preserve_patterns -> []");
+}
+
+#[test]
+fn poly_toml_file_safety_exclude_defaults_to_shared_excludes() {
+    let config = test_config();
+    let api = test_api();
+    let files = scaffold(&api, &config, &[Language::Python]).unwrap();
+    let c = &poly_toml(&files).content;
+
+    let array_body = |key: &str| -> String {
+        let start = c.find(key).unwrap_or_else(|| panic!("{key} present"));
+        let rel_end = c[start..].find("] }").expect("builtin array close");
+        c[start + key.len()..start + rel_end + 3].to_string()
+    };
+    assert_eq!(
+        array_body("lint = { exclude ="),
+        array_body("file_safety = { exclude ="),
+        "file_safety exclude must match lint's when no file-safety-exclude is set"
+    );
+}
+
+#[test]
+fn poly_toml_file_safety_exclude_only_appends_to_file_safety() {
+    let config = test_config_with_poly(r#"file-safety-exclude = ["crates/*/src/lib.rs", "**/inner.rs"]"#);
+    let api = test_api();
+    let files = scaffold(&api, &config, &[Language::Python]).unwrap();
+    let c = &poly_toml(&files).content;
+
+    let builtin_region = |key: &str| -> &str {
+        let start = c.find(key).unwrap_or_else(|| panic!("{key} present"));
+        let rel_end = c[start..].find("] }").expect("builtin array close");
+        &c[start..start + rel_end + 3]
+    };
+
+    let fs_region = builtin_region("file_safety = { exclude =");
+    assert!(
+        fs_region.contains("\"crates/*/src/lib.rs\","),
+        "file-safety-exclude glob must appear in file_safety builtin"
+    );
+    assert!(
+        fs_region.contains("\"**/inner.rs\","),
+        "second file-safety-exclude glob must appear in file_safety builtin"
+    );
+    assert!(
+        fs_region.contains("\"target/**\","),
+        "default file_safety excludes preserved"
+    );
+
+    let discovery_pos = c.find("[discovery]").expect("discovery present");
+    let hooks_pos = c.find("[hooks]").expect("hooks present");
+    let discovery_region = &c[discovery_pos..hooks_pos];
+    assert!(
+        !discovery_region.contains("crates/*/src/lib.rs"),
+        "file-safety-exclude glob must NOT appear in [discovery]"
+    );
+
+    let lint_region = builtin_region("lint = { exclude =");
+    assert!(
+        !lint_region.contains("crates/*/src/lib.rs"),
+        "file-safety-exclude glob must NOT be in lint builtin"
+    );
+    let fmt_region = builtin_region("fmt = { exclude =");
+    assert!(
+        !fmt_region.contains("crates/*/src/lib.rs"),
+        "file-safety-exclude glob must NOT be in fmt builtin"
+    );
+}
+
+#[test]
 fn poly_toml_typos_entries_are_alphabetically_ordered() {
-    // BTreeMap guarantees alphabetical key order — verify it in the output.
     let config = test_config_with_workspace_toml(
         r#"[workspace.poly.typos.extend-words]
 zensical = "zensical"
@@ -456,5 +674,94 @@ flate = "flate"
     assert!(
         flate_pos < zensical_pos,
         "flate must come before zensical (alphabetical)"
+    );
+}
+
+#[test]
+fn poly_toml_enables_clang_format_and_ships_config_for_ffi() {
+    let config = test_config();
+    let files = scaffold_poly_config(&config, &[Language::Ffi]);
+    let poly = files
+        .iter()
+        .find(|f| f.path.to_str() == Some("poly.toml"))
+        .expect("poly.toml emitted");
+    assert!(
+        poly.content.contains("[tools.clang-format]") && poly.content.contains("enabled = true"),
+        "an FFI target must enable poly's clang-format catalog tool so cbindgen headers format; got:\n{}",
+        poly.content
+    );
+    // The whole document, with the tools table, must still be valid TOML.
+    toml::from_str::<toml::Value>(&poly.content).expect("poly.toml with [tools.clang-format] must parse");
+
+    let clang = files
+        .iter()
+        .find(|f| f.path.to_str() == Some(".clang-format"))
+        .expect("an FFI target must ship a canonical .clang-format");
+    assert!(
+        clang.generated_header,
+        ".clang-format must be alef-managed (overwritten every run to keep the C style uniform)"
+    );
+    assert!(
+        clang.content.contains("BasedOnStyle: LLVM") && clang.content.contains("IndentWidth: 4"),
+        "shipped .clang-format must carry the canonical LLVM/4-space style; got:\n{}",
+        clang.content
+    );
+}
+
+#[test]
+fn poly_toml_omits_clang_format_without_ffi() {
+    let config = test_config();
+    let files = scaffold_poly_config(&config, &[Language::Python, Language::Node]);
+    let poly = files
+        .iter()
+        .find(|f| f.path.to_str() == Some("poly.toml"))
+        .expect("poly.toml emitted");
+    assert!(
+        !poly.content.contains("[tools.clang-format]"),
+        "no clang-format tool table without an FFI/C-header target; got:\n{}",
+        poly.content
+    );
+    assert!(
+        !files.iter().any(|f| f.path.to_str() == Some(".clang-format")),
+        "no .clang-format must be shipped without an FFI target"
+    );
+}
+
+/// Repos whose CI installs only a subset of toolchains need `poly lint` to skip its
+/// whole-project phase. Without a knob in `alef.toml`, that setting can only be hand-written into
+/// the generated `poly.toml`, where the next scaffold run silently drops it again.
+#[test]
+fn emits_lint_workspace_false_when_configured() {
+    let config = test_config_with_poly("lint-workspace = false");
+    let api = test_api();
+    let files = scaffold(&api, &config, &[Language::Python]).unwrap();
+
+    let content = &poly_toml(&files).content;
+    assert!(
+        content.contains("[lint]\nworkspace = false\n"),
+        "poly.toml must carry the configured [lint] workspace setting, got:\n{content}"
+    );
+    let lint_table = content.find("[lint]").expect("[lint] table must be emitted");
+    let first_sub_table = content.find("[lint.").expect("[lint.*] sub-tables are always emitted");
+    assert!(
+        lint_table < first_sub_table,
+        "[lint] must precede its sub-tables so it reads as a definition, not a redefinition, got:\n{content}"
+    );
+    let parsed: toml::Value = toml::from_str(content).expect("emitted poly.toml must be valid TOML");
+    assert_eq!(parsed["lint"]["workspace"].as_bool(), Some(false));
+}
+
+/// The default must stay byte-identical to the pre-feature output: no `[lint]` table at all,
+/// which lets poly apply its own default rather than alef pinning one.
+#[test]
+fn omits_lint_table_when_not_configured() {
+    let config = test_config();
+    let api = test_api();
+    let files = scaffold(&api, &config, &[Language::Python]).unwrap();
+
+    let content = &poly_toml(&files).content;
+    assert!(
+        !content.contains("[lint]\nworkspace"),
+        "poly.toml must not emit a [lint] workspace setting by default, got:\n{content}"
     );
 }

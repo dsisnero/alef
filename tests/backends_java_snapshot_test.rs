@@ -1,3 +1,6 @@
+// Test module: diagnostic output to stdout/stderr is expected here. ~keep
+#![allow(clippy::print_stdout, clippy::print_stderr)]
+
 /// Test that generates and displays sample Java code output.
 use alef::backends::java::JavaBackend;
 use alef::core::backend::Backend;
@@ -13,11 +16,10 @@ fn resolved_one(toml: &str) -> ResolvedCrateConfig {
 }
 
 #[test]
-#[ignore] // Run with: cargo test -- --ignored --nocapture
+#[ignore]
 fn print_generated_java_code() {
     let backend = JavaBackend;
 
-    // Create a comprehensive test API surface
     let api = ApiSurface {
         crate_name: "sample_crate".to_string(),
         version: "0.1.0".to_string(),

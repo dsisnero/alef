@@ -43,11 +43,12 @@ pub(super) fn gen_visitor_bridge(
     );
     let debug_count = rendered.matches("impl std::fmt::Debug").count();
     if debug_count != 1 {
-        eprintln!(
+        tracing::warn!(
             "[ALEF BUG] visitor_bridge.rs.jinja rendered {} Debug impls (expected 1) for struct {}",
-            debug_count, struct_name
+            debug_count,
+            struct_name
         );
-        eprintln!(
+        tracing::warn!(
             "[ALEF BUG] Rendered output (first 2000 chars):\n{}",
             &rendered[..rendered.len().min(2000)]
         );
@@ -140,7 +141,6 @@ fn build_magnus_arg(p: &crate::core::ir::ParamDef, bridge_cfg: &TraitBridgeConfi
             p.name
         );
     }
-    // Vec/slice types: convert to Ruby array
     if matches!(&p.ty, TypeRef::Vec(_)) {
         let ruby = "unsafe { magnus::Ruby::get_unchecked() }";
         return format!(
@@ -148,6 +148,5 @@ fn build_magnus_arg(p: &crate::core::ir::ParamDef, bridge_cfg: &TraitBridgeConfi
             name = p.name,
         );
     }
-    // For primitive types, pass directly — Magnus funcall handles i32, i64, u32, bool natively.
     p.name.to_string()
 }

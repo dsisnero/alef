@@ -85,12 +85,6 @@ fn context_c_type(field: &FieldDef, api: &ApiSurface) -> Option<&'static str> {
         (TypeRef::Primitive(PrimitiveType::I64), false) => Some("i64"),
         (TypeRef::Primitive(PrimitiveType::Usize), false) => Some("usize"),
         (TypeRef::Primitive(PrimitiveType::Isize), false) => Some("isize"),
-        // Enum context fields (e.g. NodeType for visitor dispatch) are passed
-        // as the i32 discriminant across the C ABI so language-side templates
-        // can read them as a plain int and decode via `Enum.values()[i]`.
-        // Without this, the field is silently dropped from the Rust HtmContext
-        // struct and host-side struct layouts (Java CTX_LAYOUT, Kotlin / Swift
-        // / Dart equivalents) read from the wrong offset.
         (TypeRef::Named(name), false) if api.enums.iter().any(|e| e.name == *name) => Some("i32"),
         _ => None,
     }
@@ -102,9 +96,11 @@ pub(super) fn context_field_specs(context_def: &TypeDef, api: &ApiSurface) -> Ve
         .iter()
         .filter_map(|field| {
             let Some(c_type) = context_c_type(field, api) else {
-                eprintln!(
-                    "[alef] gen_visitor(ffi): skip context field `{}.{}` with unsupported type {:?}",
-                    context_def.name, field.name, field.ty
+                tracing::warn!(
+                    "gen_visitor(ffi): skip context field `{}.{}` with unsupported type {:?}",
+                    context_def.name,
+                    field.name,
+                    field.ty
                 );
                 return None;
             };

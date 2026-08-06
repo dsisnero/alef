@@ -521,12 +521,6 @@ const INITIALISMS: &[&str] = &[
 /// excludes generic acronyms so they round-trip cleanly through heck's PascalCase
 /// (matching alef's hardcoded helper names like `{Type}ToJson`/`{Type}FromJson`),
 /// while still preserving product names like `GraphQL` that heck would mangle.
-// `Id` deliberately omitted: Microsoft's modern framework design guidelines
-// (and the de-facto convention in EF Core, ASP.NET Core, Azure SDKs) treat
-// `Id` as a word — `EntityId`, not `EntityID`. Keeping `ID` here also
-// diverges from the e2e codegen, which calls `to_upper_camel_case` directly
-// and emits `.Id` accessors; reconciling both sides to `Id` matches the
-// existing test expectations.
 const CSHARP_INITIALISMS: &[&str] = &["GraphQL", "UUID"];
 
 /// Apply initialism uppercasing to a PascalCase name using the provided list.
@@ -540,8 +534,6 @@ fn apply_initialisms(name: &str, list: &[&str]) -> String {
         return name.to_string();
     }
 
-    // Split the PascalCase string into words at uppercase letter boundaries.
-    // Each "word" is a contiguous sequence starting with an uppercase letter.
     let mut words: Vec<&str> = Vec::new();
     let mut word_start = 0;
     let bytes = name.as_bytes();
@@ -553,13 +545,9 @@ fn apply_initialisms(name: &str, list: &[&str]) -> String {
     }
     words.push(&name[word_start..]);
 
-    // For each word, check if it matches a known initialism (case-insensitive).
     let mut result = String::with_capacity(name.len());
     let mut i = 0;
     while i < words.len() {
-        // Try to match the longest possible span of consecutive words to a known initialism
-        // (longest-match first). This handles multi-segment initialisms like "GraphQL" which
-        // heck splits into "Graph" + "Ql".
         let mut matched = false;
         for span in (1..=(words.len() - i)).rev() {
             let candidate: String = words[i..i + span].concat();
@@ -592,6 +580,24 @@ fn apply_go_acronyms(name: &str) -> String {
 /// Convert a Rust snake_case name to Go PascalCase convention with acronym uppercasing.
 pub fn to_go_name(name: &str) -> String {
     apply_go_acronyms(&name.to_pascal_case())
+}
+
+/// Convert a Rust free-function name to its Go wrapper identifier, disambiguating it from a
+/// generated Go type of the same name.
+///
+/// A Rust crate can expose both a free function (e.g. `model_info`) and a struct (e.g.
+/// `ModelInfo`) that map to the same Go PascalCase identifier, which the Go compiler rejects as
+/// a redeclaration. Go struct/opaque/enum type names are never disambiguated (types are the
+/// canonical identifier host consumers reach for), so on collision the function is renamed by
+/// prefixing `Get`. `reserved_type_names` must contain every Go type identifier the backend will
+/// emit (already passed through [`go_type_name`]).
+pub fn go_free_function_name(func_name: &str, reserved_type_names: &HashSet<String>) -> String {
+    let go_name = to_go_name(func_name);
+    if reserved_type_names.contains(&go_name) {
+        format!("Get{go_name}")
+    } else {
+        go_name
+    }
 }
 
 /// Apply Go acronym uppercasing to a name that is already in PascalCase (e.g. an IR type name).
@@ -629,38 +635,11 @@ pub fn go_param_name(name: &str) -> String {
         return pascal;
     }
     let bytes = pascal.as_bytes();
-    // Find the boundary of the first "word":
-    // - If the string begins with a multi-char uppercase run followed by a lowercase letter,
-    //   the run minus its last char is an acronym prefix (e.g. "APIKey": run="API", next='K')
-    //   → lowercase "AP" and keep "IKey" → "apIKey" ... but Go actually wants "apiKey".
-    //   The real rule: lowercase the whole leading uppercase run regardless, because the
-    //   acronym-prefix IS the first word.
-    // - If the string begins with a single uppercase char (e.g. "BaseURL"), lowercase just it.
-    //
-    // Concretely: find how many leading bytes are uppercase. If that whole run is followed by
-    // end-of-string, lowercase everything. If followed by more chars, lowercase the entire run.
-    // For "APIKey": upper_len=3, next='K'(uppercase) but that starts the second word.
-    // Actually: scan for the first lowercase char to find where the first word ends.
     let first_lower = bytes.iter().position(|b| b.is_ascii_lowercase());
     match first_lower {
-        None => {
-            // Entire string is uppercase (single acronym like "JSON", "URL") — all lowercase.
-            pascal.to_lowercase()
-        }
-        Some(0) => {
-            // Starts with lowercase (already correct)
-            pascal
-        }
+        None => pascal.to_lowercase(),
+        Some(0) => pascal,
         Some(pos) => {
-            // pos is the index of the first lowercase char.
-            // The first "word" ends just before pos-1 (the char at pos-1 is the first char of
-            // the next PascalCase word that isnds with a lowercase continuation).
-            // For "BaseURL": pos=1 ('a'), so uppercase run = ['B'], lowercase just index 0.
-            // For "APIKey":  pos=4 ('e' in "Key"), uppercase run = "APIK", next lower = 'e',
-            //   so word boundary is at pos-1=3 ('K' is start of "Key").
-            //   → lowercase "API" (indices 0..2), keep "Key" → "apiKey" ✓
-            // For "UserID":  pos=1 ('s'), uppercase run starts at 'U', lowercase just 'U' → "userID"... wait
-            //   "UserID": 'U'(upper),'s'(lower) → pos=1, word="U", lower "U" → "u"+"serID" = "userID" ✓
             let word_end = if pos > 1 { pos - 1 } else { 1 };
             let lower_prefix = pascal[..word_end].to_lowercase();
             format!("{}{}", lower_prefix, &pascal[word_end..])
@@ -696,7 +675,6 @@ pub fn to_csharp_name(name: &str) -> String {
 /// the same class name that the bindings actually emit.
 pub fn csharp_wrapper_class_name(crate_name: &str, _namespace: &str) -> String {
     let base = to_csharp_name(crate_name);
-    // Strip Rust-binding "Rs" suffix (from "-rs" crate suffix) and append idiomatic Converter suffix.
     let stem = base.strip_suffix("Rs").unwrap_or(&base);
     format!("{stem}Converter")
 }
@@ -735,16 +713,13 @@ fn normalize_acronym_to_pascalcase(name: &str) -> String {
         return name.to_string();
     }
 
-    // Check if the name is all uppercase and 3+ letters (an acronym like "URI", "XML", "JSON")
     if name.len() >= 3 && name.chars().all(|c| c.is_ascii_uppercase()) {
-        // Convert "URI" → "Uri", "XML" → "Xml", "JSON" → "Json"
         let mut result = String::with_capacity(name.len());
         result.push(name.chars().next().unwrap().to_ascii_uppercase());
         result.extend(name.chars().skip(1).map(|c| c.to_ascii_lowercase()));
         return result;
     }
 
-    // Not an all-caps acronym — return as-is
     name.to_string()
 }
 
@@ -760,9 +735,7 @@ fn normalize_acronym_to_pascalcase(name: &str) -> String {
 /// - `GraphQLRouteConfig`   → `GraphQLRouteConfig`  (idempotent)
 /// - `HttpStatus`           → `HttpStatus`          (left alone — `Http` not in `CSHARP_INITIALISMS`)
 pub fn csharp_type_name(name: &str) -> String {
-    // First normalize 3+ letter acronyms to PascalCase (URI → Uri, XML → Xml, JSON → Json)
     let normalized = normalize_acronym_to_pascalcase(name);
-    // Then apply the preserved initialism rules (GraphQL, ID, UUID)
     apply_initialisms(&normalized, CSHARP_INITIALISMS)
 }
 

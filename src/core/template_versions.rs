@@ -1,11 +1,19 @@
 //! Centralized third-party dependency version strings for code generation.
 //!
 //! This module consolidates all hardcoded version strings used in scaffold and e2e
-//! code generation. Each const that should be auto-bumped by Renovate includes a
-//! marker comment: `// renovate: datasource=... depName=...`
+//! code generation. Each const that should be auto-bumped by Renovate carries a
+//! marker comment on the line directly above it:
+//! `// renovate: datasource=... depName=...`
+//!
+//! The regex customManager in `renovate.json` matches those markers against the
+//! adjacent `pub const NAME: &str = "..."` and keeps the version fresh so
+//! regenerated bindings ship current dependencies.
 //!
 //! When adding a new version: choose the appropriate submodule based on package ecosystem,
-//! add the renovate marker (if applicable), and use the const in templates.
+//! add the renovate marker (if the value is a single auto-bumpable version/range for a real
+//! registry package), and use the const in templates. Consts without a marker (toolchain
+//! targets, language/engine constraints, compound strings, `>= x and < y` ranges, and
+//! artifacts hosted on non-default registries) are tracked manually.
 
 pub mod npm {
     pub const NODE_ENGINE: &str = ">= 22";
@@ -14,16 +22,16 @@ pub mod npm {
     pub const NAPI_RS_CLI_DEVDEPS: &str = "^3.0.0";
 
     // renovate: datasource=npm depName=@napi-rs/cli
-    pub const NAPI_RS_CLI_CRATE: &str = "^3.6.2";
+    pub const NAPI_RS_CLI_CRATE: &str = "^3.7.3";
 
     // renovate: datasource=npm depName=typescript
-    pub const TYPESCRIPT: &str = "^6.0.3";
+    pub const TYPESCRIPT: &str = "^7.0.0";
 
     // renovate: datasource=npm depName=vitest
-    pub const VITEST: &str = "^4.1.5";
+    pub const VITEST: &str = "^4.1.10";
 
     // renovate: datasource=npm depName=@types/node
-    pub const TYPES_NODE: &str = "^22.10.2";
+    pub const TYPES_NODE: &str = "^26.0.0";
 
     // renovate: datasource=npm depName=rollup
     pub const ROLLUP: &str = "^4.53.3";
@@ -36,13 +44,16 @@ pub mod npm {
 }
 
 pub mod cargo {
-    // napi major-only; manual bump required
+    // renovate: datasource=crate depName=tracing
+    pub const TRACING: &str = "0.1";
+
+    // renovate: datasource=crate depName=napi
     pub const NAPI: &str = "3";
 
-    // napi-derive major-only; manual bump required
+    // renovate: datasource=crate depName=napi-derive
     pub const NAPI_DERIVE: &str = "3";
 
-    // napi-build major-only; manual bump required
+    // renovate: datasource=crate depName=napi-build
     pub const NAPI_BUILD: &str = "2";
 
     // renovate: datasource=crate depName=pyo3
@@ -55,7 +66,6 @@ pub mod cargo {
     pub const MAGNUS: &str = "0.8";
 
     // renovate: datasource=crate depName=ext-php-rs
-    // 0.15.12+ required for `StaticModuleEntry` used by gen_bindings/rust_bindings.rs module entry.
     pub const EXT_PHP_RS: &str = "0.15.15";
 
     // renovate: datasource=crate depName=js-sys
@@ -79,7 +89,7 @@ pub mod cargo {
     // renovate: datasource=crate depName=cbindgen
     pub const CBINDGEN: &str = "0.29";
 
-    // tempfile major-only; manual bump required
+    // renovate: datasource=crate depName=tempfile
     pub const TEMPFILE: &str = "3";
 
     // renovate: datasource=crate depName=rustler
@@ -97,11 +107,20 @@ pub mod cargo {
     // renovate: datasource=crate depName=tokio-stream
     pub const TOKIO_STREAM: &str = "0.1";
 
-    // walkdir major-only; manual bump required
+    // renovate: datasource=crate depName=walkdir
     pub const WALKDIR: &str = "2";
 
     // renovate: datasource=crate depName=tower-http
-    pub const TOWER_HTTP: &str = "0.6";
+    pub const TOWER_HTTP: &str = "0.7";
+
+    // renovate: datasource=crate depName=serde
+    pub const SERDE: &str = "1";
+
+    // renovate: datasource=crate depName=serde_json
+    pub const SERDE_JSON: &str = "1";
+
+    // renovate: datasource=crate depName=tokio
+    pub const TOKIO: &str = "1";
 
     // renovate: datasource=crate depName=flutter_rust_bridge
     pub const FLUTTER_RUST_BRIDGE: &str = "2.12.0";
@@ -117,95 +136,93 @@ pub mod cargo {
 }
 
 pub mod pypi {
-    // renovate: datasource=pypi depName=maturin
-    // Note: floor+ceil constraint; managed as single string, no Renovate auto-bump
     pub const MATURIN_BUILD_REQUIRES: &str = "maturin>=1.0,<2.0";
 
-    // renovate: datasource=pypi depName=ruff
-    pub const RUFF: &str = ">=0.14.8";
-
-    // renovate: datasource=pypi depName=pyrefly
     // Replaces mypy: pyrefly is a fast single-binary Rust type-checker, run as a
-    // poly hook. See `[tool.pyrefly]` emission in scaffold/languages/python.rs.
+    // renovate: datasource=pypi depName=pyrefly
     pub const PYREFLY: &str = ">=1.1.1";
+
+    // renovate: datasource=pypi depName=pytest
+    pub const PYTEST: &str = ">=7.4";
+
+    // renovate: datasource=pypi depName=pytest-asyncio
+    pub const PYTEST_ASYNCIO: &str = ">=0.23";
+
+    // renovate: datasource=pypi depName=pytest-timeout
+    pub const PYTEST_TIMEOUT: &str = ">=2.1";
+
+    // renovate: datasource=pypi depName=setuptools
+    pub const SETUPTOOLS: &str = ">=68";
 }
 
 pub mod gem {
-    // renovate: datasource=rubygems depName=rb_sys
-    // Emitted as multiple positional args to `add_dependency` / `gem` so
-    // Gemfile.lock resolution honours the `< 0.9.128` upper bound. rb_sys
-    // 0.9.128 ships a mingw cross sysroot that breaks rb-sys-dock's clang
-    // bindgen on the x64-mingw-ucrt target; bundler reads the gemspec / Gemfile
-    // when resolving the lockfile, so the cross-compile-layer `gem install
-    // rb_sys -v '< 0.9.128'` before `bundle install` is NOT sufficient — the
-    // upper-bound constraint must live in the source manifests too. The
-    // template-side emit strips the surrounding quotes so this string can hold
-    // a comma-separated list of quoted constraints that lands as separate
-    // positional args, which `add_dependency` / `gem` accepts.
+    // Ruby gems are pinned as pessimistic (`~>`) constraints. Renovate's regex
+    // custom manager cannot bump these: it derives no range strategy for a
+    // custom-manager range, and the `ruby` versioning then emits an
+    // "Unsupported range strategy" warning and computes no update. They are
+    // tracked manually here — the `~>` floors already admit newer releases at
+    // `bundle install`. (Other ecosystems whose versioning tolerates a missing
+    // strategy, e.g. hex, keep their markers.)
     pub const RB_SYS: &str = "\">= 0.9\", \"< 0.9.128\"";
 
-    // renovate: datasource=rubygems depName=sorbet-runtime
     pub const SORBET_RUNTIME: &str = "~> 0.5";
 
-    // renovate: datasource=rubygems depName=rake-compiler
     pub const RAKE_COMPILER: &str = "~> 1.2";
 
-    // renovate: datasource=rubygems depName=rspec
     pub const RSPEC_SCAFFOLD: &str = "~> 3.0";
 
-    // renovate: datasource=rubygems depName=rspec
     pub const RSPEC_E2E: &str = "~> 3.13";
 
-    // renovate: datasource=rubygems depName=rubocop
     pub const RUBOCOP_SCAFFOLD: &str = "~> 1.0";
 
-    // renovate: datasource=rubygems depName=rubocop
     pub const RUBOCOP_E2E: &str = "~> 1.86";
 
-    // renovate: datasource=rubygems depName=rubocop-performance
     pub const RUBOCOP_PERFORMANCE: &str = "~> 1.0";
 
-    // renovate: datasource=rubygems depName=rubocop-rspec
     pub const RUBOCOP_RSPEC_SCAFFOLD: &str = "~> 3.0";
 
-    // renovate: datasource=rubygems depName=rubocop-rspec
     pub const RUBOCOP_RSPEC_E2E: &str = "~> 3.9";
 
-    // renovate: datasource=rubygems depName=steep
     pub const STEEP: &str = "~> 1.0";
 
-    // renovate: datasource=rubygems depName=faraday
     pub const FARADAY: &str = "~> 2.0";
 }
 
 pub mod packagist {
-    // PHP lint+format is poly-native via mago — no phpstan / php-cs-fixer deps.
 
     // renovate: datasource=packagist depName=phpunit/phpunit
-    pub const PHPUNIT: &str = "^13.1";
+    // ~keep Span every PHPUnit major that supports the generated `"php": ">=8.2"` floor: 11.x needs
+    // >=8.2, 12.x needs >=8.3, 13.x needs >=8.4.1. A 13-only constraint is unsatisfiable on 8.2/8.3,
+    // so `composer install` hard-fails there, and Dependabot — which resolves Composer against the
+    // declared platform floor rather than the runtime PHP — reported "requirements could not be
+    // resolved" on every run. Composer picks the highest major the actual PHP supports.
+    pub const PHPUNIT: &str = "^11.5 || ^12.0 || ^13.1";
 
     // renovate: datasource=packagist depName=guzzlehttp/guzzle
-    pub const GUZZLE: &str = "^7.0";
+    // Accept both ^7 and ^8: a Composer resolver picking guzzle 8.x (e.g. because
+    // a committed composer.lock already resolved to 8.x) must not be rejected by a
+    // stale ^7-only constraint, which makes `composer install` hard-fail on a
+    // require/lock mismatch. If a generated e2e test depends on guzzle 7's
+    // client-side Content-Length validation behavior, gate or rework that test
+    // rather than narrowing this constraint back to ^7 only.
+    pub const GUZZLE: &str = "^7.0 || ^8.0";
 }
 
 pub mod maven {
-    // renovate: datasource=maven depName=org.junit.jupiter:junit-jupiter
-    pub const JUNIT: &str = "6.1.0";
+    // renovate: datasource=maven depName=org.junit:junit-bom
+    pub const JUNIT: &str = "6.1.2";
 
     // renovate: datasource=maven depName=org.apache.maven.plugins:maven-compiler-plugin
     pub const MAVEN_COMPILER_PLUGIN: &str = "3.15.0";
 
     // renovate: datasource=maven depName=org.apache.maven.plugins:maven-surefire-plugin
-    pub const MAVEN_SUREFIRE_PLUGIN: &str = "3.5.5";
+    pub const MAVEN_SUREFIRE_PLUGIN: &str = "3.5.6";
 
     // renovate: datasource=maven depName=org.apache.maven.plugins:maven-surefire-plugin
     pub const MAVEN_SUREFIRE_PLUGIN_E2E: &str = "3.5.2";
 
     // renovate: datasource=maven depName=org.apache.maven.plugins:maven-checkstyle-plugin
     pub const MAVEN_CHECKSTYLE_PLUGIN: &str = "3.6.0";
-
-    // renovate: datasource=maven depName=org.apache.maven.plugins:maven-pmd-plugin
-    pub const MAVEN_PMD_PLUGIN: &str = "3.28.0";
 
     // renovate: datasource=maven depName=org.apache.maven.plugins:maven-source-plugin
     pub const MAVEN_SOURCE_PLUGIN: &str = "3.4.0";
@@ -223,7 +240,7 @@ pub mod maven {
     pub const MAVEN_RESOURCES_PLUGIN: &str = "3.5.0";
 
     // renovate: datasource=maven depName=org.apache.maven.plugins:maven-jar-plugin
-    pub const MAVEN_JAR_PLUGIN: &str = "3.5.0";
+    pub const MAVEN_JAR_PLUGIN: &str = "3.5.1";
 
     // renovate: datasource=maven depName=org.apache.maven.plugins:maven-install-plugin
     pub const MAVEN_INSTALL_PLUGIN: &str = "3.1.4";
@@ -235,7 +252,7 @@ pub mod maven {
     pub const MAVEN_SITE_PLUGIN: &str = "4.0.0-M16";
 
     // renovate: datasource=maven depName=org.sonatype.central:central-publishing-maven-plugin
-    pub const CENTRAL_PUBLISHING_PLUGIN: &str = "0.10.0";
+    pub const CENTRAL_PUBLISHING_PLUGIN: &str = "0.11.0";
 
     // renovate: datasource=maven depName=org.codehaus.mojo:versions-maven-plugin
     pub const VERSIONS_MAVEN_PLUGIN: &str = "2.21.0";
@@ -244,26 +261,19 @@ pub mod maven {
     pub const MAVEN_ENFORCER_PLUGIN: &str = "3.6.3";
 
     // renovate: datasource=maven depName=org.jacoco:jacoco-maven-plugin
-    pub const JACOCO_MAVEN_PLUGIN: &str = "0.8.14";
+    pub const JACOCO_MAVEN_PLUGIN: &str = "0.8.15";
 
     // renovate: datasource=maven depName=com.puppycrawl.tools:checkstyle
-    pub const CHECKSTYLE: &str = "13.4.2";
-
-    // renovate: datasource=maven depName=net.sourceforge.pmd:pmd-java
-    // Must match pmd-core bundled in maven-pmd-plugin to avoid NoSuchMethodError.
-    pub const PMD: &str = "7.17.0";
+    pub const CHECKSTYLE: &str = "13.9.0";
 
     // renovate: datasource=maven depName=org.jspecify:jspecify
-    pub const JSPECIFY: &str = "1.0.0";
+    pub const JSPECIFY: &str = "1.0.1";
 
     // renovate: datasource=maven depName=com.fasterxml.jackson.core:jackson-databind
-    // 2.20+ adopted a 2-component scheme (2.20/2.21/2.22) that is only partially on Maven
-    // Central (jackson-core/databind 2.22 and any x.y.0 return 404). 2.19.0 is fully present
-    // across all five jackson artifacts — pin here until the new scheme is fully published.
-    pub const JACKSON: &str = "2.19.0";
+    pub const JACKSON: &str = "2.22.1";
 
     // renovate: datasource=maven depName=com.fasterxml.jackson.core:jackson-annotations
-    pub const JACKSON_ANNOTATIONS: &str = "2.19.0";
+    pub const JACKSON_ANNOTATIONS: &str = "2.22";
 
     // renovate: datasource=maven depName=com.fasterxml.jackson.core:jackson-databind
     pub const JACKSON_E2E: &str = "2.19.0";
@@ -275,9 +285,9 @@ pub mod maven {
     pub const BUILD_HELPER_MAVEN_PLUGIN: &str = "3.6.1";
 
     // renovate: datasource=maven depName=org.jetbrains.kotlin:kotlin-gradle-plugin
-    pub const KOTLIN_JVM_PLUGIN: &str = "2.4.0";
+    pub const KOTLIN_JVM_PLUGIN: &str = "2.4.10";
 
-    // renovate: datasource=maven depName=com.android.tools.build:gradle
+    // Android Gradle plugin — hosted on Google's Maven repo, not Maven Central; tracked manually.
     pub const ANDROID_GRADLE_PLUGIN: &str = "9.2.1";
 
     // renovate: datasource=maven depName=org.jlleitschuh.gradle:ktlint-gradle
@@ -286,26 +296,40 @@ pub mod maven {
     // renovate: datasource=maven depName=com.github.ben-manes:gradle-versions-plugin
     pub const GRADLE_VERSIONS_PLUGIN: &str = "0.54.0";
 
-    // renovate: datasource=github-releases depName=pinterest/ktlint
+    // renovate: datasource=maven depName=com.pinterest.ktlint:ktlint-cli
     pub const KTLINT: &str = "1.8.0";
 
     // renovate: datasource=maven depName=org.jetbrains.kotlinx:kotlinx-coroutines-core
     pub const KOTLINX_COROUTINES_CORE: &str = "1.11.0";
 
     // renovate: datasource=maven depName=net.java.dev.jna:jna
-    pub const JNA: &str = "5.18.1";
+    pub const JNA: &str = "5.19.1";
 
     // renovate: datasource=maven depName=junit:junit
     pub const JUNIT_LEGACY: &str = "4.13.2";
 
-    // renovate: datasource=maven depName=androidx.test.ext:junit
+    // androidx — hosted on Google's Maven repo, not Maven Central; tracked manually.
     pub const ANDROIDX_TEST_EXT_JUNIT: &str = "1.3.0";
 
-    // renovate: datasource=maven depName=androidx.test.espresso:espresso-core
+    // androidx — hosted on Google's Maven repo, not Maven Central; tracked manually.
     pub const ANDROIDX_TEST_ESPRESSO_CORE: &str = "3.7.0";
 
-    // renovate: datasource=gradle-plugin depName=com.vanniktech.maven.publish
+    // renovate: datasource=maven depName=com.vanniktech:gradle-maven-publish-plugin
     pub const VANNIKTECH_MAVEN_PUBLISH: &str = "0.37.0";
+
+    // Minimum Maven runtime enforced by the generated pom's requireMavenVersion rule.
+    // This is a compatibility FLOOR, not a tracked dependency: keep it at or below the
+    // Maven version GitHub-hosted runners ship so `enforce-maven` never fails in CI.
+    // Do NOT add a `renovate:` annotation here — auto-bumping the floor to the newest
+    // maven-core release is what broke publishing in 0.48.2 (runners had 3.9.11 while
+    // the floor had been bumped to 3.9.16).
+    pub const MAVEN_CORE: &str = "3.6.3";
+
+    // renovate: datasource=maven depName=org.jetbrains:annotations
+    pub const JETBRAINS_ANNOTATIONS: &str = "26.1.0";
+
+    // renovate: datasource=maven depName=org.apache.maven.plugins:maven-antrun-plugin
+    pub const MAVEN_ANTRUN_PLUGIN: &str = "3.2.0";
 }
 
 pub mod nuget {
@@ -321,9 +345,7 @@ pub mod nuget {
 
 pub mod hex {
     // renovate: datasource=hex depName=rustler
-    // Version "~> 0.37" accepts both 0.37.x (stable) and 0.38.x (newly released).
-    // This avoids lock file conflicts for consumers with older dependencies.
-    pub const RUSTLER: &str = "~> 0.37";
+    pub const RUSTLER: &str = "~> 0.38";
 
     // renovate: datasource=hex depName=rustler_precompiled
     pub const RUSTLER_PRECOMPILED: &str = "~> 0.9";
@@ -335,70 +357,64 @@ pub mod hex {
     pub const EX_DOC: &str = "~> 0.40";
 
     // renovate: datasource=hex depName=finch
-    pub const FINCH: &str = "~> 0.18";
+    pub const FINCH: &str = "~> 0.23";
 
     // renovate: datasource=hex depName=req
-    pub const REQ: &str = "~> 0.5";
+    pub const REQ: &str = "~> 0.7";
 
     // renovate: datasource=hex depName=jason
     pub const JASON: &str = "~> 1.4";
 
-    // version range; manual bump required
+    // Gleam range constraints (`>= x and < y`) are not single auto-bumpable versions.
     pub const GLEAM_STDLIB_VERSION_RANGE: &str = ">= 0.34.0 and < 2.0.0";
 
-    // version range; manual bump required
     pub const GLEEUNIT_VERSION_RANGE: &str = ">= 1.0.0 and < 2.0.0";
 
-    // renovate: datasource=hex depName=gleam_httpc
-    // 4.x is the first to support gleam_stdlib >= 1.0.0; we accept the
-    // 4.x and 5.x lines.
     pub const GLEAM_HTTPC_VERSION_RANGE: &str = ">= 4.0.0 and < 6.0.0";
 
-    // renovate: datasource=hex depName=envoy
-    // Tiny env-var helper, used by e2e tests to read MOCK_SERVER_URL.
     pub const ENVOY_VERSION_RANGE: &str = ">= 1.0.0 and < 2.0.0";
 }
 
 /// pub.dev (Dart) ecosystem.
 pub mod pub_dev {
-    // renovate: datasource=pub depName=test
+    // renovate: datasource=dart depName=test
     pub const TEST_PACKAGE: &str = "^1.25.0";
 
-    // renovate: datasource=pub depName=lints
+    // renovate: datasource=dart depName=lints
     pub const LINTS: &str = "^6.1.0";
 
-    // renovate: datasource=pub depName=ffi
+    // renovate: datasource=dart depName=ffi
     pub const FFI_PACKAGE: &str = "^2.2.0";
 
-    // renovate: datasource=pub depName=http
+    // renovate: datasource=dart depName=http
     pub const HTTP_PACKAGE: &str = "^1.2.0";
 
-    // renovate: datasource=pub depName=freezed_annotation
+    // renovate: datasource=dart depName=crypto
+    pub const CRYPTO: &str = "^3.0.0";
+
+    // renovate: datasource=dart depName=freezed_annotation
     pub const FREEZED_ANNOTATION: &str = "^3.1.0";
 
-    // renovate: datasource=pub depName=json_annotation
+    // renovate: datasource=dart depName=json_annotation
     pub const JSON_ANNOTATION: &str = "^4.11.0";
 
-    // renovate: datasource=pub depName=freezed
+    // renovate: datasource=dart depName=freezed
     pub const FREEZED: &str = "^3.2.5";
 
-    // renovate: datasource=pub depName=build_runner
+    // renovate: datasource=dart depName=build_runner
     pub const BUILD_RUNNER: &str = "^2.15.0";
 
-    // renovate: datasource=pub depName=json_serializable
+    // renovate: datasource=dart depName=json_serializable
     pub const JSON_SERIALIZABLE: &str = "^6.13.2";
 
-    // renovate: datasource=pub depName=native_assets_cli
-    pub const NATIVE_ASSETS_CLI: &str = "^0.13.0";
+    // renovate: datasource=dart depName=native_assets_cli
+    pub const NATIVE_ASSETS_CLI: &str = "^0.18.0";
 }
 
 /// Platform / toolchain pins. None of these auto-bump; track manually.
 pub mod toolchain {
-    // minimum supported Zig; manual bump required
     pub const MIN_ZIG_VERSION: &str = "0.16.0";
 
-    // version range; manual bump required.
-    // Dart 3.11 is the scaffolded SDK floor for newly generated Dart packages.
     pub const DART_SDK_CONSTRAINT: &str = ">=3.11.0 <4.0.0";
 
     /// JVM bytecode target for the Java backend (Panama FFM, JDK 22+ required).
@@ -410,34 +426,36 @@ pub mod toolchain {
     #[deprecated(since = "0.16.4", note = "use JAVA_JVM_TARGET or KOTLIN_JVM_TARGET")]
     pub const JVM_TARGET: &str = "25";
 
-    // minimum macOS deployment target for swift-bridge bindings; manual bump required
     pub const SWIFT_MIN_MACOS: &str = "13.0";
 
-    // minimum iOS deployment target for swift-bridge bindings; manual bump required
     pub const SWIFT_MIN_IOS: &str = "16.0";
 
-    // Gradle distribution version for Android projects. Supports JDK 25/26+ when paired with
-    // AGP 9.2.0+ and Kotlin 2.4.0+. AGP 8.13 caps at Gradle 8.13, so Gradle 9.x requires AGP 9.x.
-    // renovate: datasource=gradle-releases depName=gradle
     pub const GRADLE_VERSION: &str = "9.6.0";
 
-    // Android scaffold defaults; manual bumps required.
-    // AGP 9.2.0 requires compileSdk >= 36 (minimum Android 15 / API 36).
-    // Corresponds to AGP version in template_versions::maven::ANDROID_GRADLE_PLUGIN.
     pub const ANDROID_COMPILE_SDK: &str = "36";
-    // AGP 9.x raised minimum minSdk to 24 (minimum Android 7.0 / API 24).
-    // Previous value of 21 is no longer compatible with AGP 9.2.0+.
     pub const ANDROID_MIN_SDK: &str = "24";
     pub const ANDROID_JVM_TARGET: &str = "17";
 }
 
 pub mod cran {
-    // renovate: datasource=cran depName=rextendr
+    // Manually tracked: Renovate has no CRAN datasource.
     pub const REXTENDR: &str = "0.4.2";
 }
 
 pub mod precommit {
-    // alef rev: managed by sync-versions hook, no renovate marker. Folded into
-    // the generated `alef:hash:` inputs digest (see `core::hash`).
-    pub const ALEF_REV: &str = "v0.32.6";
+    pub const ALEF_REV: &str = "v0.55.6";
+
+    /// Codegen format version — bumped only when output-affecting codegen
+    /// changes require all generated files to be re-stamped. Unlike
+    /// `ALEF_REV`, this is NOT incremented on every crate release, so
+    /// routine alef upgrades do not mass-invalidate client bindings.
+    ///
+    /// Increment when:
+    /// - the domain separator in `compute_inputs_hash` changes
+    /// - a structural codegen change means existing generated files are
+    ///   incompatible with the new generator
+    ///
+    /// Do NOT increment for dependency version bumps, style fixes, or any
+    /// change that does not affect `compute_inputs_hash` output.
+    pub const CODEGEN_FORMAT_VERSION: &str = "2";
 }

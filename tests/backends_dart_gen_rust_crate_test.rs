@@ -396,7 +396,6 @@ fn lib_rs_emits_bridge_fn_per_ir_function() {
     );
     assert!(lib.contains("pub fn greet_user"), "missing greet_user fn: {lib}");
     assert!(lib.contains("user_name: String"), "missing user_name param: {lib}");
-    // rust_path resolution: call site uses the full module path, not the bare fn name.
     assert!(
         lib.contains("demo::greet_user("),
         "should call demo::greet_user via rust_path: {lib}"
@@ -589,6 +588,39 @@ fn build_rs_is_emitted() {
     assert!(build.contains("fn main()"), "missing fn main(): {build}");
 }
 
+/// The bridge crate emitted at `packages/dart/rust/` is `<source>-dart`, so its cdylib is
+/// `lib<source>_dart.dylib`. build.rs embeds a copy of the loader prologue whose candidate
+/// filenames are baked in at generation time; passing the *source* crate name as the stem made it
+/// search for a library that is never built.
+#[test]
+fn build_rs_loader_searches_for_the_dart_bridge_cdylib_stem() {
+    let api = ApiSurface {
+        crate_name: "demo-crate".into(),
+        version: "0.1.0".into(),
+        types: vec![],
+        functions: vec![],
+        enums: vec![],
+        errors: vec![],
+        excluded_type_paths: ::std::collections::HashMap::new(),
+        excluded_trait_names: ::std::collections::HashSet::new(),
+        services: vec![],
+        handler_contracts: vec![],
+        unsupported_public_items: Vec::new(),
+    };
+
+    let files = DartBackend.generate_bindings(&api, &make_config()).unwrap();
+    let build = find_file(&files, "packages/dart/rust/build.rs").expect("build.rs not found");
+
+    assert!(
+        build.contains("'libdemo_crate_dart.dylib'"),
+        "build.rs loader must search the _dart-suffixed cdylib: {build}"
+    );
+    assert!(
+        !build.contains("'libdemo_crate.dylib'"),
+        "build.rs loader must not search the source crate stem: {build}"
+    );
+}
+
 #[test]
 fn frb_yaml_is_emitted_with_module_name() {
     let api = ApiSurface {
@@ -609,10 +641,6 @@ fn frb_yaml_is_emitted_with_module_name() {
     let yaml =
         find_file(&files, "packages/dart/rust/flutter_rust_bridge.yaml").expect("flutter_rust_bridge.yaml not found");
 
-    // FRB v2 schema: `rust_root` (crate dir) + `rust_input` (module path) + `dart_output`
-    // (output dir). The CLI requires `rust_input` — it points at the crate root because
-    // the alef-generated dart Rust crate places its entire API surface at `lib.rs`.
-    // The v1 `rust_output` key was removed and must not be emitted.
     assert!(yaml.contains("rust_root: ."), "missing rust_root: {yaml}");
     assert!(yaml.contains("rust_input: crate"), "missing rust_input: crate: {yaml}");
     assert!(
@@ -643,9 +671,7 @@ fn generate_bindings_returns_dart_file_plus_rust_crate_files() {
 
     let files = DartBackend.generate_bindings(&api, &make_config()).unwrap();
 
-    // Should have: wrapper .dart + barrel .dart + traits.dart + download_libs.dart
-    // + Cargo.toml + lib.rs + build.rs + flutter_rust_bridge.yaml = 8.
-    assert_eq!(files.len(), 8, "expected 8 generated files, got {}", files.len());
+    assert_eq!(files.len(), 9, "expected 9 generated files, got {}", files.len());
 
     let has_dart = files.iter().any(|f| {
         let p = f.path.to_string_lossy().replace('\\', "/");
@@ -658,6 +684,12 @@ fn generate_bindings_returns_dart_file_plus_rust_crate_files() {
         p.ends_with("packages/dart/bin/download_libs.dart")
     });
     assert!(has_download_script, "missing Dart native library download script");
+
+    let has_native_loader = files.iter().any(|f| {
+        let p = f.path.to_string_lossy().replace('\\', "/");
+        p.ends_with("packages/dart/lib/src/native_loader.dart")
+    });
+    assert!(has_native_loader, "missing shared native-loader helper");
 }
 
 fn make_method(name: &str, params: Vec<ParamDef>, return_type: TypeRef, is_async: bool) -> MethodDef {
@@ -767,7 +799,6 @@ fn lib_rs_emits_frb_trait_bridge_for_sync_method_trait() {
     let files = DartBackend.generate_bindings(&api, &config).unwrap();
     let lib = find_file(&files, "packages/dart/rust/src/lib.rs").expect("lib.rs not found");
 
-    // Opaque struct with DartFnFuture callback field
     assert!(lib.contains("#[frb(opaque)]"), "missing #[frb(opaque)]: {lib}");
     assert!(
         lib.contains("pub struct ValidatorDartImpl"),
@@ -779,8 +810,6 @@ fn lib_rs_emits_frb_trait_bridge_for_sync_method_trait() {
     );
     assert!(lib.contains("validate:"), "missing validate field: {lib}");
 
-    // Trait impl block is on the private callback holder; the public FRB type
-    // wraps it behind an opaque Arc so FRB does not inspect closure fields.
     assert!(
         lib.contains("impl demo_crate::Validator for ValidatorDartCallbacks"),
         "missing trait impl: {lib}"
@@ -788,13 +817,11 @@ fn lib_rs_emits_frb_trait_bridge_for_sync_method_trait() {
     assert!(lib.contains("fn validate("), "missing validate method: {lib}");
     assert!(lib.contains("block_on"), "missing block_on for async bridging: {lib}");
 
-    // Factory function
     assert!(
         lib.contains("pub fn create_validator_dart_impl("),
         "missing factory fn: {lib}"
     );
 
-    // Trait defs should NOT be emitted as mirror structs
     assert!(
         !lib.contains("#[frb(mirror(Validator))]"),
         "trait should not be emitted as mirror struct: {lib}"
@@ -811,7 +838,7 @@ fn lib_rs_emits_frb_trait_bridge_for_async_method_trait() {
             "extract_text",
             vec![make_param("data", TypeRef::Bytes)],
             TypeRef::String,
-            true, // async method
+            true,
         )],
     );
     let api = ApiSurface {
@@ -831,7 +858,6 @@ fn lib_rs_emits_frb_trait_bridge_for_async_method_trait() {
     let files = DartBackend.generate_bindings(&api, &config).unwrap();
     let lib = find_file(&files, "packages/dart/rust/src/lib.rs").expect("lib.rs not found");
 
-    // Opaque struct
     assert!(lib.contains("#[frb(opaque)]"), "missing #[frb(opaque)]: {lib}");
     assert!(
         lib.contains("pub struct OcrBackendDartImpl"),
@@ -843,14 +869,11 @@ fn lib_rs_emits_frb_trait_bridge_for_async_method_trait() {
     );
     assert!(lib.contains("extract_text:"), "missing extract_text field: {lib}");
 
-    // Factory function exists
     assert!(
         lib.contains("pub fn create_ocr_backend_dart_impl("),
         "missing factory fn: {lib}"
     );
 
-    // Trait impl uses async_trait on the private callback holder and awaits the
-    // DartFnFuture directly in async fn.
     assert!(
         lib.contains("impl demo_crate::OcrBackend for OcrBackendDartCallbacks"),
         "missing trait impl: {lib}"
@@ -985,7 +1008,6 @@ fn lib_rs_emits_register_forwarder_when_register_fn_configured() {
     let files = DartBackend.generate_bindings(&api, &config).unwrap();
     let lib = find_file(&files, "packages/dart/rust/src/lib.rs").expect("lib.rs not found");
 
-    // Register forwarder takes the FRB-bridged opaque struct and returns Result<(), String>.
     assert!(
         lib.contains("pub fn register_ocr_backend(impl_: OcrBackendDartImpl) -> Result<(), String>"),
         "missing register forwarder signature: {lib}"
@@ -1003,7 +1025,6 @@ fn lib_rs_emits_register_forwarder_when_register_fn_configured() {
         "register forwarder must register the Arc and stringify errors: {lib}"
     );
 
-    // Unregister forwarder takes the plugin name and returns Result<(), String>.
     assert!(
         lib.contains("pub fn unregister_ocr_backend(name: String) -> Result<(), String>"),
         "missing unregister forwarder signature: {lib}"
@@ -1147,7 +1168,6 @@ fn lib_rs_does_not_emit_register_forwarder_without_register_fn() {
         handler_contracts: vec![],
         unsupported_public_items: Vec::new(),
     };
-    // make_config_with_bridge() leaves register_fn = None.
     let config = make_config_with_bridge("Validator");
     let files = DartBackend.generate_bindings(&api, &config).unwrap();
     let lib = find_file(&files, "packages/dart/rust/src/lib.rs").expect("lib.rs not found");
@@ -1266,7 +1286,6 @@ fn lib_rs_emits_clear_forwarder_when_clear_fn_configured() {
     let files = DartBackend.generate_bindings(&api, &config).unwrap();
     let lib = find_file(&files, "packages/dart/rust/src/lib.rs").expect("lib.rs not found");
 
-    // Clear forwarder takes no args and returns Result<(), String>.
     assert!(
         lib.contains("pub fn clear_ocr_backends() -> Result<(), String>"),
         "missing clear forwarder signature: {lib}"
@@ -1383,8 +1402,6 @@ fn cargo_toml_license_defaults_to_mit_when_scaffold_absent() {
 
 #[test]
 fn cargo_toml_does_not_include_anyhow_without_trait_bridges() {
-    // Regression: anyhow was hardcoded in extra_deps even when no trait bridges are
-    // configured, causing cargo-machete to fail on the generated Dart binding crate.
     let api = ApiSurface {
         crate_name: "demo-crate".into(),
         version: "0.1.0".into(),
@@ -1410,9 +1427,6 @@ fn cargo_toml_does_not_include_anyhow_without_trait_bridges() {
 
 #[test]
 fn cargo_toml_does_not_include_anyhow_with_trait_bridges() {
-    // Regression: anyhow was included in extra_deps alongside tokio and async-trait when
-    // trait bridges are configured, but lib.rs never imports or uses anyhow — the bridge
-    // impl uses source_crate::Result directly. cargo-machete fails on this unused dep.
     let trait_def = make_trait(
         "OcrBackend",
         "demo_crate::OcrBackend",
@@ -1444,7 +1458,6 @@ fn cargo_toml_does_not_include_anyhow_with_trait_bridges() {
         !cargo.contains("anyhow"),
         "Cargo.toml must not list anyhow even with trait bridges (lib.rs never uses it); got:\n{cargo}"
     );
-    // tokio and async-trait ARE legitimately used by trait bridges
     assert!(
         cargo.contains("tokio"),
         "Cargo.toml must list tokio for trait bridges: {cargo}"
@@ -1556,12 +1569,10 @@ stub_methods = ["process_bytes_batch"]
     let files = DartBackend.generate_bindings(&api, &config).unwrap();
     let lib = find_file(&files, "packages/dart/rust/src/lib.rs").expect("lib.rs not found");
 
-    // The stub function must still be present with its signature.
     assert!(
         lib.contains("pub fn process_bytes_batch"),
         "stub fn must still be emitted: {lib}"
     );
-    // The body must be unimplemented!(), not a real call.
     assert!(
         lib.contains("unimplemented!"),
         "stub fn body must contain unimplemented!(): {lib}"
@@ -1571,7 +1582,6 @@ stub_methods = ["process_bytes_batch"]
         "stub fn must NOT call the core fn: {lib}"
     );
 
-    // Non-stub functions must not be affected.
     assert!(lib.contains("pub fn greet"), "non-stub fn must still be emitted: {lib}");
     assert!(lib.contains("demo::greet("), "non-stub fn must call core fn: {lib}");
 }
@@ -1612,13 +1622,10 @@ fn opaque_method_named_param_with_is_ref_passes_by_reference() {
     let files = DartBackend.generate_bindings(&api, &make_config()).unwrap();
     let lib = find_file(&files, "packages/dart/rust/src/lib.rs").expect("lib.rs not found");
 
-    // The generated call must borrow the converted config (transmute via &ref, not by value).
-    // ProcessConfig has no sanitized fields, so the transmute path is taken.
     assert!(
         lib.contains("transmute::<&ProcessConfig, &demo_crate::ProcessConfig>(&config)"),
         "is_ref Named param must be passed by reference (transmute &ref) to the core call: {lib}"
     );
-    // Must not pass the owned value directly when is_ref is set.
     assert!(
         !lib.contains("transmute::<ProcessConfig, demo_crate::ProcessConfig>(config)"),
         "is_ref Named param must NOT be passed by owned transmute: {lib}"
@@ -1635,8 +1642,6 @@ fn opaque_method_named_param_with_is_ref_passes_by_reference() {
 /// converting from the dart mirror struct to the core struct.
 #[test]
 fn sanitized_string_cow_field_roundtrips_in_from_mirror_to_core_impl() {
-    // Build a struct that mimics ProcessConfig: `language: Cow<'static, str>` was
-    // extracted as TypeRef::String with sanitized=true and core_wrapper=Cow.
     let mut language_field = make_field("language", TypeRef::String, false);
     language_field.sanitized = true;
     language_field.core_wrapper = CoreWrapper::Cow;
@@ -1667,7 +1672,6 @@ fn sanitized_string_cow_field_roundtrips_in_from_mirror_to_core_impl() {
         version: Default::default(),
     };
 
-    // A free function that takes ProcessConfig as input forces a From<Mirror> for Core impl.
     let process_fn = FunctionDef {
         name: "process".to_string(),
         params: vec![make_param("config", TypeRef::Named("ProcessConfig".to_string()))],
@@ -1705,7 +1709,6 @@ fn sanitized_string_cow_field_roundtrips_in_from_mirror_to_core_impl() {
     let files = DartBackend.generate_bindings(&api, &make_config()).unwrap();
     let lib = find_file(&files, "packages/dart/rust/src/lib.rs").expect("lib.rs not found");
 
-    // Must emit v.language.into() — not Default::default() — in the From impl body.
     assert!(
         lib.contains("language: v.language.into()"),
         "sanitized String+Cow field must emit v.language.into() in From<Mirror> for Core, got:\n{lib}"
@@ -1745,12 +1748,10 @@ fn opaque_method_vec_string_param_with_is_ref_bridges_to_str_slice() {
     let files = DartBackend.generate_bindings(&api, &make_config()).unwrap();
     let lib = find_file(&files, "packages/dart/rust/src/lib.rs").expect("lib.rs not found");
 
-    // Vec<String> must be converted to an iterator of &str slices for the core call.
     assert!(
         lib.contains("names.iter().map(|s| s.as_str()).collect::<Vec<_>>()"),
         "is_ref Vec<String> param must be bridged to &[&str] via iter().map(as_str).collect: {lib}"
     );
-    // Must not pass the raw Vec<String> directly.
     assert!(
         !lib.contains("ensure_languages(names)"),
         "is_ref Vec<String> param must not be passed as raw Vec<String>: {lib}"
@@ -1885,8 +1886,6 @@ fn sanitized_string_non_cow_field_falls_back_to_default_in_from_mirror_to_core_i
     );
 }
 
-// ── rustdoc emission on FRB mirror types (so FRB propagates docs to Dart) ────
-
 fn make_field_with_doc(name: &str, ty: TypeRef, optional: bool, doc: &str) -> FieldDef {
     let mut f = make_field(name, ty, optional);
     f.doc = doc.to_string();
@@ -1978,7 +1977,6 @@ fn mirror_struct_without_rustdoc_omits_doc_comments() {
     let files = DartBackend.generate_bindings(&api, &make_config()).unwrap();
     let lib = find_file(&files, "packages/dart/rust/src/lib.rs").expect("lib.rs not found");
 
-    // No rustdoc anywhere on the mirror declaration or its only field.
     let mirror_start = lib.find("#[frb(mirror(Plain))]").expect("mirror attr missing");
     let mirror_end = lib[mirror_start..].find('}').unwrap() + mirror_start;
     let mirror_block = &lib[mirror_start..mirror_end];
@@ -2160,12 +2158,6 @@ fn mirror_multi_line_rustdoc_emits_one_triple_slash_per_line() {
 
 #[test]
 fn mirror_error_introspection_uses_safe_from_conversion_not_transmute() {
-    // Verify that when an error type has whitelisted introspection methods, the
-    // generated lib.rs contains a safe `From<&ErrorName> for core::ErrorName` impl
-    // and that the introspection method body uses `self.into()` rather than an
-    // unsafe raw-pointer cast. This guards against the unsoundness introduced by
-    // directly casting &MirrorEnum to &RealEnum when the mirror uses i64 for fields
-    // that are u16 in the real type.
     let error = ErrorDef {
         name: "AppError".to_string(),
         rust_path: "demo_crate::error::AppError".to_string(),
@@ -2237,22 +2229,18 @@ fn mirror_error_introspection_uses_safe_from_conversion_not_transmute() {
     let files = DartBackend.generate_bindings(&api, &make_config()).unwrap();
     let lib = find_file(&files, "packages/dart/rust/src/lib.rs").expect("lib.rs not found");
 
-    // Safe From impl must be present.
     assert!(
         lib.contains("impl From<&AppError> for demo_crate::error::AppError"),
         "safe From<&MirrorEnum> impl must be emitted for error types with methods: {lib}"
     );
-    // The introspection method must use the safe into() conversion.
     assert!(
         lib.contains("let real: demo_crate::error::AppError = self.into();"),
         "introspection method must use safe self.into() conversion: {lib}"
     );
-    // No unsafe raw-pointer cast must appear.
     assert!(
         !lib.contains("as *const Self as *const"),
         "unsafe raw-pointer transmute must NOT appear in mirror error impl: {lib}"
     );
-    // The u16 field must be cast correctly in the From impl.
     assert!(
         lib.contains("status: *f_status as u16"),
         "u16 field must be cast from i64 with `as u16` in From impl: {lib}"
@@ -2261,12 +2249,6 @@ fn mirror_error_introspection_uses_safe_from_conversion_not_transmute() {
 
 #[test]
 fn mirror_error_from_impl_handles_optional_string_duration_and_sanitized_fields() {
-    // Verifies three edge cases in the From<&Mirror> impl:
-    // 1. Optional String field → wrapped with Some(f_x.clone()) since the mirror
-    //    uses bare String (frb_rust_type_inner ignores optional).
-    // 2. Optional Duration field → wrapped with Some(Duration::from_millis(*f_x as u64))
-    //    since the mirror collapses Duration to i64.
-    // 3. Sanitized field → variant is skipped with a wildcard/unreachable arm.
     use alef::core::ir::CoreWrapper;
     let make_error_field = |name: &str, ty: TypeRef, optional: bool, sanitized: bool| FieldDef {
         name: name.to_string(),
@@ -2314,13 +2296,12 @@ fn mirror_error_from_impl_handles_optional_string_duration_and_sanitized_fields(
         rust_path: "demo_crate::ApiErr".to_string(),
         original_rust_path: String::new(),
         variants: vec![
-            // Variant with optional String field.
             ErrorVariant {
                 name: "Budget".to_string(),
                 message_template: None,
                 fields: vec![
                     make_error_field("message", TypeRef::String, false, false),
-                    make_error_field("model", TypeRef::String, true, false), // optional String
+                    make_error_field("model", TypeRef::String, true, false),
                 ],
                 has_source: false,
                 has_from: false,
@@ -2328,13 +2309,12 @@ fn mirror_error_from_impl_handles_optional_string_duration_and_sanitized_fields(
                 is_tuple: false,
                 doc: String::new(),
             },
-            // Variant with optional Duration field.
             ErrorVariant {
                 name: "RateLimit".to_string(),
                 message_template: None,
                 fields: vec![
                     make_error_field("message", TypeRef::String, false, false),
-                    make_error_field("retry_after", TypeRef::Duration, true, false), // optional Duration
+                    make_error_field("retry_after", TypeRef::Duration, true, false),
                 ],
                 has_source: false,
                 has_from: false,
@@ -2342,13 +2322,10 @@ fn mirror_error_from_impl_handles_optional_string_duration_and_sanitized_fields(
                 is_tuple: false,
                 doc: String::new(),
             },
-            // Variant with sanitized field — must be skipped.
             ErrorVariant {
                 name: "Serialization".to_string(),
                 message_template: None,
-                fields: vec![
-                    make_error_field("field0", TypeRef::String, false, true), // sanitized
-                ],
+                fields: vec![make_error_field("field0", TypeRef::String, false, true)],
                 has_source: true,
                 has_from: true,
                 is_unit: false,
@@ -2380,17 +2357,14 @@ fn mirror_error_from_impl_handles_optional_string_duration_and_sanitized_fields(
     let files = DartBackend.generate_bindings(&api, &make_config()).unwrap();
     let lib = find_file(&files, "packages/dart/rust/src/lib.rs").expect("lib.rs not found");
 
-    // Optional String must be wrapped with Some.
     assert!(
         lib.contains("model: Some(f_model.clone())"),
         "optional String field must be wrapped with Some(...) in From impl: {lib}"
     );
-    // Optional Duration must be converted and wrapped with Some.
     assert!(
         lib.contains("retry_after: Some(std::time::Duration::from_millis(*f_retry_after as u64))"),
         "optional Duration field must become Some(Duration::from_millis(...)) in From impl: {lib}"
     );
-    // Sanitized variant must be absent from match arms, replaced by unreachable wildcard.
     assert!(
         lib.contains("unreachable!"),
         "sanitized variant must produce unreachable wildcard arm in From impl: {lib}"
@@ -2410,7 +2384,6 @@ fn mirror_error_from_impl_handles_optional_string_duration_and_sanitized_fields(
 /// E0559 "variant `X` has no field named `field0`" when the core variant is a tuple.
 #[test]
 fn mirror_error_from_impl_uses_tuple_syntax_for_tuple_variants() {
-    // Tuple-variant fields have positional names "_0", "_1" (as set by the extractor).
     let make_positional_field = |idx: usize, ty: TypeRef| FieldDef {
         name: format!("_{idx}"),
         ty,
@@ -2432,7 +2405,6 @@ fn mirror_error_from_impl_uses_tuple_syntax_for_tuple_variants() {
         original_type: None,
     };
 
-    // A named-field variant to verify struct syntax is still used for those.
     let make_named_field = |name: &str, ty: TypeRef| FieldDef {
         name: name.to_string(),
         ty,
@@ -2459,7 +2431,6 @@ fn mirror_error_from_impl_uses_tuple_syntax_for_tuple_variants() {
         rust_path: "demo_crate::GraphQLError".to_string(),
         original_rust_path: String::new(),
         variants: vec![
-            // Tuple variant with one String field: GraphQLError::ExecutionError(String)
             ErrorVariant {
                 name: "ExecutionError".to_string(),
                 message_template: None,
@@ -2470,7 +2441,6 @@ fn mirror_error_from_impl_uses_tuple_syntax_for_tuple_variants() {
                 is_tuple: false,
                 doc: String::new(),
             },
-            // Tuple variant with two fields: GraphQLError::NetworkError(String, i64)
             ErrorVariant {
                 name: "NetworkError".to_string(),
                 message_template: None,
@@ -2484,7 +2454,6 @@ fn mirror_error_from_impl_uses_tuple_syntax_for_tuple_variants() {
                 is_tuple: false,
                 doc: String::new(),
             },
-            // Struct variant with named fields: must still use struct syntax.
             ErrorVariant {
                 name: "SchemaError".to_string(),
                 message_template: None,
@@ -2495,7 +2464,6 @@ fn mirror_error_from_impl_uses_tuple_syntax_for_tuple_variants() {
                 is_tuple: false,
                 doc: String::new(),
             },
-            // Unit variant: must stay simple.
             ErrorVariant {
                 name: "Unknown".to_string(),
                 message_template: None,
@@ -2508,9 +2476,6 @@ fn mirror_error_from_impl_uses_tuple_syntax_for_tuple_variants() {
             },
         ],
         doc: String::new(),
-        // The From<&Mirror> for Core impl is only emitted alongside introspection
-        // methods (it's the conversion used by `let real: Core = self.into();`).
-        // Include a stub method so the From impl is exercised.
         methods: vec![MethodDef {
             name: "kind".to_string(),
             params: vec![],
@@ -2552,8 +2517,6 @@ fn mirror_error_from_impl_uses_tuple_syntax_for_tuple_variants() {
     let files = DartBackend.generate_bindings(&api, &make_config()).unwrap();
     let lib = find_file(&files, "packages/dart/rust/src/lib.rs").expect("lib.rs not found");
 
-    // Tuple variants: mirror pattern uses struct syntax { field0: … } (FRB requirement),
-    // but the core constructor must use positional tuple syntax Self::Variant(expr).
     assert!(
         lib.contains("GraphQLError::ExecutionError { field0: f_field0 }"),
         "tuple variant pattern must still use mirror struct syntax {{field0: …}}: {lib}"
@@ -2567,7 +2530,6 @@ fn mirror_error_from_impl_uses_tuple_syntax_for_tuple_variants() {
         "tuple variant constructor must NOT use struct syntax Self::ExecutionError {{ field0: … }}: {lib}"
     );
 
-    // Two-field tuple variant: both positional args must appear.
     assert!(
         lib.contains("GraphQLError::NetworkError { field0: f_field0, field1: f_field1 }"),
         "two-field tuple variant pattern must use struct syntax: {lib}"
@@ -2577,9 +2539,6 @@ fn mirror_error_from_impl_uses_tuple_syntax_for_tuple_variants() {
         "two-field tuple variant constructor must use positional tuple syntax: {lib}"
     );
 
-    // Named-field struct variant must still use struct syntax.
-    // The emitter writes struct variants over multiple lines, so match the opener
-    // and the field-init line independently.
     assert!(
         lib.contains("Self::SchemaError {"),
         "named-field struct variant constructor must still use struct syntax: {lib}"
@@ -2589,7 +2548,6 @@ fn mirror_error_from_impl_uses_tuple_syntax_for_tuple_variants() {
         "named-field struct variant must initialize `message` from the bound pattern: {lib}"
     );
 
-    // Unit variant must remain unchanged.
     assert!(
         lib.contains("GraphQLError::Unknown => Self::Unknown"),
         "unit variant arm must be unchanged: {lib}"
@@ -2604,8 +2562,6 @@ fn mirror_error_from_impl_uses_tuple_syntax_for_tuple_variants() {
 /// v0.18.2 introduced the same fix for the Java backend but left the Dart backend broken.
 #[test]
 fn sanitized_vec_vec_string_enum_field_uses_tuple_pair_conversion() {
-    // Build an enum that mimics NodeContent::MetadataBlock { entries: Vec<(String, String)> }
-    // as seen by alef after sanitization: ty = Vec<Vec<String>>, sanitized = true.
     let mut entries_field = make_field(
         "entries",
         TypeRef::Vec(Box::new(TypeRef::Vec(Box::new(TypeRef::String)))),
@@ -2709,7 +2665,6 @@ fn opaque_wrapper_cfg_widens_to_include_android_x86_64() {
         "opaque wrapper cfg must drop the android-x86_64 exclusion so the wrapper \
          exists on that triple (core provides a stub there), got:\n{lib}"
     );
-    // The remaining cfg gates (feature + wasm32) must be preserved unchanged.
     assert!(
         lib.contains(r#"#[cfg(all(feature = "ner-llm", not(target_arch = "wasm32")))]"#),
         "widened wrapper cfg must keep the feature and wasm32 gates, got:\n{lib}"

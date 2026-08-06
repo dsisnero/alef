@@ -29,9 +29,6 @@ pub fn to_r_version(version: &str) -> String {
         return version.to_string();
     };
 
-    // For rc (release candidate) prereleases, encode the RC number as an offset
-    // from 9000 so that ordering is preserved within a series (rc.1 → 9001, rc.15 → 9015).
-    // All other prerelease identifiers (alpha, beta, dev, …) map to the base value 9000.
     let numeric_offset: u32 = if pre.starts_with("rc") {
         pre.split('.')
             .filter_map(|part| part.parse::<u32>().ok())
@@ -116,14 +113,33 @@ pub fn to_rubygems_prerelease(version: &str) -> String {
 /// ```
 pub fn to_dotnet_assembly_version(version: &str) -> String {
     let base = version.split_once('-').map_or(version, |(b, _)| b);
-    // Defensive: if the base lacks any of the MAJOR.MINOR.PATCH components,
-    // pad with zeros so the result is always 4-component numeric.
     let mut parts: Vec<&str> = base.split('.').collect();
     while parts.len() < 3 {
         parts.push("0");
     }
     parts.truncate(3);
     format!("{}.0", parts.join("."))
+}
+
+/// Convert a semver version string to a Go identifier suffix, for use in
+/// version-skew sentinel constants such as `RequireNativeSetup_<ident>`.
+///
+/// Every byte that isn't an ASCII letter or digit becomes `_`. The result is
+/// not itself a valid Go identifier (it may start with a digit), but it is
+/// valid when appended to a letter-leading prefix.
+///
+/// # Examples
+///
+/// ```
+/// use alef::core::version::to_go_version_ident;
+/// assert_eq!(to_go_version_ident("1.0.0"), "1_0_0");
+/// assert_eq!(to_go_version_ident("1.0.0-rc.38"), "1_0_0_rc_38");
+/// ```
+pub fn to_go_version_ident(version: &str) -> String {
+    version
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect()
 }
 
 #[cfg(test)]
@@ -152,8 +168,6 @@ mod tests {
         assert_eq!(to_rubygems_prerelease("1.0.0-pre-rc-2"), "1.0.0.pre.pre.rc.2");
     }
 
-    // --- to_r_version tests ---
-
     #[test]
     fn r_release_version_is_unchanged() {
         assert_eq!(to_r_version("1.8.0"), "1.8.0");
@@ -178,8 +192,6 @@ mod tests {
         assert_eq!(to_r_version("0.1.0-alpha.2"), "0.1.0.9000");
     }
 
-    // --- to_pep440 tests ---
-
     #[test]
     fn pep440_release_version_is_unchanged() {
         assert_eq!(to_pep440("1.2.3"), "1.2.3");
@@ -199,8 +211,6 @@ mod tests {
         assert_eq!(to_pep440("1.0.0-beta.3"), "1.0.0b3");
     }
 
-    // --- to_dotnet_assembly_version tests ---
-
     #[test]
     fn dotnet_release_version_pads_to_four_components() {
         assert_eq!(to_dotnet_assembly_version("1.9.0"), "1.9.0.0");
@@ -209,7 +219,6 @@ mod tests {
 
     #[test]
     fn dotnet_strips_prerelease_suffix() {
-        // tslp rc.48 was the symptom that exposed the missing AssemblyVersion stamp.
         assert_eq!(to_dotnet_assembly_version("1.9.0-rc.48"), "1.9.0.0");
         assert_eq!(to_dotnet_assembly_version("0.1.0-alpha.2"), "0.1.0.0");
         assert_eq!(to_dotnet_assembly_version("0.1.0-beta.3"), "0.1.0.0");
@@ -217,8 +226,19 @@ mod tests {
 
     #[test]
     fn dotnet_short_versions_pad_zero_components() {
-        // Defensive: never emit a value that breaks csc's MAJOR.MINOR.PATCH.REVISION parser.
         assert_eq!(to_dotnet_assembly_version("1"), "1.0.0.0");
         assert_eq!(to_dotnet_assembly_version("1.2"), "1.2.0.0");
+    }
+
+    #[test]
+    fn go_version_ident_replaces_dots_and_dashes() {
+        assert_eq!(to_go_version_ident("1.0.0"), "1_0_0");
+        assert_eq!(to_go_version_ident("1.0.0-rc.38"), "1_0_0_rc_38");
+    }
+
+    #[test]
+    fn go_version_ident_keeps_alphanumerics_untouched() {
+        assert_eq!(to_go_version_ident("0"), "0");
+        assert_eq!(to_go_version_ident("v1"), "v1");
     }
 }

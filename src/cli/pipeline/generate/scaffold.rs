@@ -97,10 +97,6 @@ pub fn write_scaffold_files_with_overwrite(
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create directory {}", parent.display()))?;
         }
-        // Binary file path: same as in `write_files`. Without this branch the
-        // scaffold writer writes the base64 STRING into the .jar file, so
-        // every `task <lang>:smoke` invocation hits "ClassNotFoundException:
-        // GradleWrapperMain" because the jar isn't a real zip archive.
         let is_jar_file = full_path.extension().is_some_and(|ext| ext == "jar");
         if is_jar_file {
             let binary_content = base64::engine::general_purpose::STANDARD
@@ -119,18 +115,6 @@ pub fn write_scaffold_files_with_overwrite(
             continue;
         }
         let normalized = normalize_content(&full_path, &file.content);
-        // Skip the write when on-disk bytes already match the normalized output.
-        // `std::fs::write` is unconditional truncate+write, which updates mtime
-        // even for identical content; pre-commit/prek hooks then report the file
-        // as "modified by this hook" and fail the run, breaking the
-        // alef-sync-versions hook for downstream repos on every commit.
-        //
-        // The on-disk file may carry an `alef:hash:` line injected by
-        // `finalize_hashes` after the original write, while the freshly
-        // generated `normalized` does not — so strip the hash line from both
-        // before comparing. `finalize_hashes` runs after this function and
-        // re-injects the hash idempotently, so skipping the rewrite here does
-        // not lose information.
         if let Ok(existing) = std::fs::read_to_string(&full_path) {
             let existing_body = crate::core::hash::strip_hash_line(&existing);
             let normalized_body = crate::core::hash::strip_hash_line(&normalized);
@@ -145,6 +129,27 @@ pub fn write_scaffold_files_with_overwrite(
         apply_shebang_chmod(&full_path, &normalized)?;
         count += 1;
         debug!("  wrote: {}", full_path.display());
+        if file.path == Path::new(POLY_CONFIG) {
+            normalize_poly_config(&full_path, base_dir);
+        }
     }
     Ok(count)
+}
+
+/// Repo-root poly config, emitted by the scaffold pass.
+const POLY_CONFIG: &str = "poly.toml";
+
+/// Hand `poly.toml` to poly immediately after writing it.
+///
+/// poly defines the canonical TOML form and the scaffold emits the file from a
+/// hand-rolled string template that does not match it, so the file is rewritten on
+/// every run and, left raw, fails the consumer's own `poly fmt --check`. The
+/// full-regen convergence pass normally repairs it, but that runs many fallible
+/// stages later (post-build, stubs, readme, e2e, docs) — an abort in any of them
+/// leaves the raw file behind — and the partial-regen paths never pass the repo
+/// root to poly at all. Formatting it here closes both gaps for the cost of one
+/// single-file invocation. Best-effort: `poly_format` warns and returns when poly
+/// is not on PATH.
+fn normalize_poly_config(full_path: &Path, base_dir: &Path) {
+    crate::cli::pipeline::poly_format(std::slice::from_ref(&full_path.to_path_buf()), base_dir);
 }

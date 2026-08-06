@@ -18,7 +18,6 @@ fn test_generate_docs_empty_api() {
     let config = make_test_config();
 
     let files = generate_docs(&api, &config, &[Language::Python], "docs").unwrap();
-    // 1 lang + configuration.md + types.md + errors.md
     assert_eq!(files.len(), 4);
     let lang_file = files
         .iter()
@@ -79,7 +78,6 @@ fn test_generate_docs_produces_one_file_per_language_plus_three_shared() {
     let api = make_minimal_api("1.2.3");
     let config = make_test_config();
     let files = generate_docs(&api, &config, &[Language::Python, Language::Node], "out").unwrap();
-    // 2 language files + configuration.md + types.md + errors.md
     assert_eq!(files.len(), 5);
     let paths: Vec<&str> = files.iter().map(|f| f.path.to_str().unwrap()).collect();
     assert!(paths.iter().any(|p| p.contains("api-python")));
@@ -130,7 +128,6 @@ fn test_generate_docs_multiple_languages_produce_correct_slugs() {
     ];
     let expected_slugs = ["api-python", "api-typescript", "api-go", "api-java", "api-ruby"];
     let files = generate_docs(&api, &config, &langs, "docs/api").unwrap();
-    // 5 lang files + 3 shared
     assert_eq!(files.len(), 8);
     for slug in &expected_slugs {
         assert!(
@@ -396,4 +393,53 @@ fn doc_content<'a>(files: &'a [crate::core::backend::GeneratedFile], slug: &str)
         })
         .map(|file| file.content.as_str())
         .unwrap_or_else(|| panic!("missing generated doc file for {slug}"))
+}
+
+/// Regression test for a real generated-doc defect: an authored `# Example` whose source
+/// fence is bare (rustdoc's implicit-Rust convention, as `html-to-markdown`'s `convert()`
+/// doc comment uses) must render with a bare closing fence in `api-rust.md`, not a closing
+/// fence that re-carries the `rust` language tag — which reopens a block instead of closing
+/// it and corrupts every line of Markdown that follows in the rendered page.
+#[test]
+fn test_generate_docs_rust_authored_example_closes_fence_bare() {
+    let mut api = make_minimal_api("1.0.0");
+    let mut convert = make_function(
+        "convert",
+        vec![make_param("html", TypeRef::String, false)],
+        TypeRef::Named("ConversionResult".to_string()),
+        false,
+        Some("ConversionError"),
+    );
+    convert.doc = concat!(
+        "Convert HTML to Markdown.\n\n",
+        "# Example\n\n",
+        "```\n",
+        "use html_to_markdown_rs::{convert, ConversionOptions};\n",
+        "let result = convert(\"<h1>Hi</h1>\", ConversionOptions::default()).unwrap();\n",
+        "```",
+    )
+    .to_string();
+    api.functions = vec![convert];
+    api.types = vec![empty_type("ConversionResult")];
+    let config = make_test_config();
+
+    let files = generate_docs(&api, &config, &[Language::Rust], "docs").unwrap();
+    let content = doc_content(&files, "api-rust");
+
+    // The signature block also renders a ` ```rust ` fence, so scope the check to the
+    // fence pair that immediately follows the `**Example:**` heading.
+    let example_start = content
+        .find("**Example:**")
+        .expect("expected an Example section in the generated doc");
+    let example_fence_lines: Vec<&str> = content[example_start..]
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("```"))
+        .take(2)
+        .collect();
+    assert_eq!(
+        example_fence_lines,
+        vec!["```rust", "```"],
+        "the example's closing fence must be bare, not re-tagged with the language"
+    );
 }

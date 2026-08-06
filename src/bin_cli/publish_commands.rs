@@ -27,13 +27,13 @@ pub(crate) fn handle(command: Commands, context: &DispatchContext) -> Result<Opt
                     for resolved_cfg in &crates_to_process {
                         let languages = resolve_languages(resolved_cfg, lang.as_deref())?;
                         if multi {
-                            eprintln!(
+                            tracing::info!(
                                 "[{}] Preparing publish for: {}",
                                 resolved_cfg.name,
                                 format_languages(&languages)
                             );
                         } else {
-                            eprintln!("Preparing publish for: {}", format_languages(&languages));
+                            tracing::info!("Preparing publish for: {}", format_languages(&languages));
                         }
                         crate::publish::prepare(
                             resolved_cfg,
@@ -43,7 +43,7 @@ pub(crate) fn handle(command: Commands, context: &DispatchContext) -> Result<Opt
                             require_registry,
                         )?;
                     }
-                    println!("Prepare complete");
+                    tracing::info!("Prepare complete");
                     Ok(None)
                 }
                 PublishAction::Build {
@@ -58,17 +58,17 @@ pub(crate) fn handle(command: Commands, context: &DispatchContext) -> Result<Opt
                     for resolved_cfg in &crates_to_process {
                         let languages = resolve_languages(resolved_cfg, lang.as_deref())?;
                         if multi {
-                            eprintln!(
+                            tracing::info!(
                                 "[{}] Building publish artifacts for: {}",
                                 resolved_cfg.name,
                                 format_languages(&languages)
                             );
                         } else {
-                            eprintln!("Building publish artifacts for: {}", format_languages(&languages));
+                            tracing::info!("Building publish artifacts for: {}", format_languages(&languages));
                         }
                         crate::publish::build(resolved_cfg, &languages, rust_target.as_ref(), use_cross)?;
                     }
-                    println!("Build complete");
+                    tracing::info!("Build complete");
                     Ok(None)
                 }
                 PublishAction::Package {
@@ -94,14 +94,12 @@ pub(crate) fn handle(command: Commands, context: &DispatchContext) -> Result<Opt
                             .or_else(|| resolved_cfg.resolved_version())
                             .context("could not determine version — set --version or version_from in alef.toml")?;
 
-                        // Build PHP-specific options when any PHP language is in the list.
                         let needs_php = languages.contains(&crate::core::config::Language::Php);
                         let pie_opts: Option<crate::publish::package::php::PiePackageOptions<'_>> = if needs_php {
                             let php_ver = php_version
                                 .as_deref()
                                 .context("--php-version is required when packaging --lang php")?;
                             let ts_mode = crate::publish::package::php::TsMode::parse(&php_ts)?;
-                            // Validate: Windows target requires --windows-compiler.
                             if let Some(ref rt) = rust_target {
                                 if rt.os == crate::publish::platform::Os::Windows && windows_compiler.is_none() {
                                     anyhow::bail!(
@@ -123,14 +121,14 @@ pub(crate) fn handle(command: Commands, context: &DispatchContext) -> Result<Opt
                         let pkg_options = crate::publish::PackageOptions { php: pie_opts };
 
                         if multi {
-                            eprintln!(
+                            tracing::info!(
                                 "[{}] Packaging {} (v{ver}) for: {}",
                                 resolved_cfg.name,
                                 output_dir.display(),
                                 format_languages(&languages)
                             );
                         } else {
-                            eprintln!(
+                            tracing::info!(
                                 "Packaging {} (v{ver}) for: {}",
                                 output_dir.display(),
                                 format_languages(&languages)
@@ -146,7 +144,7 @@ pub(crate) fn handle(command: Commands, context: &DispatchContext) -> Result<Opt
                             &pkg_options,
                         )?;
                     }
-                    println!("Package complete");
+                    tracing::info!("Package complete");
                     Ok(None)
                 }
                 PublishAction::Validate => {
@@ -157,11 +155,11 @@ pub(crate) fn handle(command: Commands, context: &DispatchContext) -> Result<Opt
                         all_issues.extend(issues);
                     }
                     if all_issues.is_empty() {
-                        println!("All package manifests are consistent");
+                        crate::bin_cli::output::line("All package manifests are consistent");
                     } else {
-                        eprintln!("Validation issues:");
+                        crate::bin_cli::output::line("Validation issues:");
                         for issue in &all_issues {
-                            eprintln!("  - {issue}");
+                            crate::bin_cli::output::line(format_args!("  - {issue}"));
                         }
                         anyhow::bail!("{} validation issue(s) found", all_issues.len());
                     }

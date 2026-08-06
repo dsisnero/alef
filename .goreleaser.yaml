@@ -1,5 +1,3 @@
-# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
-
 version: 2
 
 before:
@@ -39,7 +37,7 @@ changelog:
 brews:
   - name: alef
     repository:
-      owner: kreuzberg-dev
+      owner: xberg-io
       name: homebrew-tap
       token: "{{ .Env.HOMEBREW_TOKEN }}"
     directory: Formula

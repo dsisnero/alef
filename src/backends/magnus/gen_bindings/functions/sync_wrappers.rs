@@ -3,6 +3,7 @@ use super::scan_args_defaults::{
 };
 use super::serde_bindings::{
     magnus_ahash_pre_call_bindings, magnus_call_args_with_ahash, magnus_serde_let_bindings, magnus_serde_recoverable,
+    params_need_fallible_deser,
 };
 use crate::backends::magnus::type_map::MagnusMapper;
 use crate::codegen::generators;
@@ -23,8 +24,6 @@ pub(in crate::backends::magnus::gen_bindings) fn gen_function(
     let is_default_config_func = last_param_is_default_struct(func, api);
     let variadic = needs_variadic_arity(&func.params) || is_default_config_func;
 
-    // For non-opaque Named params, accept magnus::Value so a plain Ruby Hash works directly.
-    // The binding calls to_json internally before serde_json deserialization.
     let params = if variadic {
         "args: &[magnus::Value]".to_string()
     } else {
@@ -38,31 +37,27 @@ pub(in crate::backends::magnus::gen_bindings) fn gen_function(
         })
     };
     let return_type = mapper.map_type(&func.return_type);
-    // Async functions always return Result because Runtime::new() can fail.
-    // Variadic functions must return Result because scan_args uses ? operator.
-    let has_error = func.error_type.is_some() || func.is_async || variadic;
+    let force_result_for_deser = !variadic
+        && func.error_type.is_none()
+        && !func.is_async
+        && params_need_fallible_deser(&func.params, opaque_types);
+    let has_error = func.error_type.is_some() || func.is_async || variadic || force_result_for_deser;
     let return_annotation = mapper.wrap_return(&return_type, has_error);
 
     let can_delegate = crate::codegen::shared::can_auto_delegate_function(func, opaque_types);
-    let serde_recoverable = !can_delegate && magnus_serde_recoverable(func, opaque_types);
+    let serde_recoverable = !can_delegate
+        && magnus_serde_recoverable(
+            func,
+            opaque_types,
+            func.error_type.is_some() || func.is_async || force_result_for_deser,
+        );
 
-    // Check if any param is a Vec<Named> that will need `{name}_core` rebinding.
     let needs_vec_named_let_binding = func.params.iter().any(|p| match &p.ty {
         TypeRef::Vec(inner) => matches!(inner.as_ref(), TypeRef::Named(name) if !opaque_types.contains(name.as_str())),
         _ => false,
     });
 
-    // Generate serde_magnus deserialization preamble for non-opaque Named params.
-    // Two emission modes:
-    //   - delegate path: rebind {name} to the binding type so the existing call_args gen works.
-    //   - serde-recovery path: emit `{name}_core: core::Type` so gen_call_args_with_let_bindings
-    //     can pass `&{name}_core` to the core function.
     let mut deser_lines = Vec::new();
-    // When a Vec<Named> param forces the `_core` call-arg path (gen_call_args_with_let_bindings_*),
-    // every Named param in the call is referenced as `{name}_core`. The serde let-binding emitter
-    // names scalar Named params `{name}_core` too, so use it here as well — otherwise the non-serde
-    // preamble would bind a scalar Named param as `{name}` and the `&{name}_core` call site would
-    // not resolve.
     if serde_recoverable || needs_vec_named_let_binding {
         deser_lines.extend(magnus_serde_let_bindings(
             &func.params,
@@ -131,13 +126,9 @@ pub(in crate::backends::magnus::gen_bindings) fn gen_function(
         }
     }
 
-    // AHashMap<Cow<'static, str>, Value> params: Ruby receives these as
-    // HashMap<String, String>. Emit pre-call `let __<name>_ahash` bindings so the
-    // call site can borrow a properly-typed AHashMap.
     let ahash_bindings = magnus_ahash_pre_call_bindings(&func.params);
     deser_lines.extend(ahash_bindings);
 
-    // When variadic, prepend scan_args prologue to unpack individual bindings from args slice.
     let scan_args_prologue = if variadic {
         format!(
             "{}\n    ",
@@ -170,8 +161,6 @@ pub(in crate::backends::magnus::gen_bindings) fn gen_function(
         };
         let core_call = format!("{core_fn_path}({call_args})");
         if func.is_async {
-            // Async core function: wrap in tokio runtime block_on.
-            // Runtime::new() can fail, so always use map_err and return Ok(...).
             let wrap = generators::wrap_return_with_mutex_mapped(
                 "result",
                 &func.return_type,
@@ -221,8 +210,7 @@ pub(in crate::backends::magnus::gen_bindings) fn gen_function(
                     wrap => &wrap,
                 },
             )
-        } else if variadic {
-            // Variadic functions must return Result (scan_args uses ?), so wrap plain value in Ok().
+        } else if variadic || force_result_for_deser {
             let inner = generators::wrap_return_with_mutex_mapped(
                 &core_call,
                 &func.return_type,

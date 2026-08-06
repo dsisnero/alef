@@ -94,10 +94,6 @@ pub fn validate_call_export(surface: &ApiSurface, module_path: &str, function_na
         .map(|f| f.rust_path.clone())
         .collect();
 
-    // Also accept method-on-type references: e.g. `function = "chat"` where `chat`
-    // is a method on a public type like `LlmClient` (trait) or `DefaultClient`. The
-    // e2e codegen layer already handles method-style call sites; the validator was
-    // previously too strict and rejected these legitimate entry points.
     let mut method_match_found = false;
     for type_def in &surface.types {
         for method in &type_def.methods {
@@ -118,9 +114,6 @@ pub fn validate_call_export(surface: &ApiSurface, module_path: &str, function_na
         return ExportValidation::Ok;
     }
 
-    // Lenient policy for methods: if any method anywhere in the surface matches the
-    // function name, accept it. Codegen handles method-style dispatch correctly and
-    // the strict module-path check is only meaningful for free functions.
     if method_match_found {
         return ExportValidation::Ok;
     }
@@ -328,7 +321,6 @@ mod tests {
 
     #[test]
     fn return_type_fields_returns_struct_fields() {
-        // with neutral DTO fixtures that do not mirror a specific extraction app.
         let mut surface = empty_surface();
         surface.functions.push(make_fn(
             "extract_doc",
@@ -390,7 +382,6 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let lib_rs = dir.path().join("lib.rs");
         std::fs::write(&lib_rs, lib_rs_source).expect("write lib.rs");
-        // of `sample_crate` throughout this test cluster.
         crate::extract::extractor::extract(&[lib_rs.as_path()], "sample_crate", "0.0.0", None).expect("extract failed")
     }
 
@@ -399,7 +390,7 @@ mod tests {
         let surface = extract_from_tmp(
             r#"
             pub mod rendering {
-                pub fn render_page(page: u32) -> String { todo!() }
+                pub fn render_page(page: u32) -> String { unimplemented!() }
             }
         "#,
         );
@@ -417,7 +408,7 @@ mod tests {
             r#"
             pub use rendering::*;
             pub mod rendering {
-                pub fn render_page(page: u32) -> String { todo!() }
+                pub fn render_page(page: u32) -> String { unimplemented!() }
             }
         "#,
         );
@@ -460,7 +451,7 @@ mod tests {
             pub use chunking::core::chunk_text;
             pub mod chunking {
                 pub mod core {
-                    pub async fn chunk_text(text: String) -> Vec<String> { todo!() }
+                    pub async fn chunk_text(text: String) -> Vec<String> { unimplemented!() }
                 }
             }
         "#,

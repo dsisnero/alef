@@ -63,6 +63,10 @@ pub fn default_lint_config(lang: Language, output_dir: &str, ctx: &LangContext) 
             typecheck: None,
         },
         Language::Ruby => {
+            // `bundle install` before rubocop so the gem (and its plugins) are
+            // present — lets consumer repos drop the identical `[crates.lint.ruby]`
+            // override and rely on this default.
+            let before_cmd = wrap(format!("cd {output_dir} && bundle install"), ctx.run_wrapper);
             let format_cmd = wrap(
                 append_paths(
                     format!("cd {output_dir} && bundle exec rubocop -A ."),
@@ -79,7 +83,7 @@ pub fn default_lint_config(lang: Language, output_dir: &str, ctx: &LangContext) 
             );
             LintConfig {
                 precondition: Some(require_tool("bundle")),
-                before: None,
+                before: Some(StringOrVec::Single(before_cmd)),
                 format: Some(StringOrVec::Single(format_cmd)),
                 check: Some(StringOrVec::Single(check_cmd)),
                 typecheck: None,
@@ -165,6 +169,10 @@ pub fn default_lint_config(lang: Language, output_dir: &str, ctx: &LangContext) 
             }
         }
         Language::Elixir => {
+            // `mix deps.get` before credo so deps (credo itself) are fetched —
+            // lets consumer repos drop the identical `[crates.lint.elixir]`
+            // override and rely on this default.
+            let before_cmd = wrap(format!("cd {output_dir} && mix deps.get"), ctx.run_wrapper);
             let format_cmd = wrap(
                 append_paths(format!("cd {output_dir} && mix format"), ctx.extra_lint_paths),
                 ctx.run_wrapper,
@@ -175,7 +183,7 @@ pub fn default_lint_config(lang: Language, output_dir: &str, ctx: &LangContext) 
             );
             LintConfig {
                 precondition: Some(require_tool("mix")),
-                before: None,
+                before: Some(StringOrVec::Single(before_cmd)),
                 format: Some(StringOrVec::Single(format_cmd)),
                 check: Some(StringOrVec::Single(check_cmd)),
                 typecheck: None,
@@ -224,11 +232,38 @@ pub fn default_lint_config(lang: Language, output_dir: &str, ctx: &LangContext) 
             )),
             typecheck: None,
         },
-        Language::Kotlin | Language::KotlinAndroid => {
-            let format_cmd = wrap(format!("cd {output_dir} && gradle ktlintFormat"), ctx.run_wrapper);
-            let check_cmd = wrap(format!("cd {output_dir} && gradle ktlintCheck"), ctx.run_wrapper);
+        // Kotlin formats with ktfmt — the single Kotlin formatter across all
+        // backends. ktlint is not wired anywhere; `build`/`.gradle` dirs are
+        // pruned so generated/build artifacts aren't touched.
+        Language::Kotlin => {
+            let find_kt = format!(
+                "find {output_dir} \\( -name build -o -name .gradle \\) -prune -o \
+                 \\( -name '*.kt' -o -name '*.kts' \\) -type f -print0 | xargs -0 ktfmt --kotlinlang-style"
+            );
+            let format_cmd = wrap(find_kt.clone(), ctx.run_wrapper);
+            let check_cmd = wrap(format!("{find_kt} --dry-run --set-exit-if-changed"), ctx.run_wrapper);
             LintConfig {
-                precondition: Some(require_tool("gradle")),
+                precondition: Some(require_tool("ktfmt")),
+                before: None,
+                format: Some(StringOrVec::Single(format_cmd)),
+                check: Some(StringOrVec::Single(check_cmd)),
+                typecheck: None,
+            }
+        }
+        // Kotlin-Android formats with ktfmt (not gradle ktlint): the Android
+        // Gradle plugin is heavy to spin up for a format pass, so consumer repos
+        // uniformly override to a `find … | xargs ktfmt --kotlinlang-style` sweep.
+        // Making it the default lets them drop the identical override. `build`/
+        // `.gradle` dirs are pruned so generated/build artifacts aren't touched.
+        Language::KotlinAndroid => {
+            let find_kt = format!(
+                "find {output_dir} \\( -name build -o -name .gradle \\) -prune -o \
+                 \\( -name '*.kt' -o -name '*.kts' \\) -type f -print0 | xargs -0 ktfmt --kotlinlang-style"
+            );
+            let format_cmd = wrap(find_kt.clone(), ctx.run_wrapper);
+            let check_cmd = wrap(format!("{find_kt} --dry-run --set-exit-if-changed"), ctx.run_wrapper);
+            LintConfig {
+                precondition: Some(require_tool("ktfmt")),
                 before: None,
                 format: Some(StringOrVec::Single(format_cmd)),
                 check: Some(StringOrVec::Single(check_cmd)),
@@ -236,12 +271,14 @@ pub fn default_lint_config(lang: Language, output_dir: &str, ctx: &LangContext) 
             }
         }
         Language::Swift => {
+            // Only `Sources` (not `Tests`): consumer repos uniformly override to
+            // drop `Tests`, so make it the default and let them delete the override.
             let format_cmd = wrap(
-                format!("cd {output_dir} && swift format --in-place --recursive Sources Tests"),
+                format!("cd {output_dir} && swift format --in-place --recursive Sources"),
                 ctx.run_wrapper,
             );
             let check_cmd = wrap(
-                format!("cd {output_dir} && swift format lint --recursive Sources Tests"),
+                format!("cd {output_dir} && swift format lint --recursive Sources"),
                 ctx.run_wrapper,
             );
             LintConfig {
@@ -270,9 +307,6 @@ pub fn default_lint_config(lang: Language, output_dir: &str, ctx: &LangContext) 
             }
         }
         Language::Zig => {
-            // Format `build.zig` (package root) as well as `src/`. `zig fmt src`
-            // alone misses the scaffolded `build.zig`, leaving it for the consumer's
-            // own `zig fmt` hook to reformat — a spurious post-generation diff.
             let format_cmd = wrap(format!("cd {output_dir} && zig fmt src build.zig"), ctx.run_wrapper);
             let check_cmd = wrap(
                 format!("cd {output_dir} && zig fmt --check src build.zig"),
@@ -348,6 +382,7 @@ mod tests {
             Language::Ffi,
             Language::Rust,
             Language::Kotlin,
+            Language::KotlinAndroid,
             Language::Swift,
             Language::Dart,
             Language::Gleam,
@@ -605,19 +640,75 @@ mod tests {
     }
 
     #[test]
-    fn kotlin_uses_gradle_ktlint() {
+    fn kotlin_uses_ktfmt() {
         let c = cfg(Language::Kotlin, "packages/kotlin");
         let fmt = c.format.unwrap().commands().join(" ");
         let check = c.check.unwrap().commands().join(" ");
         assert!(
-            fmt.contains("gradle ktlintFormat"),
-            "Kotlin format should use gradle ktlintFormat, got: {fmt}"
+            fmt.contains("ktfmt --kotlinlang-style"),
+            "Kotlin format should use ktfmt, got: {fmt}"
         );
         assert!(
-            check.contains("gradle ktlintCheck"),
-            "Kotlin check should use gradle ktlintCheck, got: {check}"
+            !fmt.contains("gradle ktlint"),
+            "Kotlin should not shell out to gradle ktlint, got: {fmt}"
         );
-        assert_eq!(c.precondition.as_deref(), Some("command -v gradle >/dev/null 2>&1"));
+        assert!(
+            check.contains("--dry-run --set-exit-if-changed"),
+            "Kotlin check should be a non-mutating ktfmt run, got: {check}"
+        );
+        assert_eq!(c.precondition.as_deref(), Some("command -v ktfmt >/dev/null 2>&1"));
+    }
+
+    #[test]
+    fn kotlin_android_uses_ktfmt() {
+        let c = cfg(Language::KotlinAndroid, "packages/kotlin-android");
+        let fmt = c.format.unwrap().commands().join(" ");
+        let check = c.check.unwrap().commands().join(" ");
+        assert!(
+            fmt.contains("ktfmt --kotlinlang-style"),
+            "Kotlin-Android format should use ktfmt, got: {fmt}"
+        );
+        assert!(
+            !fmt.contains("gradle ktlint"),
+            "Kotlin-Android should not shell out to gradle ktlint, got: {fmt}"
+        );
+        assert!(
+            check.contains("--dry-run --set-exit-if-changed"),
+            "Kotlin-Android check should be a non-mutating ktfmt run, got: {check}"
+        );
+        assert!(
+            fmt.contains("packages/kotlin-android"),
+            "output_dir should be substituted, got: {fmt}"
+        );
+        assert_eq!(c.precondition.as_deref(), Some("command -v ktfmt >/dev/null 2>&1"));
+    }
+
+    #[test]
+    fn elixir_default_runs_deps_get_before() {
+        let c = cfg(Language::Elixir, "packages/elixir");
+        let before = c
+            .before
+            .expect("elixir default should fetch deps first")
+            .commands()
+            .join(" ");
+        assert!(
+            before.contains("mix deps.get"),
+            "elixir before should run mix deps.get, got: {before}"
+        );
+    }
+
+    #[test]
+    fn ruby_default_runs_bundle_install_before() {
+        let c = cfg(Language::Ruby, "packages/ruby");
+        let before = c
+            .before
+            .expect("ruby default should install gems first")
+            .commands()
+            .join(" ");
+        assert!(
+            before.contains("bundle install"),
+            "ruby before should run bundle install, got: {before}"
+        );
     }
 
     #[test]
@@ -632,6 +723,10 @@ mod tests {
         assert!(
             check.contains("swift format lint"),
             "Swift check should use swift format lint, got: {check}"
+        );
+        assert!(
+            !fmt.contains("Tests") && !check.contains("Tests"),
+            "Swift default should format only Sources, not Tests; got fmt: {fmt}, check: {check}"
         );
         assert_eq!(c.precondition.as_deref(), Some("command -v swift >/dev/null 2>&1"));
     }

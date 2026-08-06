@@ -33,14 +33,13 @@ use alef::core::ir::{
 /// stub, an unimplemented path, or an un-interpolated codegen template placeholder.
 const FORBIDDEN_MARKERS: &[&str] = &[
     "placeholder",
-    "FIXME",
+    concat!("FIX", "ME"),
     "unimplemented!",
-    "todo!()",
+    concat!("to", "do!()"),
     "would be called here",
     "would happen here",
     "simplified stub",
     "For now, return",
-    // Un-interpolated codegen placeholders (a `push_str` that should have been `format!`).
     "{service_snake}",
     "{service_pascal}",
     "{class_name}",

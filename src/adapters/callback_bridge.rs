@@ -86,10 +86,6 @@ fn error_type(adapter: &AdapterConfig) -> &str {
     adapter.error_type.as_deref().unwrap_or("anyhow::Error")
 }
 
-// ---------------------------------------------------------------------------
-// Python (PyO3)
-// ---------------------------------------------------------------------------
-
 fn gen_python_body(adapter: &AdapterConfig, _config: &ResolvedCrateConfig) -> (String, String) {
     let name = &adapter.name;
     let struct_name = format!("Py{}Bridge", to_pascal_case(name));
@@ -100,7 +96,6 @@ fn gen_python_body(adapter: &AdapterConfig, _config: &ResolvedCrateConfig) -> (S
     let _params = params_str(adapter);
     let _args = call_args(adapter);
 
-    // Import the trait and error type from core_path
     let core_path = &adapter.core_path;
     let import_base = core_path
         .rsplit("::")
@@ -169,10 +164,6 @@ fn gen_python_body(adapter: &AdapterConfig, _config: &ResolvedCrateConfig) -> (S
     (struct_code, impl_code)
 }
 
-// ---------------------------------------------------------------------------
-// Node (NAPI)
-// ---------------------------------------------------------------------------
-
 fn gen_node_body(adapter: &AdapterConfig, _config: &ResolvedCrateConfig) -> (String, String) {
     let name = &adapter.name;
     let struct_name = format!("Js{}Bridge", to_pascal_case(name));
@@ -224,10 +215,6 @@ fn gen_node_body(adapter: &AdapterConfig, _config: &ResolvedCrateConfig) -> (Str
 
     (struct_code, impl_code)
 }
-
-// ---------------------------------------------------------------------------
-// Ruby (Magnus)
-// ---------------------------------------------------------------------------
 
 fn gen_ruby_body(adapter: &AdapterConfig, _config: &ResolvedCrateConfig) -> (String, String) {
     let name = &adapter.name;
@@ -281,10 +268,6 @@ fn gen_ruby_body(adapter: &AdapterConfig, _config: &ResolvedCrateConfig) -> (Str
     (struct_code, impl_code)
 }
 
-// ---------------------------------------------------------------------------
-// PHP (ext-php-rs)
-// ---------------------------------------------------------------------------
-
 fn gen_php_body(adapter: &AdapterConfig, _config: &ResolvedCrateConfig) -> (String, String) {
     let name = &adapter.name;
     let struct_name = format!("Php{}Bridge", to_pascal_case(name));
@@ -327,10 +310,6 @@ fn gen_php_body(adapter: &AdapterConfig, _config: &ResolvedCrateConfig) -> (Stri
     (struct_code, impl_code)
 }
 
-// ---------------------------------------------------------------------------
-// Elixir (Rustler)
-// ---------------------------------------------------------------------------
-
 fn gen_elixir_body(adapter: &AdapterConfig, _config: &ResolvedCrateConfig) -> (String, String) {
     let name = &adapter.name;
     let struct_name = format!("Ex{}Bridge", to_pascal_case(name));
@@ -369,10 +348,6 @@ fn gen_elixir_body(adapter: &AdapterConfig, _config: &ResolvedCrateConfig) -> (S
 
     (struct_code, impl_code)
 }
-
-// ---------------------------------------------------------------------------
-// WASM (wasm-bindgen)
-// ---------------------------------------------------------------------------
 
 fn gen_wasm_body(adapter: &AdapterConfig, _config: &ResolvedCrateConfig) -> (String, String) {
     let name = &adapter.name;
@@ -421,10 +396,6 @@ fn gen_wasm_body(adapter: &AdapterConfig, _config: &ResolvedCrateConfig) -> (Str
 
     (struct_code, impl_code)
 }
-
-// ---------------------------------------------------------------------------
-// FFI (C ABI) — function pointer callback
-// ---------------------------------------------------------------------------
 
 fn gen_ffi_body(adapter: &AdapterConfig, config: &ResolvedCrateConfig) -> (String, String) {
     let name = &adapter.name;
@@ -488,10 +459,6 @@ fn gen_ffi_body(adapter: &AdapterConfig, config: &ResolvedCrateConfig) -> (Strin
     (struct_code, impl_code)
 }
 
-// ---------------------------------------------------------------------------
-// Go (wraps C FFI) — same function pointer pattern as FFI
-// ---------------------------------------------------------------------------
-
 fn gen_go_body(adapter: &AdapterConfig, config: &ResolvedCrateConfig) -> (String, String) {
     let name = &adapter.name;
     let prefix = config.ffi_prefix();
@@ -549,10 +516,6 @@ fn gen_go_body(adapter: &AdapterConfig, config: &ResolvedCrateConfig) -> (String
 
     (struct_code, impl_code)
 }
-
-// ---------------------------------------------------------------------------
-// Java (Panama FFI) — function pointer pattern
-// ---------------------------------------------------------------------------
 
 fn gen_java_body(adapter: &AdapterConfig, config: &ResolvedCrateConfig) -> (String, String) {
     let name = &adapter.name;
@@ -612,10 +575,6 @@ fn gen_java_body(adapter: &AdapterConfig, config: &ResolvedCrateConfig) -> (Stri
     (struct_code, impl_code)
 }
 
-// ---------------------------------------------------------------------------
-// C# (P/Invoke) — function pointer pattern
-// ---------------------------------------------------------------------------
-
 fn gen_csharp_body(adapter: &AdapterConfig, config: &ResolvedCrateConfig) -> (String, String) {
     let name = &adapter.name;
     let prefix = config.ffi_prefix();
@@ -673,10 +632,6 @@ fn gen_csharp_body(adapter: &AdapterConfig, config: &ResolvedCrateConfig) -> (St
 
     (struct_code, impl_code)
 }
-
-// ---------------------------------------------------------------------------
-// R (extendr)
-// ---------------------------------------------------------------------------
 
 fn gen_r_body(adapter: &AdapterConfig, _config: &ResolvedCrateConfig) -> (String, String) {
     let name = &adapter.name;

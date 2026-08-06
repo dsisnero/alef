@@ -67,8 +67,6 @@ fn test_generate_bindings_produces_binding_go_file() {
     assert!(!files.is_empty());
     assert!(files[0].path.to_string_lossy().contains("binding.go"));
 
-    // embed_ffi.go must declare the same package as binding.go, never a
-    // hardcoded foreign package name.
     let binding = files
         .iter()
         .find(|f| f.path.to_string_lossy().ends_with("binding.go"))
@@ -89,6 +87,66 @@ fn test_generate_bindings_produces_binding_go_file() {
     assert!(
         embed.content.contains(pkg_line),
         "embed_ffi.go package must match binding.go ({pkg_line})"
+    );
+}
+
+#[test]
+fn test_generate_bindings_emits_cmd_setup_and_native_setup_sentinel() {
+    use crate::core::ir::ApiSurface;
+    let config = make_config();
+    let api = ApiSurface {
+        crate_name: "test-lib".to_string(),
+        version: "1.0.0-rc.38".to_string(),
+        types: vec![],
+        functions: vec![],
+        enums: vec![],
+        errors: vec![],
+        excluded_type_paths: ::std::collections::HashMap::new(),
+        excluded_trait_names: ::std::collections::HashSet::new(),
+        services: vec![],
+        handler_contracts: vec![],
+        unsupported_public_items: Vec::new(),
+    };
+    let backend = GoBackend;
+    let files = backend.generate_bindings(&api, &config).unwrap();
+
+    assert!(
+        !files
+            .iter()
+            .any(|f| f.path.to_string_lossy().ends_with("cmd/download_ffi/main.go")),
+        "the old cmd/download_ffi tool must no longer be emitted"
+    );
+
+    let setup = files
+        .iter()
+        .find(|f| f.path.to_string_lossy().ends_with("cmd/setup/main.go"))
+        .expect("cmd/setup/main.go must be generated");
+    assert!(
+        setup.content.contains(r#"moduleVersion     = "1.0.0-rc.38""#),
+        "cmd/setup/main.go must embed the crate version:\n{}",
+        setup.content
+    );
+    assert!(
+        setup.content.contains(r#"versionIdent      = "1_0_0_rc_38""#),
+        "cmd/setup must embed the version-matched sentinel identifier:\n{}",
+        setup.content
+    );
+    assert!(
+        setup.content.contains("RequireNativeSetup_%s"),
+        "cmd/setup's shim writer must build the RequireNativeSetup_<versionIdent> reference:\n{}",
+        setup.content
+    );
+
+    let native_setup = files
+        .iter()
+        .find(|f| f.path.to_string_lossy().ends_with("native_setup.go"))
+        .expect("native_setup.go must be generated");
+    assert!(
+        native_setup
+            .content
+            .contains(r#"const RequireNativeSetup_1_0_0_rc_38 = "1.0.0-rc.38""#),
+        "native_setup.go must declare the version-skew sentinel:\n{}",
+        native_setup.content
     );
 }
 
@@ -279,5 +337,194 @@ fn capsule_function_constructs_host_language_and_imports_package() {
     assert!(
         binding.content.contains("github.com/example/go-my-lib"),
         "binding.go must import the configured capsule package"
+    );
+}
+
+/// A free function whose Go PascalCase name collides with a struct type of the same name
+/// (e.g. Rust's `fn model_info(...)` and `struct ModelInfo`) must not produce two `ModelInfo`
+/// package-level declarations. The type keeps the plain name; the function is renamed
+/// `GetModelInfo`. A non-colliding function in the same package is unaffected.
+#[test]
+fn free_function_colliding_with_type_name_is_renamed_get_prefixed() {
+    use crate::core::ir::*;
+
+    let config = make_config();
+    let api = ApiSurface {
+        crate_name: "test-lib".to_string(),
+        version: "0.1.0".to_string(),
+        types: vec![TypeDef {
+            name: "ModelInfo".to_string(),
+            rust_path: "test_lib::ModelInfo".to_string(),
+            original_rust_path: String::new(),
+            fields: vec![],
+            methods: vec![],
+            is_opaque: false,
+            is_clone: false,
+            is_copy: false,
+            is_trait: false,
+            has_default: false,
+            has_stripped_cfg_fields: false,
+            is_return_type: true,
+            serde_rename_all: None,
+            has_serde: true,
+            super_traits: vec![],
+            doc: "Model metadata.".to_string(),
+            cfg: None,
+            binding_excluded: false,
+            binding_exclusion_reason: None,
+            is_variant_wrapper: false,
+            has_lifetime_params: false,
+            has_private_fields: false,
+            version: Default::default(),
+        }],
+        functions: vec![
+            FunctionDef {
+                name: "model_info".to_string(),
+                rust_path: "test_lib::model_info".to_string(),
+                original_rust_path: String::new(),
+                params: vec![ParamDef {
+                    name: "model".to_string(),
+                    ty: TypeRef::String,
+                    optional: false,
+                    default: None,
+                    sanitized: false,
+                    typed_default: None,
+                    is_ref: true,
+                    is_mut: false,
+                    newtype_wrapper: None,
+                    original_type: None,
+                    map_is_ahash: false,
+                    map_key_is_cow: false,
+                    vec_inner_is_ref: false,
+                    map_is_btree: false,
+                    core_wrapper: crate::core::ir::CoreWrapper::None,
+                }],
+                return_type: TypeRef::Optional(Box::new(TypeRef::Named("ModelInfo".to_string()))),
+                is_async: false,
+                error_type: None,
+                doc: "Look up model metadata by name.".to_string(),
+                cfg: None,
+                sanitized: false,
+                return_sanitized: false,
+                returns_ref: false,
+                returns_cow: false,
+                return_newtype_wrapper: None,
+                binding_excluded: false,
+                binding_exclusion_reason: None,
+                version: Default::default(),
+            },
+            FunctionDef {
+                name: "list_models".to_string(),
+                rust_path: "test_lib::list_models".to_string(),
+                original_rust_path: String::new(),
+                params: vec![],
+                return_type: TypeRef::String,
+                is_async: false,
+                error_type: None,
+                doc: "List known model names.".to_string(),
+                cfg: None,
+                sanitized: false,
+                return_sanitized: false,
+                returns_ref: false,
+                returns_cow: false,
+                return_newtype_wrapper: None,
+                binding_excluded: false,
+                binding_exclusion_reason: None,
+                version: Default::default(),
+            },
+        ],
+        enums: vec![],
+        errors: vec![],
+        excluded_type_paths: ::std::collections::HashMap::new(),
+        excluded_trait_names: ::std::collections::HashSet::new(),
+        services: vec![],
+        handler_contracts: vec![],
+        unsupported_public_items: Vec::new(),
+    };
+
+    let files = GoBackend.generate_bindings(&api, &config).unwrap();
+    let binding = files
+        .iter()
+        .find(|f| f.path.to_string_lossy().ends_with("binding.go"))
+        .expect("binding.go present");
+
+    assert!(
+        binding.content.contains("type ModelInfo struct"),
+        "struct type must keep its plain name. Got:\n{}",
+        binding.content
+    );
+    assert!(
+        binding.content.contains("func GetModelInfo(model string)"),
+        "colliding free function must be renamed to GetModelInfo. Got:\n{}",
+        binding.content
+    );
+    assert!(
+        !binding.content.contains("func ModelInfo("),
+        "colliding free function must not keep the bare type name. Got:\n{}",
+        binding.content
+    );
+    assert!(
+        binding.content.contains("func ListModels()"),
+        "non-colliding function must be unaffected. Got:\n{}",
+        binding.content
+    );
+}
+
+/// Go rejects a struct that carries both a field and a method named `Providers`
+/// (`field and method with the same name`). A core type with a public `providers` field and
+/// an inherent `providers()` method feeds both the struct emitter and the method-wrapper
+/// emitter, so the wrapper must be dropped and the field kept.
+#[test]
+fn generate_bindings_skips_method_wrapper_when_struct_field_has_same_name() {
+    use crate::core::ir::{ApiSurface, FieldDef, MethodDef, ReceiverKind, TypeDef, TypeRef};
+
+    let config = make_config();
+    let api = ApiSurface {
+        crate_name: "test-lib".to_string(),
+        version: "0.1.0".to_string(),
+        types: vec![TypeDef {
+            name: "LlmConfig".to_string(),
+            rust_path: "test_lib::LlmConfig".to_string(),
+            has_serde: true,
+            fields: vec![FieldDef {
+                name: "providers".to_string(),
+                ty: TypeRef::String,
+                optional: true,
+                ..Default::default()
+            }],
+            methods: vec![MethodDef {
+                name: "providers".to_string(),
+                return_type: TypeRef::String,
+                receiver: Some(ReceiverKind::Ref),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+        functions: vec![],
+        enums: vec![],
+        errors: vec![],
+        excluded_type_paths: ::std::collections::HashMap::new(),
+        excluded_trait_names: ::std::collections::HashSet::new(),
+        services: vec![],
+        handler_contracts: vec![],
+        unsupported_public_items: Vec::new(),
+    };
+
+    let files = GoBackend.generate_bindings(&api, &config).unwrap();
+    let binding = files
+        .iter()
+        .find(|f| f.path.to_string_lossy().ends_with("binding.go"))
+        .expect("binding.go present");
+
+    assert!(
+        binding.content.contains("Providers "),
+        "the struct field must still be emitted. Got:\n{}",
+        binding.content
+    );
+    let wrappers = binding.content.matches("func (r *LlmConfig) Providers(").count();
+    assert_eq!(
+        wrappers, 0,
+        "the same-named method wrapper must be skipped, found {wrappers} in:\n{}",
+        binding.content
     );
 }

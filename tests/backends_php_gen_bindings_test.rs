@@ -106,10 +106,6 @@ exclude_types = ["HiddenConfig"]
     cfg.resolve().expect("test config must resolve").remove(0)
 }
 
-// ---------------------------------------------------------------------------
-// PHP trait bridge helpers
-// ---------------------------------------------------------------------------
-
 fn make_trait_def_php(name: &str, methods: Vec<MethodDef>) -> TypeDef {
     TypeDef {
         name: name.to_string(),
@@ -321,7 +317,6 @@ fn make_visitor_bridge_cfg_php(trait_name: &str, type_alias: &str) -> alef::core
     }
 }
 
-// ---------------------------------------------------------------------------
 fn make_field_with_doc(name: &str, ty: TypeRef, optional: bool, doc: &str) -> FieldDef {
     FieldDef {
         name: name.to_string(),
@@ -355,8 +350,12 @@ mod methods_errors;
 mod params_formatting;
 #[path = "backends_php_gen_bindings/public_api_stubs.rs"]
 mod public_api_stubs;
+#[path = "backends_php_gen_bindings/scaffold_composer_requirements.rs"]
+mod scaffold_composer_requirements;
 #[path = "backends_php_gen_bindings/scaffold_pie_url.rs"]
 mod scaffold_pie_url;
+#[path = "backends_php_gen_bindings/streaming_method_order.rs"]
+mod streaming_method_order;
 #[path = "backends_php_gen_bindings/stubs_dtos.rs"]
 mod stubs_dtos;
 #[path = "backends_php_gen_bindings/tagged_enums.rs"]

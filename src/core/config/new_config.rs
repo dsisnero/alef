@@ -91,7 +91,6 @@ impl NewAlefConfig {
     /// - [`ResolveError::OverlappingOutputPath`] when two crates resolve to the
     ///   same output directory for the same language.
     pub fn resolve(&self) -> Result<Vec<ResolvedCrateConfig>, ResolveError> {
-        // --- Uniqueness check ---------------------------------------------------
         let mut seen: HashMap<&str, usize> = HashMap::new();
         for (idx, krate) in self.crates.iter().enumerate() {
             if seen.insert(krate.name.as_str(), idx).is_some() {
@@ -106,8 +105,6 @@ impl NewAlefConfig {
             resolved.push(self.resolve_one(krate, multi_crate)?);
         }
 
-        // --- Overlapping output path check --------------------------------------
-        // For each language, build a map path → crate names; error on any dup.
         let mut path_owners: HashMap<String, HashMap<PathBuf, Vec<String>>> = HashMap::new();
         for cfg in &resolved {
             for (lang, path) in &cfg.output_paths {
@@ -133,11 +130,9 @@ impl NewAlefConfig {
     fn resolve_one(&self, krate: &RawCrateConfig, multi_crate: bool) -> Result<ResolvedCrateConfig, ResolveError> {
         let ws = &self.workspace;
 
-        // --- Languages ----------------------------------------------------------
         let languages: Vec<Language> = match krate.languages.as_deref() {
             Some(langs) if !langs.is_empty() => langs.to_vec(),
             Some(_) => {
-                // Explicitly empty per-crate list: treat as "no override" and use workspace.
                 if ws.languages.is_empty() {
                     return Err(ResolveError::EmptyLanguages(krate.name.clone()));
                 }
@@ -151,15 +146,8 @@ impl NewAlefConfig {
             }
         };
 
-        // --- Output paths -------------------------------------------------------
         let output_paths = resolve_output_paths(krate, &ws.output_template, &languages, multi_crate);
 
-        // --- HashMap pipelines -------------------------------------------------
-        // Most per-language pipeline maps use per-key wholesale overlay. Build
-        // commands are intentionally field-wise so workspace defaults and crate
-        // overrides can compose without restating preconditions/release commands.
-        // `path_mappings` and `extra_dependencies` are intentionally not merged
-        // here: they remain strictly per-crate and are taken verbatim below.
         let lint = merge_map(&ws.lint, &krate.lint);
         let test = merge_map(&ws.test, &krate.test);
         let setup = merge_map(&ws.setup, &krate.setup);
@@ -168,10 +156,6 @@ impl NewAlefConfig {
         let build_commands = merge_build_command_maps(&ws.build_commands, &krate.build_commands);
         let generate_overrides = merge_map(&ws.generate_overrides, &krate.generate_overrides);
 
-        // --- Cross-language validation ------------------------------------------
-        // alef-backend-jni is paired with kotlin-android: the JNI backend derives
-        // the package, bridge class name, and feature list from kotlin_android
-        // config. Without it the backend has no symbol prefix to emit.
         if languages.contains(&Language::Jni) && !languages.contains(&Language::KotlinAndroid) {
             return Err(ResolveError::InvalidConfig(format!(
                 "crate `{}`: language `jni` requires `kotlin_android` to also be enabled in languages",
@@ -179,9 +163,6 @@ impl NewAlefConfig {
             )));
         }
 
-        // --- Adapter skip_languages validation ----------------------------------
-        // Reject unknown language names in adapter skip_languages early so
-        // typos like "wasm32" instead of "wasm" fail loudly at config-resolve time.
         for adapter in &krate.adapters {
             for lang in &adapter.skip_languages {
                 if !is_known_language(lang.as_str()) {
@@ -195,7 +176,6 @@ impl NewAlefConfig {
             }
         }
 
-        // --- Service skip_languages validation ----------------------------------
         for service in &krate.services {
             for lang in &service.skip_languages {
                 if !is_known_language(lang.as_str()) {
@@ -209,8 +189,6 @@ impl NewAlefConfig {
             }
         }
 
-        // --- Service/handler-contract cross-reference validation ----------------
-        // Every registration's callback_contract must match a handler_contract trait_name.
         let contract_names: std::collections::HashSet<&str> = krate
             .handler_contracts
             .iter()
@@ -226,7 +204,6 @@ impl NewAlefConfig {
                     )));
                 }
             }
-            // Validate entrypoint kinds are recognised
             for ep in &service.entrypoints {
                 if ep.kind != "run" && ep.kind != "finalize" {
                     return Err(ResolveError::InvalidConfig(format!(
@@ -239,6 +216,20 @@ impl NewAlefConfig {
         }
 
         let source_crates = resolve_source_crates(&krate.source_crates, krate.workspace_root.as_deref())?;
+
+        // Per-target toggles: workspace defaults, overridden per key by the crate. ~keep
+        let mut targets = ws.targets.clone();
+        targets.extend(krate.targets.iter().map(|(k, v)| (k.clone(), *v)));
+        for key in targets.keys() {
+            if !crate::publish::platform::CANONICAL_TARGET_KEYS.contains(&key.as_str()) {
+                return Err(ResolveError::InvalidConfig(format!(
+                    "crate `{}`: unknown target key `{}` in `[targets]`; valid keys are: {}",
+                    krate.name,
+                    key,
+                    crate::publish::platform::CANONICAL_TARGET_KEYS.join(", ")
+                )));
+            }
+        }
 
         Ok(ResolvedCrateConfig {
             name: krate.name.clone(),
@@ -255,6 +246,7 @@ impl NewAlefConfig {
             extra_dependencies: krate.extra_dependencies.clone(),
             auto_path_mappings: krate.auto_path_mappings.unwrap_or(true),
             languages,
+            targets,
             python: krate.python.clone().or_else(|| ws.python.clone()),
             node: krate.node.clone().or_else(|| ws.node.clone()),
             ruby: krate.ruby.clone().or_else(|| ws.ruby.clone()),
@@ -284,9 +276,6 @@ impl NewAlefConfig {
             update,
             clean,
             build_commands,
-            // Per-crate generate/dto override the workspace value when set.
-            // None inherits the workspace default. tools and opaque_types are
-            // workspace-only by design (see WorkspaceConfig docs).
             generate: krate.generate.clone().unwrap_or_else(|| ws.generate.clone()),
             generate_overrides,
             dto: krate.dto.clone().unwrap_or_else(|| ws.dto.clone()),

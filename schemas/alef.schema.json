@@ -2254,6 +2254,14 @@
     },
     "ExcludeConfig": {
       "properties": {
+        "fields": {
+          "default": [],
+          "description": "Exclude specific struct fields from ALL bindings: \"TypeName.field_name\".",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "functions": {
           "default": [],
           "items": {
@@ -3047,6 +3055,38 @@
       "required": [
         "name",
         "command"
+      ],
+      "type": "object"
+    },
+    "HookSource": {
+      "additionalProperties": false,
+      "description": "A single external git hook source, rendered as a `[[hooks.sources]]` block in the\ngenerated `poly.toml` (e.g. an `ai-rulez` validation hook pinned by revision).",
+      "properties": {
+        "git": {
+          "description": "Git repository URL providing the hook.",
+          "type": "string"
+        },
+        "hooks": {
+          "default": [],
+          "description": "Hook names from the source to enable.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "id": {
+          "description": "Stable identifier for the hook source (e.g. `\"ai-rulez\"`).",
+          "type": "string"
+        },
+        "revision": {
+          "description": "Pinned git revision (tag, branch, or commit SHA).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "git",
+        "revision"
       ],
       "type": "object"
     },
@@ -4346,7 +4386,7 @@
     },
     "PolyConfig": {
       "additionalProperties": false,
-      "description": "Repo-specific `poly.toml` overrides merged into the emitter's generated\noutput.\n\nDeclared under `[workspace.poly]` in `alef.toml`.  An empty (or absent)\n`[workspace.poly]` section leaves the generated output byte-identical to the\ndefault.\n\n```toml\n[workspace.poly]\nexclude = [\"vendor/generated/**\", \"third-party/**\"]\n\n[workspace.poly.typos.extend-words]\nflate = \"flate\"\n\n[workspace.poly.typos.extend-identifiers]\nPyMuPDF = \"PyMuPDF\"\n\n[workspace.poly.per-file-ignores]\n\"**/legacy_api.py\" = [\"ANN\", \"D103\"]\n\"**/compat.py\"     = [\"UP035\", \"F401\"]\n```",
+      "description": "Repo-specific `poly.toml` overrides merged into the emitter's generated\noutput.\n\nDeclared under `[workspace.poly]` in `alef.toml`.  An empty (or absent)\n`[workspace.poly]` section leaves the generated output byte-identical to the\ndefault.\n\n```toml\n[workspace.poly]\nexclude = [\"vendor/generated/**\", \"third-party/**\"]\nfile-safety-exclude = [\"crates/*/src/lib.rs\"]\n\n[workspace.poly.typos.extend-words]\nflate = \"flate\"\n\n[workspace.poly.typos.extend-identifiers]\nPyMuPDF = \"PyMuPDF\"\n\n[workspace.poly.per-file-ignores]\n\"**/legacy_api.py\" = [\"ANN\", \"D103\"]\n\"**/compat.py\"     = [\"UP035\", \"F401\"]\n\n[workspace.poly.uncomment]\nenabled = true\npreserve-patterns = [\"SAFETY:\"]\n```",
       "properties": {
         "exclude": {
           "default": [],
@@ -4355,6 +4395,30 @@
             "type": "string"
           },
           "type": "array"
+        },
+        "file-safety-exclude": {
+          "default": [],
+          "description": "Extra gitignore-style globs appended ONLY to the `file_safety` builtin\nhook exclude list — NOT to `[discovery]`, `polylint`, or `polyfmt`.\n\nUse this to exempt files from poly's shebang / file-safety check while\nstill linting and formatting them. For example, Rust source with inner\nattributes (`#![...]`) on the first line is misread by the shebang\nheuristic as an executable script.\n\nDefault `file_safety` globs (shared with `exclude`) are emitted first;\nthese extra globs follow in the order given here.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "hooks-sources": {
+          "default": [],
+          "description": "External git-sourced pre-commit hook sources, emitted as `[[hooks.sources]]`\nblocks in the generated `poly.toml`. Each entry pins a hook repository (e.g.\nan `ai-rulez` validation hook) by git URL + revision.\n\nEmpty (the default) emits no `[[hooks.sources]]` blocks, leaving the output\nbyte-identical to the pre-feature default.",
+          "items": {
+            "$ref": "#/$defs/HookSource"
+          },
+          "type": "array"
+        },
+        "lint-workspace": {
+          "default": null,
+          "description": "Whether `poly lint` runs its whole-project lint phase, emitted as `[lint] workspace`.\n\nAbsent (the default) emits no `[lint]` table, matching poly's own default of `true`.\nSet to `false` for repos whose CI installs only a subset of toolchains, so the\nwhole-workspace linters that cannot run there are skipped — equivalent to always passing\n`poly lint --no-workspace`.",
+          "type": [
+            "boolean",
+            "null"
+          ]
         },
         "per-file-ignores": {
           "additionalProperties": {
@@ -4385,6 +4449,18 @@
             "extend-words": {}
           },
           "description": "Typos spell-checker word and identifier allowlists.\n\nMerged into `[lint.typos.extend_words]` and\n`[lint.typos.extend_identifiers]` in the generated poly.toml.\nWhen all sub-tables are empty, no `[lint.typos.*]` sections are emitted."
+        },
+        "uncomment": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UncommentConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Optional uncomment-linter configuration emitted as a `[lint.uncomment]`\ntable.\n\nAbsent (the default) emits NO `[lint.uncomment]` table, leaving the\noutput byte-identical to the pre-feature default. When present — even as\nan empty `[workspace.poly.uncomment]` table — a `[lint.uncomment]` table\nis emitted with poly-default values filled in."
         }
       },
       "type": "object"
@@ -4993,6 +5069,7 @@
         "exclude": {
           "$ref": "#/$defs/ExcludeConfig",
           "default": {
+            "fields": [],
             "functions": [],
             "methods": [],
             "types": []
@@ -5329,6 +5406,14 @@
           ],
           "default": null
         },
+        "targets": {
+          "additionalProperties": {
+            "type": "boolean"
+          },
+          "default": {},
+          "description": "Per-target build opt-out toggles for this crate, overriding the\nworkspace `[targets]` table per key. Keys are canonical target families\n(see [`crate::publish::platform::CANONICAL_TARGET_KEYS`]); setting a key\nto `false` drops every matching target triple from this crate's generated\ntarget lists. Absent keys inherit the workspace value (default enabled).",
+          "type": "object"
+        },
         "test": {
           "additionalProperties": {
             "$ref": "#/$defs/TestConfig"
@@ -5630,6 +5715,14 @@
           "default": {},
           "description": "Per-field name remapping for this language. Key is `TypeName.field_name`, value is the\ndesired binding field name. Applied after automatic keyword escaping.",
           "type": "object"
+        },
+        "required_ruby_version": {
+          "default": null,
+          "description": "Override the `required_ruby_version` constraint emitted into the gemspec. A single\nRubyGems requirement string (e.g. `\">= 3.2.0\"`). When unset, defaults to `\">= 3.2.0\"`\n(no upper bound, so the gem installs on Ruby 4.x).",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "run_wrapper": {
           "default": null,
@@ -6190,6 +6283,14 @@
             "null"
           ]
         },
+        "ffi_features": {
+          "default": [],
+          "description": "Features to enable on the injected secondary FFI crate dependency (the\nC-ABI `*-ffi` crate the swift-bridge shim links in addition to the core\ncrate). By default that dependency is emitted in plain form\n(`{ version, path }`), inheriting the FFI crate's default features.\n\nWhen this list is non-empty, the dependency is instead emitted with\n`default-features = false` and exactly these features. This is needed so\nthe swift shim can drop `heic` (whose `libheif-sys` `build.rs` cannot\nsatisfy `pkg-config` under cross-compilation) via a `full-no-heic`-style\nfeature set, independently of the primary core dep's feature handling\n(`features` / `excluded_default_features` / `target_dep_overrides`),\nwhich does not reach this secondary injection.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "min_ios_version": {
           "default": null,
           "description": "Minimum iOS deployment target. Defaults to `template_versions::toolchain::SWIFT_MIN_IOS` when unset.",
@@ -6611,6 +6712,46 @@
       },
       "type": "object"
     },
+    "UncommentConfig": {
+      "additionalProperties": false,
+      "description": "Uncomment linter customisations emitted under `[lint.uncomment]`.\n\nDeclared under `[workspace.poly.uncomment]` in `alef.toml`. When the section\nis absent, no `[lint.uncomment]` table is emitted (the generated output is\nbyte-identical to the default). When present, a `[lint.uncomment]` table is\nemitted with each field rendered under its snake_case poly key.\n\nField defaults mirror poly's own `uncomment` defaults so declaring an empty\n`[workspace.poly.uncomment]` table opts the linter in with poly-default\nbehaviour.\n\n```toml\n[workspace.poly.uncomment]\nenabled = true\nremove-todos = false\npreserve-patterns = [\"allow(\", \"SAFETY:\"]\n```",
+      "properties": {
+        "enabled": {
+          "default": true,
+          "description": "Whether the uncomment linter runs at all.\n\nEmitted as `enabled` in the generated `[lint.uncomment]` table.",
+          "type": "boolean"
+        },
+        "preserve-patterns": {
+          "default": [],
+          "description": "Extra comment-content substrings that exempt a comment from removal.\n\nEmitted as `preserve_patterns` in the generated `[lint.uncomment]`\ntable. Order is preserved as written. An empty list still emits an empty\narray so the key round-trips.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "remove-docs": {
+          "default": false,
+          "description": "Whether documentation comments are stripped.\n\nEmitted as `remove_docs` in the generated `[lint.uncomment]` table.",
+          "type": "boolean"
+        },
+        "remove-fixme": {
+          "default": false,
+          "description": "Whether `FIXME` comments are stripped.\n\nEmitted as `remove_fixme` in the generated `[lint.uncomment]` table.",
+          "type": "boolean"
+        },
+        "remove-todos": {
+          "default": false,
+          "description": "Whether `TODO` comments are stripped.\n\nEmitted as `remove_todos` in the generated `[lint.uncomment]` table.",
+          "type": "boolean"
+        },
+        "use-default-ignores": {
+          "default": true,
+          "description": "Whether poly's built-in ignore patterns apply.\n\nEmitted as `use_default_ignores` in the generated `[lint.uncomment]`\ntable.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
     "UpdateConfig": {
       "properties": {
         "before": {
@@ -6701,7 +6842,7 @@
         },
         "custom_rust_modules": {
           "default": [],
-          "description": "Hand-written Rust modules to declare in the generated lib.rs with `pub mod <name>;`\nand re-export with `pub use <name>::*;`. Separate from `[custom_modules].wasm` which\nonly adds TypeScript `export *` re-exports. Use this for Rust-side dispatch/glue modules.",
+          "description": "Hand-written Rust modules to declare in the generated lib.rs with `pub mod <name>;`\nand re-export with `pub use <name>::*;`. This is the knob for Rust-side dispatch/glue\nmodules under wasm. Note that `[custom_modules].wasm` is NOT consumed by the wasm\nbackend (no code path reads it) — use this field instead.",
           "items": {
             "type": "string"
           },
@@ -6753,6 +6894,20 @@
           "default": {},
           "description": "Additional Cargo dependencies for the WASM binding crate only.",
           "type": "object"
+        },
+        "extra_dev_dependencies": {
+          "additionalProperties": true,
+          "default": {},
+          "description": "Additional `[dev-dependencies]` entries for the generated WASM binding\ncrate's Cargo.toml. Declares test-only dependencies for hand-written\ntest files (e.g. `wasm-bindgen-test` for in-crate `#[wasm_bindgen_test]`\nsuites) without hand-editing the generated manifest.",
+          "type": "object"
+        },
+        "extra_features": {
+          "default": [],
+          "description": "Core-crate features to declare as opt-in passthrough features on the\ngenerated WASM binding crate without enabling them on its core dependency.\nEach entry `name` emits `name = [\"<core-crate>/name\"]` in `[features]`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
         },
         "extra_lint_paths": {
           "default": [],
@@ -6820,6 +6975,19 @@
           },
           "type": "array"
         },
+        "targets": {
+          "default": [
+            "web",
+            "bundler",
+            "nodejs",
+            "deno"
+          ],
+          "description": "wasm-pack build targets to generate and publish. Each entry produces a\n`pkg/<target>` build plus a `build:wasm:<target>` script; `build:all`\nbuilds exactly this set, and `files`/`main`/`module`/`types` are derived\nfrom it. Every target embeds its own full copy of the wasm binary, so\nrestricting this to a single target (e.g. `[\"web\"]`) keeps the published\nnpm package small — the `web` ES module is consumed by browsers, CDNs,\nbundlers, Deno (`npm:`), and Node 22+. Valid entries: `web`, `bundler`,\n`nodejs`, `deno`. Defaults to all four for backward compatibility.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "type_overrides": {
           "additionalProperties": {
             "type": "string"
@@ -6834,6 +7002,14 @@
             "string",
             "null"
           ]
+        },
+        "wasm_opt": {
+          "default": [],
+          "description": "`wasm-opt` pass arguments, emitted as\n`[package.metadata.wasm-pack.profile.release] wasm-opt = [...]`. When set to\na non-empty list, wasm-pack runs `wasm-opt` with these flags (e.g. `[\"-Oz\"]`\nto minimize binary size, keeping large builds under a CDN per-file cap).\nDefaults to empty, which emits `wasm-opt = false` so wasm-pack skips the pass\n(the historical default; unchanged for consumers that don't set it).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
         }
       },
       "type": "object"
@@ -7163,12 +7339,16 @@
           "$ref": "#/$defs/PolyConfig",
           "default": {
             "exclude": [],
+            "file-safety-exclude": [],
+            "hooks-sources": [],
+            "lint-workspace": null,
             "per-file-ignores": {},
             "pyrefly-sub-configs": {},
             "typos": {
               "extend-identifiers": {},
               "extend-words": {}
-            }
+            },
+            "uncomment": null
           },
           "description": "Repository-level `poly.toml` customisations merged into the emitter's\ngenerated output.  Because `poly.toml` is regenerated on every `alef`\nrun, any per-repo lint suppressions must live here to survive regen.\n\nSee [`PolyConfig`] for the full set of configurable knobs."
         },
@@ -7251,6 +7431,14 @@
           ],
           "default": null,
           "description": "Workspace-wide version sync rules. A per-crate publish step still runs\nindependently per crate; sync rules in this section apply globally."
+        },
+        "targets": {
+          "additionalProperties": {
+            "type": "boolean"
+          },
+          "default": {},
+          "description": "Per-target build opt-out toggles, shared across all crates.\n\nKeys are canonical target families — `linux_x64`, `linux_arm64`,\n`linux_x64_musl`, `linux_arm64_musl`, `mac_intel`, `mac_arm`,\n`windows_x64`, `windows_arm64` (see\n[`crate::publish::platform::CANONICAL_TARGET_KEYS`]). Setting a key to\n`false` drops every matching target triple from every language's\ngenerated target list (napi platforms, elixir nif targets, C# RIDs,\nruby cross-platforms, dart native RIDs). Absent keys default to enabled,\nso an empty table leaves generated output unchanged. A per-crate\n`[[crates]] targets` table overrides individual keys.",
+          "type": "object"
         },
         "test": {
           "additionalProperties": {
@@ -7390,7 +7578,7 @@
       "type": "object"
     }
   },
-  "$id": "https://github.com/xberg-io/alef/releases/download/v0.32.6/alef.schema.json",
+  "$id": "https://github.com/xberg-io/alef/releases/download/v0.55.6/alef.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "description": "JSON Schema for the JSON representation of alef.toml.",
@@ -7473,12 +7661,16 @@
         "php": null,
         "poly": {
           "exclude": [],
+          "file-safety-exclude": [],
+          "hooks-sources": [],
+          "lint-workspace": null,
           "per-file-ignores": {},
           "pyrefly-sub-configs": {},
           "typos": {
             "extend-identifiers": {},
             "extend-words": {}
-          }
+          },
+          "uncomment": null
         },
         "python": null,
         "r": null,
@@ -7487,6 +7679,7 @@
         "setup": {},
         "swift": null,
         "sync": null,
+        "targets": {},
         "test": {},
         "tools": {
           "node_package_manager": null,
@@ -7505,6 +7698,6 @@
   ],
   "title": "Alef configuration",
   "type": "object",
-  "version": "0.32.6",
-  "x-alef-version": "0.32.6"
+  "version": "0.55.6",
+  "x-alef-version": "0.55.6"
 }

@@ -17,8 +17,6 @@ fn test_option_option_primitive_getter_returns_primitive_type() {
             original_rust_path: String::new(),
             fields: vec![FieldDef {
                 name: "max_depth".to_string(),
-                // field.ty = Optional(Primitive(Usize)), field.optional = true
-                // represents Rust type Option<Option<usize>>
                 ty: TypeRef::Optional(Box::new(TypeRef::Primitive(PrimitiveType::Usize))),
                 optional: true,
                 default: None,
@@ -72,7 +70,6 @@ fn test_option_option_primitive_getter_returns_primitive_type() {
     let files = backend.generate_bindings(&api, &config).unwrap();
     let lib = files.iter().find(|f| f.path.ends_with("lib.rs")).unwrap();
 
-    // Return type must be `usize`, not `*mut std::ffi::c_char`
     assert!(
         lib.content.contains("-> usize"),
         "expected `-> usize` in getter but got:\n{}",
@@ -83,13 +80,11 @@ fn test_option_option_primitive_getter_returns_primitive_type() {
         "getter must not return *mut c_char for Option<Option<usize>>"
     );
 
-    // Both None arms must return 0, not a pointer
     assert!(
         lib.content.contains("None => 0"),
         "expected `None => 0` sentinel in generated getter"
     );
 
-    // The inner Some(inner_val) branch must dereference the usize
     assert!(
         lib.content.contains("*inner_val"),
         "expected `*inner_val` deref for inner primitive in generated getter"
@@ -99,7 +94,6 @@ fn test_option_option_primitive_getter_returns_primitive_type() {
 /// Build a minimal `ApiSurface` with one struct that has a Named field,
 /// controlling `is_clone` on the field's referenced type.
 fn api_with_named_field(field_type: &str, is_clone: bool) -> ApiSurface {
-    // The struct that holds the Named field
     let holder = TypeDef {
         name: "Holder".to_string(),
         rust_path: "my_lib::Holder".to_string(),
@@ -144,7 +138,6 @@ fn api_with_named_field(field_type: &str, is_clone: bool) -> ApiSurface {
         has_private_fields: false,
         version: Default::default(),
     };
-    // The type referenced by the Named field
     let named_type = TypeDef {
         name: field_type.to_string(),
         rust_path: format!("my_lib::{field_type}"),
@@ -196,7 +189,6 @@ fn test_named_field_non_clone_no_clone_call() {
     let files = backend.generate_bindings(&api, &config).unwrap();
     let lib = files.iter().find(|f| f.path.ends_with("lib.rs")).unwrap();
 
-    // The field accessor for `inner` (a non-Clone opaque type) must not call .clone()
     assert!(
         !lib.content.contains(".clone()"),
         "non-Clone opaque Named field must not emit .clone() in accessor:\n{}",
@@ -214,7 +206,6 @@ fn test_named_field_clone_capable_emits_clone() {
     let files = backend.generate_bindings(&api, &config).unwrap();
     let lib = files.iter().find(|f| f.path.ends_with("lib.rs")).unwrap();
 
-    // The field accessor for `inner` (a Clone type) must clone the value
     assert!(
         lib.content.contains(".clone()"),
         "Clone-capable Named field must emit .clone() in accessor:\n{}",
@@ -368,11 +359,6 @@ result_type = "WalkOutcome"
         !lib.content.contains("syn_parse_with_visitor"),
         "options-field mode must not emit the legacy with_visitor wrapper"
     );
-    // Regression for Zig (strict opaque pointer cast): when visitor_callbacks is enabled the
-    // options-field setter must accept the *mut SynVisitor handle produced by
-    // syn_visitor_create, NOT the *mut SynSyntaxWalkerBridge produced by the trait-bridge
-    // path. C and Zig consumers both call syn_visitor_create followed by
-    // syn_options_set_renderer; Zig refuses implicit casts between opaque pointer types.
     assert!(
         lib.content.contains("visitor: *mut SynVisitor"),
         "options-field setter must accept *mut SynVisitor when visitor_callbacks is enabled"
@@ -482,5 +468,49 @@ options_field = "renderer"
     assert!(
         !lib.content.contains("ConversionOptions") && !lib.content.contains("ConversionResult"),
         "must not leak conversion-shaped type names in generic wrapper"
+    );
+}
+
+/// Regression: a field marked `binding_excluded` (e.g. a global `[crates.exclude].fields`
+/// entry hiding a pipeline-invariant field of a foreign `source_crate` type) must NOT get a
+/// generated FFI accessor. Previously the FFI backend filtered only on `sanitized`, so an
+/// excluded field still emitted a getter — and a name-colliding foreign type (h2m
+/// `OutputFormat` vs host `OutputFormat`) made that getter fail to compile.
+#[test]
+fn test_binding_excluded_field_emits_no_accessor() {
+    let backend = FfiBackend;
+    let config = sample_config();
+
+    let baseline = backend
+        .generate_bindings(&sample_api(), &config)
+        .unwrap()
+        .into_iter()
+        .find(|f| f.path.ends_with("lib.rs"))
+        .unwrap()
+        .content;
+    assert!(
+        baseline.contains("_verbose("),
+        "baseline should emit a `verbose` accessor"
+    );
+
+    let mut api = sample_api();
+    let verbose = api.types[0].fields.iter_mut().find(|f| f.name == "verbose").unwrap();
+    verbose.binding_excluded = true;
+    verbose.binding_exclusion_reason = Some("exclude.fields".to_string());
+
+    let excluded = backend
+        .generate_bindings(&api, &config)
+        .unwrap()
+        .into_iter()
+        .find(|f| f.path.ends_with("lib.rs"))
+        .unwrap()
+        .content;
+    assert!(
+        !excluded.contains("_verbose("),
+        "excluded field must not emit an accessor, got:\n{excluded}"
+    );
+    assert!(
+        excluded.contains("_name("),
+        "sibling non-excluded fields must still emit accessors"
     );
 }

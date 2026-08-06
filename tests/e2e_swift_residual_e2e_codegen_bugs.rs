@@ -153,8 +153,6 @@ fn render_with_config(config_toml: &str, fixture: Fixture, type_defs: Vec<TypeDe
         .clone()
 }
 
-// -- Bug A: function name `init` becomes `init_` (swift_ident escape) --------
-
 #[test]
 fn function_named_init_is_escaped_to_init_underscore() {
     let toml = r#"
@@ -206,8 +204,6 @@ type = "json_object"
     );
 }
 
-// -- Bug B: Vec<String> result emits direct .contains, no .asStr() ----------
-
 #[test]
 fn vec_string_result_uses_native_contains_without_as_str_coercion() {
     let toml = r#"
@@ -257,8 +253,6 @@ args = []
     );
 }
 
-// -- Bug C: result_is_simple + result_is_option coalesces before trimming ---
-
 #[test]
 fn simple_optional_result_coalesces_before_string_assertions() {
     let toml = r#"
@@ -305,15 +299,12 @@ type = "string"
         "Optional<String> bare result must be coalesced with `?? \"\"` \
          before string operations. Rendered:\n{rendered}"
     );
-    // Negative guard: the unwrapped form previously emitted is rejected by Swift.
     assert!(
         !rendered.contains("        XCTAssertEqual(result.trimmingCharacters"),
         "must not call `.trimmingCharacters` on the optional directly. \
          Rendered:\n{rendered}"
     );
 }
-
-// -- Bug D: opaque element accessor override (`structure → kind`) ----------
 
 #[test]
 fn contains_over_opaque_vec_uses_configured_element_accessor() {
@@ -373,8 +364,6 @@ type = "string"
     );
 }
 
-// -- Bug E: count_min on opaque scalar field wraps with .toString() --------
-
 #[test]
 fn count_min_on_opaque_method_call_wraps_with_tostring() {
     let toml = r#"
@@ -412,9 +401,6 @@ type = "string"
             return_type: None,
         },
     );
-    // The test result type is `TextResult` with a String field `text`.
-    // String is not a PrimitiveType, so we use Named("String").
-    // When emitted to Swift via opaque method call, it becomes RustString.
     let result_ir = vec![make_type(
         "TextResult",
         vec![make_field("text", TypeRef::Named("String".to_string()))],
@@ -429,5 +415,134 @@ type = "string"
     assert!(
         !rendered.contains("result.text().count"),
         "must not call `.count` directly on RustString. Rendered:\n{rendered}"
+    );
+}
+
+/// Regression for the ci-e2e swift failure (`ContractTests.swift:129`): a scalar-string
+/// leaf reached with `has_optional = true` rendered `...elements().toString()?.count`,
+/// which Swift rejects with "cannot use optional chaining on non-optional value of type
+/// 'String'" because `.toString()` returns a non-optional `String`. Such a target must
+/// take `.count` directly.
+#[test]
+fn count_min_on_optional_scalar_field_does_not_optional_chain_count() {
+    let toml = r#"
+[workspace]
+languages = ["swift"]
+
+[[crates]]
+name = "sample_pack"
+sources = ["src/lib.rs"]
+
+[crates.e2e]
+fixtures = "fixtures"
+output = "e2e"
+
+[crates.e2e.call]
+function = "extract_text"
+module = "SampleLanguagePack"
+result_var = "result"
+
+[[crates.e2e.call.args]]
+name = "document"
+field = "input"
+type = "string"
+"#;
+    let fixture = make_fixture(
+        "extract_text_optional_count_min",
+        Assertion {
+            assertion_type: "count_min".to_string(),
+            field: Some("text".to_string()),
+            value: Some(serde_json::json!(1)),
+            values: None,
+            method: None,
+            check: None,
+            args: None,
+            return_type: None,
+        },
+    );
+    let mut text_field = make_field("text", TypeRef::Named("String".to_string()));
+    text_field.optional = true;
+    let result_ir = vec![make_type("TextResult", vec![text_field])];
+    let rendered = render_with_config(toml, fixture, result_ir);
+
+    assert!(
+        !rendered.contains(".toString()?.count"),
+        "must not optional-chain `.count` onto a non-optional `.toString()` String. \
+         Rendered:\n{rendered}"
+    );
+    assert!(
+        rendered.contains(".toString().count"),
+        "count_min on an optional scalar String must take `.count` on the Swift String directly. \
+         Rendered:\n{rendered}"
+    );
+}
+
+/// Regression for the ci-e2e swift failure (`ContractTests.swift`): an opaque-parent
+/// `Option<Vec<T>>` field (e.g. `elements: Option<Vec<Element>>`) is natively bridged by
+/// swift-bridge as `Optional<RustVec<Element>>`, NOT as a JSON-string `RustString`. The e2e
+/// classifier previously treated `f.optional` on a Vec field as disqualifying it from being
+/// countable, which routed it into the JSON-bridged bucket and made `count_min` fall back to
+/// `.toString().count` — a compile error on `Optional<RustVec<T>>`, which has no `.toString()`.
+/// The fix must emit `?.count ?? 0` on the native `RustVec` handle instead.
+#[test]
+fn count_min_on_optional_vec_of_named_uses_native_optional_count() {
+    let toml = r#"
+[workspace]
+languages = ["swift"]
+
+[[crates]]
+name = "sample_pack"
+sources = ["src/lib.rs"]
+
+[crates.e2e]
+fixtures = "fixtures"
+output = "e2e"
+fields_optional = ["elements"]
+
+[crates.e2e.call]
+function = "extract_text"
+module = "SampleLanguagePack"
+result_var = "result"
+
+[[crates.e2e.call.args]]
+name = "document"
+field = "input"
+type = "string"
+"#;
+    let fixture = make_fixture(
+        "extract_text_optional_vec_count_min",
+        Assertion {
+            assertion_type: "count_min".to_string(),
+            field: Some("elements".to_string()),
+            value: Some(serde_json::json!(1)),
+            values: None,
+            method: None,
+            check: None,
+            args: None,
+            return_type: None,
+        },
+    );
+    let mut elements_field = make_field(
+        "elements",
+        TypeRef::Vec(Box::new(TypeRef::Named("Element".to_string()))),
+    );
+    elements_field.optional = true;
+    let mut parent = make_type("TextResult", vec![elements_field]);
+    // The parent must stay opaque for this shape to be natively bridged. On a first-class parent,
+    // `emit_vec_struct_serde_getter` collapses an optional `Vec<Named(serde struct)>` into a
+    // whole-field `-> String`, a `RustString` in Swift that genuinely has no `.count`. ~keep
+    parent.is_opaque = true;
+    let result_ir = vec![parent, make_type("Element", vec![make_field("text", TypeRef::String)])];
+    let rendered = render_with_config(toml, fixture, result_ir);
+
+    assert!(
+        rendered.contains("elements()?.count ?? 0"),
+        "count_min on an Optional<RustVec<T>> field must unwrap with `?.count ?? 0` \
+         on the native RustVec handle. Rendered:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("elements().toString()"),
+        "must not fall back to `.toString()` on a native Optional<RustVec<T>> handle, \
+         which has no `.toString()` method. Rendered:\n{rendered}"
     );
 }

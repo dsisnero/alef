@@ -6,6 +6,7 @@
 
 use crate::backends::php::naming::php_autoload_namespace;
 use crate::core::backend::GeneratedFile;
+use crate::core::config::Language;
 use crate::core::config::ResolvedCrateConfig;
 use crate::e2e::config::E2eConfig;
 use crate::e2e::escape::sanitize_filename;
@@ -90,7 +91,7 @@ impl E2eCodegen for PhpCodegen {
             .as_ref()
             .and_then(|p| p.path.as_ref())
             .cloned()
-            .unwrap_or_else(|| "../../packages/php".to_string());
+            .unwrap_or_else(|| default_php_pkg_path(config));
         let pkg_version = php_pkg
             .as_ref()
             .and_then(|p| p.version.as_ref())
@@ -108,7 +109,8 @@ impl E2eCodegen for PhpCodegen {
         // namespace separator must be JSON-escaped (`\` → `\\`). The trailing
         // pair represents the PHP-mandated trailing `\` (which itself escapes
         // to `\\` in JSON).
-        let php_namespace_escaped = php_autoload_namespace(config).replace('\\', "\\\\");
+        let php_namespace = php_autoload_namespace(config);
+        let php_namespace_escaped = php_namespace.replace('\\', "\\\\");
         let e2e_autoload_ns = format!("{php_namespace_escaped}\\\\E2e\\\\");
 
         // Generate composer.json.
@@ -118,7 +120,7 @@ impl E2eCodegen for PhpCodegen {
                 &e2e_pkg_name,
                 &e2e_autoload_ns,
                 &extension_name,
-                &pkg_name,
+                &php_namespace,
                 &pkg_path,
                 &pkg_version,
                 e2e_config.dep_mode,
@@ -201,7 +203,7 @@ impl E2eCodegen for PhpCodegen {
         // Compute per-(type, field) getter classification for PHP.
         // ext-php-rs 0.15.x exposes scalar fields as PHP properties via `#[php(prop)]`,
         // but non-scalar fields (Named structs, Vec<Named>, Map, etc.) need a
-        // `#[php(getter)]` method because `get_method_props` is `todo!()` in
+        // `#[php(getter)]` method because `get_method_props` is unimplemented in
         // ext-php-rs-derive 0.11.7. E2e assertions must call `->getCamelCase()` for those.
         //
         // The classification MUST be keyed by (owner_type, field_name) rather than
@@ -259,6 +261,35 @@ impl E2eCodegen for PhpCodegen {
     fn language_name(&self) -> &'static str {
         "php"
     }
+}
+
+/// Default `path` for the local PHP composer dependency when
+/// `[crates.e2e.packages.php].path` is unset.
+///
+/// Derived from [`ResolvedCrateConfig::package_dir`] for [`Language::Php`], which
+/// follows `[crates.output] php` when configured — since 0.51 that co-locates the
+/// generated userland classes with the PHP binding crate at `crates/<pkg>-php/src/`
+/// instead of the historical `packages/php/` — or falls back to the historical
+/// `packages/php` default when unconfigured.
+///
+/// `php_autoload_section` (in `project.rs`) always appends its own `/src/` suffix to
+/// this path to build the PSR-4 mapping, mirroring the historical split layout
+/// (`packages/php/composer.json` + `packages/php/src/*.php`). When the resolved
+/// package directory is co-located and already ends in `/src` (the
+/// `crates/<pkg>-php/src/` shape), that trailing segment is stripped here so the
+/// re-appended `/src/` lands back on the real directory instead of doubling up into a
+/// nonexistent `.../src/src/`. ~keep
+fn default_php_pkg_path(config: &ResolvedCrateConfig) -> String {
+    let pkg_dir = config.package_dir(Language::Php);
+    let trimmed = pkg_dir.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return "../../packages/php".to_string();
+    }
+    let crate_root = trimmed.strip_suffix("/src").unwrap_or(trimmed);
+    if crate_root.is_empty() {
+        return "../../packages/php".to_string();
+    }
+    format!("../../{crate_root}")
 }
 
 mod args;

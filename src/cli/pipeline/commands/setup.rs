@@ -3,7 +3,7 @@ use crate::core::config::output::StringOrVec;
 use crate::core::config::{Language, ResolvedCrateConfig};
 use anyhow::Context as _;
 use rayon::prelude::*;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 /// Install dependencies for each language.
 ///
@@ -25,13 +25,6 @@ pub fn setup(
             if !check_precondition(*lang, setup_cfg.precondition.as_deref()) {
                 return (*lang, Ok(()));
             }
-            // Resolve the per-language working directory. Languages whose
-            // manifest does not live at the repo root (swift / kotlin-android /
-            // dart / zig) declare a `workdir` so install commands like
-            // `swift package resolve` and `gradle build` find their manifest.
-            // Skip the cwd if the directory does not exist yet — the binding
-            // may not have been initialized, in which case the install command
-            // would have failed anyway from the repo root.
             let cwd: Option<std::path::PathBuf> = setup_cfg.workdir.as_ref().and_then(|w| {
                 let joined = base_dir.join(w);
                 if joined.exists() {
@@ -66,7 +59,7 @@ pub fn setup(
     let mut first_error: Option<anyhow::Error> = None;
     for (lang, result) in results {
         if let Err(e) = result {
-            eprintln!("✗ setup failed: {lang} — {e}");
+            error!("setup failed: {lang} — {e}");
             warn!("Setup failed for {lang}: {e}");
             if first_error.is_none() {
                 first_error = Some(e);

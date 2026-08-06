@@ -23,6 +23,8 @@ pub(crate) fn scaffold_dart(api: &ApiSurface, config: &ResolvedCrateConfig) -> a
     let build_runner = pub_dev::BUILD_RUNNER;
     let json_serializable = pub_dev::JSON_SERIALIZABLE;
     let native_assets_cli = pub_dev::NATIVE_ASSETS_CLI;
+    let http_package = pub_dev::HTTP_PACKAGE;
+    let crypto_package = pub_dev::CRYPTO;
     let style = dart_style(config);
 
     let dependency_block = match style {
@@ -80,17 +82,12 @@ pub(crate) fn scaffold_dart(api: &ApiSurface, config: &ResolvedCrateConfig) -> a
         .as_deref()
         .map(|repository| format!("repository: {repository}\n"))
         .unwrap_or_default();
-    // Only emit `homepage:` when it is non-empty to keep pubspec.yaml clean.
     let homepage_line = if meta.homepage.is_empty() {
         String::new()
     } else {
         format!("homepage: {}\n", meta.homepage)
     };
 
-    // Host-native capsule (Language) passthrough. Dart has no idiomatic high-level
-    // tree-sitter Language wrapper, so the binding returns the raw `Pointer<TSLanguage>`
-    // via dart:ffi and normally needs no extra package. A capsule entry with a non-empty
-    // `package` still injects a pub dependency line for consumers that wire their own wrapper.
     let capsule_dependency_lines: String = {
         let mut deps: Vec<(String, String)> = config
             .dart
@@ -124,7 +121,9 @@ version: {version}
 executables:
   download_libs:
 dependencies:
-  http: '^1.1.0'
+  http: '{http_package}'
+  # SHA-256 verification of downloaded native-library release assets.
+  crypto: '{crypto_package}'
 {capsule_dependency_lines}{dependency_block}dev_dependencies:
   test: '{test_package}'
   lints: '{lints}'
@@ -135,6 +134,8 @@ dependencies:
         repository_line = repository_line,
         homepage_line = homepage_line,
         capsule_dependency_lines = capsule_dependency_lines,
+        http_package = http_package,
+        crypto_package = crypto_package,
     );
 
     let generated_dir = format!("lib/src/{module_name}_bridge_generated/**");
@@ -173,6 +174,12 @@ linter:
     );
 
     let gitignore = ".dart_tool/\nbuild/\npubspec.lock\n";
+
+    // NOTE: do NOT exclude lib/src/native/ or *.so/*.dylib/*.dll here. Native FFI
+    // libraries are staged into lib/src/native/<rid>/ at publish time and MUST ship in
+    // the pub.dev tarball; .pubignore fully replaces git-based file listing, so excluding
+    // them silently strips the natives and consumers cannot load the FFI library.
+    let pubignore = "android/\nios/\nblobs/\nrust/\nexample/\ntest/\n";
 
     let test_dart = r#"import 'package:test/test.dart';
 
@@ -240,9 +247,6 @@ From the repository root:
 
     let editorconfig = "[*]\ncharset = utf-8\nend_of_line = lf\ninsert_final_newline = true\n\n[*.dart]\nindent_style = space\nindent_size = 2\n";
 
-    // pub.dev requires a CHANGELOG.md in the package root. Emit a minimal seed
-    // entry keyed to the current version. This file has generated_header: false
-    // so it is a create-once seed — users update it before publishing.
     let changelog = format!(
         "# Changelog\n\nAll notable changes to this package will be documented in this file.\n\n## {version}\n\n- Initial release.\n",
         version = version,
@@ -274,6 +278,11 @@ void main() {{
         GeneratedFile {
             path: PathBuf::from("packages/dart/.gitignore"),
             content: gitignore.to_string(),
+            generated_header: false,
+        },
+        GeneratedFile {
+            path: PathBuf::from("packages/dart/.pubignore"),
+            content: pubignore.to_string(),
             generated_header: false,
         },
         GeneratedFile {

@@ -9,9 +9,6 @@ pub(super) struct CallbackArgField {
     c_type: String,
 }
 
-// Data-driven callback specifications
-// ---------------------------------------------------------------------------
-
 /// The kind of a single callback parameter (beyond the common ctx/user_data/out
 /// prefix that every callback shares).
 pub(super) enum ParamKind {
@@ -47,9 +44,7 @@ pub(crate) fn callback_specs_from_trait(
     bridge_cfg: Option<&TraitBridgeConfig>,
 ) -> Vec<CallbackSpec> {
     let Some(protocol) = VisitorProtocol::from_bridge_config("", bridge_cfg) else {
-        eprintln!(
-            "[alef] gen_visitor(ffi): visitor callbacks require configured context_type and result_type metadata"
-        );
+        tracing::warn!("gen_visitor(ffi): visitor callbacks require configured context_type and result_type metadata");
         return Vec::new();
     };
     let mut specs = Vec::with_capacity(trait_def.methods.len());
@@ -58,9 +53,10 @@ pub(crate) fn callback_specs_from_trait(
             continue;
         }
         if !matches!(&m.return_type, TypeRef::Named(name) if name == &protocol.result_type) {
-            eprintln!(
-                "[alef] gen_visitor(ffi): skip method `{}` — visitor callbacks require `{}` return type",
-                m.name, protocol.result_type
+            tracing::warn!(
+                "gen_visitor(ffi): skip method `{}` — visitor callbacks require `{}` return type",
+                m.name,
+                protocol.result_type
             );
             continue;
         }
@@ -69,15 +65,15 @@ pub(crate) fn callback_specs_from_trait(
             .iter()
             .any(|p| matches!(&p.ty, TypeRef::Named(name) if name == &protocol.context_type))
         {
-            eprintln!(
-                "[alef] gen_visitor(ffi): skip method `{}` — visitor callbacks require `{}` parameter",
-                m.name, protocol.context_type
+            tracing::warn!(
+                "gen_visitor(ffi): skip method `{}` — visitor callbacks require `{}` parameter",
+                m.name,
+                protocol.context_type
             );
             continue;
         }
         let mut params = Vec::new();
         for p in &m.params {
-            // Skip the context parameter — it is threaded via FFI's separate channel.
             if matches!(&p.ty, TypeRef::Named(name) if name == &protocol.context_type) {
                 continue;
             }
@@ -113,17 +109,20 @@ pub(crate) fn callback_specs_from_trait(
                         params.push(ParamKind::CellSlice(param_name));
                     }
                     _ => {
-                        eprintln!(
-                            "[alef] gen_visitor(ffi): skip method `{}` — unsupported Vec param `{}`",
-                            m.name, p.name
+                        tracing::warn!(
+                            "gen_visitor(ffi): skip method `{}` — unsupported Vec param `{}`",
+                            m.name,
+                            p.name
                         );
                         continue 'methods;
                     }
                 },
                 _ => {
-                    eprintln!(
-                        "[alef] gen_visitor(ffi): skip method `{}` — unsupported param `{}: {:?}`",
-                        m.name, p.name, p.ty
+                    tracing::warn!(
+                        "gen_visitor(ffi): skip method `{}` — unsupported param `{}: {:?}`",
+                        m.name,
+                        p.name,
+                        p.ty
                     );
                     continue 'methods;
                 }
@@ -137,10 +136,6 @@ pub(crate) fn callback_specs_from_trait(
     }
     specs
 }
-
-// ---------------------------------------------------------------------------
-// Code-generation helpers — each produces one section of the output
-// ---------------------------------------------------------------------------
 
 /// Build the C `extern "C" fn(...)` signature parameters for one callback.
 pub(super) fn callback_arg_fields(spec: &CallbackSpec, pascal_prefix: &str) -> Vec<CallbackArgField> {
@@ -200,11 +195,7 @@ pub(super) fn callback_arg_fields(spec: &CallbackSpec, pascal_prefix: &str) -> V
 /// Build sanitized doc lines for a callback field template.
 fn callback_doc_lines(doc: &str) -> Vec<String> {
     doc.lines()
-        .map(|line| {
-            // Strip any leading `///` the caller may have pre-pended so embedded
-            // continuation lines do not get double-prefixed by the template.
-            line.trim_start_matches("///").trim_start().to_string()
-        })
+        .map(|line| line.trim_start_matches("///").trim_start().to_string())
         .collect()
 }
 

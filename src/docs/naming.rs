@@ -75,7 +75,6 @@ pub(crate) fn lang_code_fence(lang: Language) -> &'static str {
 
 /// Convert a Rust type name to the idiomatic name for the target language.
 pub(crate) fn type_name(name: &str, lang: Language, ffi_prefix: &str) -> String {
-    // Strip module path prefix if present
     let short = name.rsplit("::").next().unwrap_or(name);
     match lang {
         Language::Python
@@ -97,7 +96,6 @@ pub(crate) fn type_name(name: &str, lang: Language, ffi_prefix: &str) -> String 
         | Language::Zig
         | Language::Crystal => short.to_pascal_case(),
         Language::Ffi | Language::C | Language::Jni => {
-            // C: prefix with configured FFI prefix (PascalCase) and PascalCase type name
             format!("{}{}", ffi_prefix, short.to_pascal_case())
         }
     }
@@ -120,7 +118,6 @@ pub(crate) fn func_name(name: &str, lang: Language, ffi_prefix: &str) -> String 
         | Language::Gleam
         | Language::Zig => to_camel_case(name),
     };
-    // Handle reserved keywords
     match (lang, base.as_str()) {
         (Language::Java, "default") => "defaultOptions".to_string(),
         (Language::Csharp, "Default") => "CreateDefault".to_string(),
@@ -140,7 +137,6 @@ pub(crate) fn field_name(name: &str, lang: Language) -> String {
         | Language::C
         | Language::Crystal
         | Language::Jni => name.to_snake_case(),
-        // Go and C# exported fields/properties are PascalCase
         Language::Go | Language::Csharp => name.to_pascal_case(),
         Language::Node | Language::Wasm | Language::Java | Language::Php => to_camel_case(name),
         Language::Kotlin
@@ -154,7 +150,6 @@ pub(crate) fn field_name(name: &str, lang: Language) -> String {
 
 /// Convert a Rust enum variant name to the idiomatic name for the target language.
 pub(crate) fn enum_variant_name(name: &str, lang: Language, ffi_prefix: &str) -> String {
-    // Special-case acronym variants that don't split cleanly
     if name == "RDFa" {
         return match lang {
             Language::Python | Language::Java => "RDFA".to_string(),
@@ -165,18 +160,9 @@ pub(crate) fn enum_variant_name(name: &str, lang: Language, ffi_prefix: &str) ->
         };
     }
     match lang {
-        Language::Python => {
-            // Python: UPPER_SNAKE_CASE
-            name.to_shouty_snake_case()
-        }
-        Language::Java => {
-            // Java: UPPER_SNAKE_CASE
-            name.to_shouty_snake_case()
-        }
-        Language::Ruby | Language::Elixir => {
-            // Ruby/Elixir: :snake_atom style
-            name.to_snake_case()
-        }
+        Language::Python => name.to_shouty_snake_case(),
+        Language::Java => name.to_shouty_snake_case(),
+        Language::Ruby | Language::Elixir => name.to_snake_case(),
         Language::Go
         | Language::Node
         | Language::Wasm
@@ -190,7 +176,6 @@ pub(crate) fn enum_variant_name(name: &str, lang: Language, ffi_prefix: &str) ->
         | Language::Crystal
         | Language::Zig => name.to_pascal_case(),
         Language::R => name.to_snake_case(),
-        // Rust: PascalCase enum variants
         Language::Rust => name.to_pascal_case(),
         Language::Ffi | Language::C | Language::Jni => {
             format!("{}_{}", ffi_prefix.to_shouty_snake_case(), name.to_shouty_snake_case())
@@ -286,8 +271,6 @@ mod tests {
 
     #[test]
     fn test_lang_slug_kotlin_vs_kotlin_android() {
-        // JVM Kotlin keeps the bare `kotlin` slug; the Android target gets its own slug so
-        // both can coexist as sibling api-*.md docs in the same workspace.
         assert_eq!(lang_slug(Language::Kotlin), "kotlin");
         assert_eq!(lang_slug(Language::KotlinAndroid), "kotlin-android");
     }
@@ -300,13 +283,7 @@ mod tests {
 
     #[test]
     fn test_lang_code_fence_kotlin_android_uses_kotlin() {
-        // The code-fence language stays `kotlin` because that's what syntax highlighters expect —
-        // only the doc filename and human-readable title need to differ.
         assert_eq!(lang_code_fence(Language::Kotlin), "kotlin");
         assert_eq!(lang_code_fence(Language::KotlinAndroid), "kotlin");
     }
 }
-
-// ---------------------------------------------------------------------------
-// Default value formatting
-// ---------------------------------------------------------------------------

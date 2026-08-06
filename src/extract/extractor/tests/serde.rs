@@ -18,8 +18,6 @@ fn test_has_serde_via_derive_still_detected() {
 
 #[test]
 fn test_has_serde_via_manual_impls_detected() {
-    // Types with manual impl Serialize + impl Deserialize blocks must get has_serde=true.
-    // This mirrors borrowed context structs that use asymmetric lifetime impls.
     let source = r#"
         #[derive(Clone, Debug)]
         pub struct NodeContext {
@@ -29,13 +27,13 @@ fn test_has_serde_via_manual_impls_detected() {
 
         impl serde::Serialize for NodeContext {
             fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-                todo!()
+                unimplemented!()
             }
         }
 
         impl<'de> serde::Deserialize<'de> for NodeContext {
             fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-                todo!()
+                unimplemented!()
             }
         }
     "#;
@@ -50,7 +48,6 @@ fn test_has_serde_via_manual_impls_detected() {
 
 #[test]
 fn test_has_serde_with_lifetime_parameterised_manual_impls() {
-    // Mirrors the exact NodeContext pattern: Serialize on Foo<'_>, Deserialize on Foo<'static>.
     let source = r#"
         #[derive(Clone, Debug)]
         pub struct Foo {
@@ -59,13 +56,13 @@ fn test_has_serde_with_lifetime_parameterised_manual_impls() {
 
         impl serde::Serialize for Foo {
             fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-                todo!()
+                unimplemented!()
             }
         }
 
         impl<'de> serde::Deserialize<'de> for Foo {
             fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-                todo!()
+                unimplemented!()
             }
         }
     "#;
@@ -80,7 +77,6 @@ fn test_has_serde_with_lifetime_parameterised_manual_impls() {
 
 #[test]
 fn test_has_serde_only_serialize_not_set() {
-    // Only Serialize without Deserialize must NOT set has_serde=true.
     let source = r#"
         #[derive(Clone, Debug)]
         pub struct Foo {
@@ -89,7 +85,7 @@ fn test_has_serde_only_serialize_not_set() {
 
         impl serde::Serialize for Foo {
             fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-                todo!()
+                unimplemented!()
             }
         }
     "#;
@@ -101,10 +97,6 @@ fn test_has_serde_only_serialize_not_set() {
         "only Serialize without Deserialize must not set has_serde"
     );
 }
-
-// ---------------------------------------------------------------------------
-// Version annotation extraction pipeline tests
-// ---------------------------------------------------------------------------
 
 #[test]
 fn test_extract_function_since_annotation_is_populated() {

@@ -16,6 +16,11 @@ pub struct WasmConfig {
     pub type_overrides: HashMap<String, String>,
     #[serde(default)]
     pub features: Option<Vec<String>>,
+    /// Core-crate features to declare as opt-in passthrough features on the
+    /// generated WASM binding crate without enabling them on its core dependency.
+    /// Each entry `name` emits `name = ["<core-crate>/name"]` in `[features]`.
+    #[serde(default)]
+    pub extra_features: Vec<String>,
     /// Override the serde rename_all strategy for JSON field names (e.g. "camelCase", "snake_case").
     /// When set, this takes priority over the IR type-level serde_rename_all.
     #[serde(default)]
@@ -31,6 +36,13 @@ pub struct WasmConfig {
     #[serde(default)]
     #[schemars(with = "HashMap<String, serde_json::Value>")]
     pub extra_dependencies: HashMap<String, toml::Value>,
+    /// Additional `[dev-dependencies]` entries for the generated WASM binding
+    /// crate's Cargo.toml. Declares test-only dependencies for hand-written
+    /// test files (e.g. `wasm-bindgen-test` for in-crate `#[wasm_bindgen_test]`
+    /// suites) without hand-editing the generated manifest.
+    #[serde(default)]
+    #[schemars(with = "HashMap<String, serde_json::Value>")]
+    pub extra_dev_dependencies: HashMap<String, toml::Value>,
     /// Per-field name remapping for this language. Key is `TypeName.field_name`, value is the
     /// desired binding field name. Applied after automatic keyword escaping.
     #[serde(default)]
@@ -61,8 +73,9 @@ pub struct WasmConfig {
     #[serde(default)]
     pub exclude_extra_dependencies: Vec<String>,
     /// Hand-written Rust modules to declare in the generated lib.rs with `pub mod <name>;`
-    /// and re-export with `pub use <name>::*;`. Separate from `[custom_modules].wasm` which
-    /// only adds TypeScript `export *` re-exports. Use this for Rust-side dispatch/glue modules.
+    /// and re-export with `pub use <name>::*;`. This is the knob for Rust-side dispatch/glue
+    /// modules under wasm. Note that `[custom_modules].wasm` is NOT consumed by the wasm
+    /// backend (no code path reads it) — use this field instead.
     #[serde(default)]
     pub custom_rust_modules: Vec<String>,
     /// Per-type field exclusions for the generated From impls and binding struct.
@@ -90,4 +103,32 @@ pub struct WasmConfig {
     /// Defaults to empty (all languages assumed supported).
     #[serde(default)]
     pub languages: Vec<String>,
+    /// wasm-pack build targets to generate and publish. Each entry produces a
+    /// `pkg/<target>` build plus a `build:wasm:<target>` script; `build:all`
+    /// builds exactly this set, and `files`/`main`/`module`/`types` are derived
+    /// from it. Every target embeds its own full copy of the wasm binary, so
+    /// restricting this to a single target (e.g. `["web"]`) keeps the published
+    /// npm package small — the `web` ES module is consumed by browsers, CDNs,
+    /// bundlers, Deno (`npm:`), and Node 22+. Valid entries: `web`, `bundler`,
+    /// `nodejs`, `deno`. Defaults to all four for backward compatibility.
+    #[serde(default = "default_wasm_targets")]
+    pub targets: Vec<String>,
+    /// `wasm-opt` pass arguments, emitted as
+    /// `[package.metadata.wasm-pack.profile.release] wasm-opt = [...]`. When set to
+    /// a non-empty list, wasm-pack runs `wasm-opt` with these flags (e.g. `["-Oz"]`
+    /// to minimize binary size, keeping large builds under a CDN per-file cap).
+    /// Defaults to empty, which emits `wasm-opt = false` so wasm-pack skips the pass
+    /// (the historical default; unchanged for consumers that don't set it).
+    #[serde(default)]
+    pub wasm_opt: Vec<String>,
+}
+
+/// The default wasm-pack target set: every target wasm-pack supports.
+pub fn default_wasm_targets() -> Vec<String> {
+    vec![
+        "web".to_string(),
+        "bundler".to_string(),
+        "nodejs".to_string(),
+        "deno".to_string(),
+    ]
 }

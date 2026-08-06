@@ -29,7 +29,6 @@ pub fn run(params: &GoTagParams<'_>) -> Result<Vec<String>> {
     let version = params.version.trim_start_matches('v');
     let tag = format!("v{version}");
 
-    // Derive major version number.
     let major: u64 = version
         .split('.')
         .next()
@@ -37,12 +36,9 @@ pub fn run(params: &GoTagParams<'_>) -> Result<Vec<String>> {
         .parse()
         .context("major version is not a number")?;
 
-    // Go submodule prefix from alef.toml output path for Go.
     let go_output = params.config.package_dir(crate::core::config::extras::Language::Go);
-    // strip trailing slashes
     let go_base = go_output.trim_end_matches('/').to_string();
 
-    // For v2+ modules, Go requires /v{major}/ in the module path.
     let go_module_path = if major >= 2 {
         format!("{go_base}/v{major}")
     } else {
@@ -50,11 +46,9 @@ pub fn run(params: &GoTagParams<'_>) -> Result<Vec<String>> {
     };
 
     let module_tag = format!("{go_module_path}/{tag}");
-    let legacy_tag = format!("{go_base}/{tag}"); // legacy non-major-versioned format
+    let legacy_tag = format!("{go_base}/{tag}");
 
-    // Collect tags to create.
     let tags = if major >= 2 {
-        // For v2+ modules emit both the versioned path and the legacy path.
         vec![module_tag.clone(), legacy_tag.clone()]
     } else {
         vec![module_tag.clone()]
@@ -64,8 +58,8 @@ pub fn run(params: &GoTagParams<'_>) -> Result<Vec<String>> {
 
     for ref_tag in &tags {
         if params.dry_run {
-            println!("[dry-run] Would create git tag: {ref_tag}");
-            println!("[dry-run] Would push to {}: {ref_tag}", params.remote);
+            tracing::info!("[dry-run] Would create git tag: {ref_tag}");
+            tracing::info!("[dry-run] Would push to {}: {ref_tag}", params.remote);
             created.push(ref_tag.clone());
         } else {
             create_and_push_tag(ref_tag, &tag, params.remote, params.workspace_root)?;
@@ -81,10 +75,10 @@ pub fn run(params: &GoTagParams<'_>) -> Result<Vec<String>> {
             "remote": params.remote,
             "dry_run": params.dry_run,
         });
-        println!("{}", serde_json::to_string_pretty(&out)?);
+        crate::bin_cli::output::payload(serde_json::to_string_pretty(&out)?);
     } else if !params.dry_run {
         for t in &created {
-            println!("Created and pushed tag: {t}");
+            crate::bin_cli::output::line(format!("Created and pushed tag: {t}"));
         }
     }
 
@@ -92,18 +86,16 @@ pub fn run(params: &GoTagParams<'_>) -> Result<Vec<String>> {
 }
 
 fn create_and_push_tag(new_tag: &str, source_ref: &str, remote: &str, workspace_root: &std::path::Path) -> Result<()> {
-    // Check if tag already exists locally.
     let local_check = std::process::Command::new("git")
         .args(["rev-parse", new_tag])
         .current_dir(workspace_root)
         .output();
 
     if local_check.is_ok_and(|o| o.status.success()) {
-        eprintln!("  Tag {new_tag} already exists locally; skipping.");
+        tracing::warn!("  Tag {new_tag} already exists locally; skipping.");
         return Ok(());
     }
 
-    // Check if tag already exists on remote.
     let remote_check = std::process::Command::new("git")
         .args(["ls-remote", "--tags", remote])
         .current_dir(workspace_root)
@@ -113,11 +105,10 @@ fn create_and_push_tag(new_tag: &str, source_ref: &str, remote: &str, workspace_
         .lines()
         .any(|l| l.contains(&format!("refs/tags/{new_tag}")))
     {
-        eprintln!("  Tag {new_tag} already exists on remote; skipping.");
+        tracing::warn!("  Tag {new_tag} already exists on remote; skipping.");
         return Ok(());
     }
 
-    // Create annotated tag.
     let tag_status = std::process::Command::new("git")
         .args([
             "tag",
@@ -135,7 +126,6 @@ fn create_and_push_tag(new_tag: &str, source_ref: &str, remote: &str, workspace_
         anyhow::bail!("git tag {new_tag} failed");
     }
 
-    // Push the tag with --force-with-lease for safety.
     let push_status = std::process::Command::new("git")
         .args(["push", "--force-with-lease", remote, &format!("refs/tags/{new_tag}")])
         .current_dir(workspace_root)
@@ -146,7 +136,7 @@ fn create_and_push_tag(new_tag: &str, source_ref: &str, remote: &str, workspace_
         anyhow::bail!("git push for tag {new_tag} failed");
     }
 
-    eprintln!("  Tag {new_tag} created and pushed.");
+    tracing::info!("  Tag {new_tag} created and pushed.");
     Ok(())
 }
 
@@ -179,7 +169,6 @@ mod tests {
             .current_dir(dir)
             .output()
             .unwrap();
-        // Create the release tag.
         Command::new("git")
             .args(["tag", "-a", "v4.1.0", "HEAD", "-m", "Release v4.1.0"])
             .current_dir(dir)
@@ -216,7 +205,6 @@ sources = ["src/lib.rs"]
         };
         let tags = run(&params).unwrap();
         assert!(!tags.is_empty());
-        // Both module_tag and legacy_tag for major >= 2.
         assert!(tags.iter().any(|t| t.contains("packages/go/v4/v4.1.0")));
         assert!(tags.iter().any(|t| t.contains("packages/go/v4.1.0")));
     }
@@ -247,7 +235,6 @@ sources = ["src/lib.rs"]
             config: &config,
             workspace_root: tmp.path(),
         };
-        // Should not error.
         let result = run(&params);
         assert!(result.is_ok());
     }

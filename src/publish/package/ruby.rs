@@ -16,6 +16,7 @@ use crate::publish::platform::RustTarget;
 use anyhow::{Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 /// Package a Ruby native gem for the given target.
 ///
@@ -36,40 +37,32 @@ pub fn package_ruby(
         anyhow::bail!("Ruby package directory does not exist: {}", pkg_dir.display());
     }
 
-    // Find the compiled native extension.
     let rb_crate = crate::publish::crate_name_from_output(config, crate::core::config::extras::Language::Ruby)
         .unwrap_or_else(|| format!("{}-rb", config.name));
     let lib_filename = target.shared_lib_name(&rb_crate.replace('-', "_"));
     let native_lib = find_ruby_native_lib(workspace_root, target, &rb_crate, &lib_filename)?;
 
-    // Determine abi directory name (e.g. "3.2.0", "3.1.0").
-    // We use a fixed conventional path: lib/{gem_name}/ for the shared lib.
-    let lib_dest_dir = pkg_dir.join("lib").join(&gem_name);
+    let ruby_abi = ruby_abi_for_packaging()?;
+    let ext_name = rb_crate.replace('-', "_");
+
+    let lib_dest_dir = pkg_dir.join("lib").join(&ext_name).join(&ruby_abi);
     fs::create_dir_all(&lib_dest_dir).with_context(|| format!("creating {}", lib_dest_dir.display()))?;
     let lib_dest = lib_dest_dir.join(&lib_filename);
     fs::copy(&native_lib, &lib_dest).with_context(|| format!("copying native lib to {}", lib_dest.display()))?;
 
-    // Collect all .rb wrapper files already present in lib/ so they are included
-    // alongside the native shared object.  Without them `gem push` rejects the gem
-    // with "invalid gem structure" because the require paths cannot be satisfied.
     let mut rb_files: Vec<String> = scan_rb_files(&pkg_dir.join("lib"))
         .unwrap_or_default()
         .into_iter()
         .filter_map(|p| p.strip_prefix(&pkg_dir).ok().map(|r| r.to_string_lossy().into_owned()))
         .collect();
     rb_files.sort();
-    // Always include the native lib path even if it was just staged (scan_rb_files
-    // skips .so/.bundle files by design).
-    let native_lib_path = format!("lib/{gem_name}/{lib_filename}");
+    let native_lib_path = format!("lib/{ext_name}/{ruby_abi}/{lib_filename}");
     if !rb_files.contains(&native_lib_path) {
         rb_files.push(native_lib_path);
     }
 
-    // Propagate `required_ruby_version` from the source gemspec so platform
-    // gems refuse to install on incompatible Ruby ABIs.
     let required_ruby_version = read_required_ruby_version(&pkg_dir);
 
-    // Write a platform-specific gemspec.
     let gemspec_name = format!("{gem_name}-platform.gemspec");
     let gemspec_path = pkg_dir.join(&gemspec_name);
     let platform_gemspec = generate_platform_gemspec(
@@ -81,11 +74,9 @@ pub fn package_ruby(
     )?;
     fs::write(&gemspec_path, platform_gemspec)?;
 
-    // Run gem build.
     let build_cmd = format!("gem build {gemspec_name}");
     crate::publish::run_shell_command_in(&build_cmd, &pkg_dir)?;
 
-    // Find the produced .gem file.
     let gem_file = find_gem_file(&pkg_dir, &gem_name, version, &platform)
         .with_context(|| format!("gem build did not produce expected .gem in {}", pkg_dir.display()))?;
 
@@ -97,9 +88,7 @@ pub fn package_ruby(
     let dest = output_dir.join(&gem_filename);
     fs::copy(&gem_file, &dest)?;
 
-    // Cleanup temporary platform gemspec.
     let _ = fs::remove_file(&gemspec_path);
-    // Cleanup staged native lib copy.
     let _ = fs::remove_file(&lib_dest);
 
     Ok(PackageArtifact {
@@ -115,7 +104,6 @@ fn find_ruby_native_lib(
     rb_crate: &str,
     lib_filename: &str,
 ) -> Result<PathBuf> {
-    // Cross path.
     let cross = workspace_root
         .join("target")
         .join(&target.triple)
@@ -124,12 +112,10 @@ fn find_ruby_native_lib(
     if cross.exists() {
         return Ok(cross);
     }
-    // Native path.
     let native = workspace_root.join("target/release").join(lib_filename);
     if native.exists() {
         return Ok(native);
     }
-    // rb-sys may also produce it inside the gem crate dir.
     let in_crate = workspace_root
         .join("crates")
         .join(rb_crate)
@@ -146,7 +132,6 @@ fn find_ruby_native_lib(
 }
 
 fn scan_rb_files(lib_dir: &Path) -> Result<Vec<PathBuf>> {
-    // Walk lib_dir and collect all .rb files (not native libs).
     let mut found = Vec::new();
     if !lib_dir.exists() {
         return Ok(found);
@@ -155,8 +140,6 @@ fn scan_rb_files(lib_dir: &Path) -> Result<Vec<PathBuf>> {
         let entry = entry?;
         let path = entry.path();
         if path.is_dir() {
-            // One level of recursion is sufficient for typical gem layouts:
-            // lib/{gem}.rb, lib/{gem}/version.rb, lib/{gem}/native.rb, etc.
             for sub in fs::read_dir(&path).with_context(|| format!("reading {}", path.display()))? {
                 let sub = sub?;
                 let sub_path = sub.path();
@@ -178,8 +161,6 @@ fn generate_platform_gemspec(
     files: &[String],
     required_ruby_version: Option<&str>,
 ) -> Result<String> {
-    // Generate a minimal gemspec that references the pre-compiled native library
-    // AND all Ruby wrapper files required to satisfy the gem's require paths.
     let files_ruby = files
         .iter()
         .map(|f| format!("    {f:?}"))
@@ -224,7 +205,6 @@ fn read_required_ruby_version(pkg_dir: &Path) -> Option<String> {
         if path.extension().is_none_or(|e| e != "gemspec") {
             continue;
         }
-        // Skip the platform-specific gemspec we ourselves emit.
         if path
             .file_name()
             .and_then(|n| n.to_str())
@@ -241,12 +221,10 @@ fn read_required_ruby_version(pkg_dir: &Path) -> Option<String> {
 }
 
 fn find_gem_file(dir: &Path, gem_name: &str, version: &str, platform: &str) -> Result<PathBuf> {
-    // gem build produces: {name}-{version}-{platform}.gem in cwd.
     let expected = dir.join(format!("{gem_name}-{version}-{platform}.gem"));
     if expected.exists() {
         return Ok(expected);
     }
-    // Fallback: scan for any .gem matching the version.
     let candidates: Vec<PathBuf> = fs::read_dir(dir)?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
@@ -261,9 +239,61 @@ fn find_gem_file(dir: &Path, gem_name: &str, version: &str, platform: &str) -> R
         .with_context(|| format!("no .gem file for {gem_name}-{version} found in {}", dir.display()))
 }
 
+fn ruby_abi_for_packaging() -> Result<String> {
+    if let Some(abi) = ruby_abi_override(std::env::var("RUBY_ABI").ok()) {
+        return Ok(abi);
+    }
+
+    let output = Command::new("ruby")
+        .arg("-rrbconfig")
+        .arg("-e")
+        .arg("print RbConfig::CONFIG.fetch(\"ruby_version\")")
+        .output()
+        .context("failed to execute `ruby` to read RbConfig['ruby_version']")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "`ruby -rrbconfig -e 'print RbConfig::CONFIG.fetch(\"ruby_version\")' failed with {}: {}",
+            output.status,
+            stderr.trim()
+        );
+    }
+
+    let abi = String::from_utf8(output.stdout)
+        .context("ruby output for RbConfig['ruby_version'] was not valid UTF-8")?
+        .trim()
+        .to_string();
+
+    if abi.is_empty() {
+        anyhow::bail!("ruby ABI is empty from `RbConfig['ruby_version']`")
+    }
+
+    Ok(abi)
+}
+
+/// Normalize a `RUBY_ABI` override value: trim surrounding whitespace (common in CI env
+/// injection) and treat an unset or blank value as "no override".
+fn ruby_abi_override(raw: Option<String>) -> Option<String> {
+    raw.map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ruby_abi_override_trims_and_rejects_blank() {
+        assert_eq!(ruby_abi_override(Some("3.4.0".to_string())), Some("3.4.0".to_string()));
+        assert_eq!(
+            ruby_abi_override(Some("  3.4.0 \n".to_string())),
+            Some("3.4.0".to_string())
+        );
+        assert_eq!(ruby_abi_override(Some("   ".to_string())), None);
+        assert_eq!(ruby_abi_override(Some(String::new())), None);
+        assert_eq!(ruby_abi_override(None), None);
+    }
 
     #[test]
     fn generate_platform_gemspec_includes_native_and_wrapper_files() {
@@ -317,13 +347,11 @@ mod tests {
     #[test]
     fn read_required_ruby_version_extracts_from_source_gemspec() {
         let tmp = tempfile::TempDir::new().unwrap();
-        // Decoy: platform gemspec must be skipped.
         std::fs::write(
             tmp.path().join("mylib-platform.gemspec"),
             r#"spec.required_ruby_version = ">= 99.0""#,
         )
         .unwrap();
-        // Real source gemspec.
         std::fs::write(
             tmp.path().join("mylib.gemspec"),
             "# frozen_string_literal: true\nGem::Specification.new do |spec|\n  spec.required_ruby_version = \">= 3.2.0\"\nend\n",
@@ -366,12 +394,9 @@ mod tests {
         let lib_dir = tmp.path().join("lib");
         let sub_dir = lib_dir.join("mylib");
         std::fs::create_dir_all(&sub_dir).unwrap();
-        // Top-level wrapper.
         std::fs::write(lib_dir.join("mylib.rb"), b"").unwrap();
-        // Sub-level wrappers.
         std::fs::write(sub_dir.join("version.rb"), b"").unwrap();
         std::fs::write(sub_dir.join("native.rb"), b"").unwrap();
-        // Native lib — should NOT appear in scan results.
         std::fs::write(sub_dir.join("libmylib_rb.so"), b"").unwrap();
 
         let mut found = scan_rb_files(&lib_dir).unwrap();

@@ -253,11 +253,16 @@ pub(super) fn swift_traversal_contains_assert(
 /// that converts each element to a Swift `String`, and `is_optional` reports
 /// whether the resulting expression is `Optional<[String]>` (callers should
 /// coalesce with `?? []`) or already a concrete `[String]`.
+///
+/// When `materialized_expr` is provided (from a prior call to `materialise_vec_temporaries`),
+/// use that expression instead of rebuilding the accessor. This keeps RustVec temporaries
+/// bound to locals, preventing use-after-free when swift-bridge releases them.
 pub(super) fn swift_array_contains_expr(
     field: Option<&str>,
     result_var: &str,
     field_resolver: &FieldResolver,
     result_field_accessor: &HashMap<String, String>,
+    materialized_expr: Option<&str>,
 ) -> (String, bool) {
     // swift-bridge auto-renames Rust snake_case methods to lowerCamelCase on the
     // Swift side. `RustStringRef::as_str()` is exposed as `asStr()` — emitting
@@ -277,7 +282,13 @@ pub(super) fn swift_array_contains_expr(
         .cloned()
         .unwrap_or_else(|| "as_str".to_string());
     let elem_call = swift_ident(&elem_accessor_name.to_lower_camel_case());
-    let (accessor, has_optional) = swift_build_accessor(f, result_var, field_resolver);
+    // When a materialized expression is provided (from materialise_vec_temporaries),
+    // use it directly instead of rebuilding. This keeps RustVec temporaries bound.
+    let (accessor, has_optional) = if let Some(expr) = materialized_expr {
+        (expr.to_string(), swift_build_accessor(f, result_var, field_resolver).1)
+    } else {
+        swift_build_accessor(f, result_var, field_resolver)
+    };
     // Only chain `?.map` when the accessor is actually optional. The previous
     // unconditional `?.map` produced "cannot use optional chaining on
     // non-optional value of type 'RustVec<…>'" for plain `Vec<T>` fields.
@@ -369,32 +380,57 @@ pub(super) fn swift_stringy_aggregator_contains_assert(
 ///
 /// Also check if the field itself (the leaf) is optional, which happens when the field
 /// returns Optional<RustVec<T>> (e.g., `links()` may return Optional).
-pub(super) fn swift_array_count_expr(field: Option<&str>, result_var: &str, field_resolver: &FieldResolver) -> String {
+///
+/// When `materialized_expr` is provided (from a prior call to `materialise_vec_temporaries`),
+/// use that expression instead of rebuilding the accessor. This keeps RustVec temporaries
+/// bound to locals, preventing use-after-free when swift-bridge releases them.
+///
+/// Returns `None` when the field is actually a scalar String (not a collection) that was
+/// incorrectly marked as an array in the e2e config. In this case, count assertions
+/// should be skipped.
+pub(super) fn swift_array_count_expr(
+    field: Option<&str>,
+    result_var: &str,
+    field_resolver: &FieldResolver,
+    materialized_expr: Option<&str>,
+) -> Option<String> {
     let Some(f) = field else {
-        return format!("{result_var}.count");
+        return Some(format!("{result_var}.count"));
     };
-    let (accessor, mut has_optional) = swift_build_accessor(f, result_var, field_resolver);
+    // When a materialized expression is provided (from materialise_vec_temporaries),
+    // use it directly instead of rebuilding. This keeps RustVec temporaries bound.
+    let accessor = if let Some(expr) = materialized_expr {
+        expr.to_string()
+    } else {
+        swift_build_accessor(f, result_var, field_resolver).0
+    };
+    let mut has_optional = swift_build_accessor(f, result_var, field_resolver).1;
     // Also check if the leaf field itself is optional.
     if field_resolver.is_optional(f) {
         has_optional = true;
     }
     // For opaque method-call accessors (e.g., `result.elements()`), check if the field
-    // is a non-Vec type. If so, wrap with `.toString()` to convert RustString to Swift String
-    // before appending `.count`, just like `not_empty` and `is_empty` do.
-    let count_target = swift_count_target(&accessor, field_resolver, Some(f));
-    if has_optional {
-        // In Swift, accessing .count on an optional with ?. returns Optional<Int>,
-        // so we coalesce with ?? 0 to get a concrete Int for XCTAssert.
-        if count_target.contains("?.") {
-            format!("{count_target}.count ?? 0")
-        } else {
-            // If no ?. but field is optional, the field_expr itself is Optional<RustVec<T>>
-            // so we need ?. to call count.
-            format!("({count_target}?.count ?? 0)")
-        }
+    // is a non-Vec type. If so, it would wrap with `.toString()` to convert RustString to Swift String.
+    // But if the field is actually a scalar string (not a collection), we cannot meaningfully
+    // call .count on it, so return None to signal that this assertion should be skipped.
+    let count_target = swift_count_target(&accessor, field_resolver, Some(f))?;
+    // `swift_count_target` wraps a scalar-String leaf with `.toString()`, which yields a
+    // NON-optional Swift `String`. Appending `?.count` to it is a compile error
+    // ("cannot use optional chaining on non-optional value of type 'String'"), so such a
+    // target always takes `.count` directly regardless of `has_optional`.
+    let target_is_to_string = count_target.ends_with(".toString()");
+    Some(if count_target.contains("?.") {
+        // An optional ancestor chain already propagated `?`, so `.count` is Optional<Int>;
+        // coalesce with `?? 0` to get a concrete Int for XCTAssert.
+        format!("({count_target}.count ?? 0)")
+    } else if has_optional && !target_is_to_string {
+        // The field_expr itself is Optional<RustVec<T>> (no ancestor chain), so unwrap
+        // with `?.count` before coalescing.
+        format!("({count_target}?.count ?? 0)")
     } else {
+        // Non-optional RustVec<T>, or a `.toString()` Swift `String` — `.count` directly.
         format!("{count_target}.count")
-    }
+    })
 }
 
 /// Return the count-able target expression for `field_expr`.
@@ -403,25 +439,34 @@ pub(super) fn swift_array_count_expr(field: Option<&str>, result_var: &str, fiel
 /// value depends on the field's IR kind:
 ///
 /// - `Vec<T>` ⇒ `RustVec<T>`, which exposes `.count` directly. No wrap.
-/// - `String` ⇒ `RustString`, which does NOT expose `.count`. Wrap with
-///   `.toString()` so `.count` lands on Swift `String`.
+/// - `String` ⇒ `RustString`, which does NOT expose `.count`. Since wrapping
+///   with `.toString()` loses the collection semantics, return None to signal
+///   that count assertions cannot be generated for scalar string fields.
 ///
 /// First-class property accessors (no trailing parens) return Swift values
 /// that already support `.count` directly.
 ///
 /// The discriminator is the field's resolved leaf type, looked up against the
 /// `SwiftFirstClassMap`'s vec field set when available. If the field is
-/// unknown (None), fall back to the conservative wrap — RustString is the
-/// dominant scalar-leaf case for top-level assertions.
-pub(super) fn swift_count_target(field_expr: &str, field_resolver: &FieldResolver, field: Option<&str>) -> String {
+/// unknown (None), fall back to checking whether the field would be wrapped
+/// with `.toString()` — indicating a scalar String field unsuitable for counting.
+pub(super) fn swift_count_target(
+    field_expr: &str,
+    field_resolver: &FieldResolver,
+    field: Option<&str>,
+) -> Option<String> {
     let is_method_call = field_expr.trim_end().ends_with(')');
     if !is_method_call {
-        return field_expr.to_string();
+        return Some(field_expr.to_string());
     }
     if let Some(f) = field
         && field_resolver.leaf_is_vec_via_swift_map(field_resolver.resolve(f))
     {
-        return field_expr.to_string();
+        return Some(field_expr.to_string());
     }
-    format!("{field_expr}.toString()")
+    // A non-Vec method-call accessor is a scalar String (RustString) leaf. Converting
+    // it to a Swift `String` via `.toString()` yields a value that DOES expose a
+    // meaningful `.count` (character length), so wrap with `.toString()` and let the
+    // caller append `.count` for length assertions (e.g. `count_min`, `is_empty`).
+    Some(format!("{field_expr}.toString()"))
 }

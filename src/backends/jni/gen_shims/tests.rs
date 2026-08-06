@@ -40,16 +40,12 @@ mod tests {
 
     #[test]
     fn bytes_call_arg_optional_ref_uses_as_deref() {
-        // Option<&[u8]>: Option<Vec<u8>> does not coerce, must deref.
         assert_eq!(
             bytes_call_arg("document_bytes", true, true),
             "document_bytes.as_deref()"
         );
-        // Option<Vec<u8>>: owned, pass through.
         assert_eq!(bytes_call_arg("document_bytes", true, false), "document_bytes");
-        // &[u8]: &Vec<u8> coerces.
         assert_eq!(bytes_call_arg("document_bytes", false, true), "&document_bytes");
-        // Vec<u8>: owned, pass through.
         assert_eq!(bytes_call_arg("document_bytes", false, false), "document_bytes");
     }
 
@@ -154,6 +150,33 @@ namespace = "dev.sample_crate"
         );
     }
 
+    /// A free function resolved into a *sibling* workspace crate (rust_path
+    /// `<sibling_crate>::<fn>`, where the sibling crate is not the umbrella crate)
+    /// must be reached through the umbrella facade by item path
+    /// (`core_crate::<fn>`), mirroring how opaque types are referenced. Prefixing
+    /// the origin crate — `core_crate::<sibling_crate>::<fn>` — does not resolve
+    /// (E0433: cannot find `<sibling_crate>` in `core_crate`).
+    #[test]
+    fn sibling_crate_function_is_reached_through_umbrella_facade() {
+        let func = crate::core::ir::FunctionDef {
+            name: "schema_query_only".into(),
+            rust_path: "demo_graphql::schema_query_only".into(),
+            params: vec![],
+            return_type: TypeRef::String,
+            error_type: None,
+            ..Default::default()
+        };
+        let content = emit_lib_rs(&api_with_functions(vec![func]), &btree_fixture_config());
+        assert!(
+            content.contains("core_crate::schema_query_only("),
+            "sibling-crate fn must be called as core_crate::schema_query_only(): {content}"
+        );
+        assert!(
+            !content.contains("core_crate::demo_graphql::"),
+            "sibling-crate fn must NOT be prefixed with the origin crate: {content}"
+        );
+    }
+
     /// The generated `throw_jni_error` helper must use `env.throw_new(...).is_err()`
     /// and fall back to `java/lang/RuntimeException` rather than silently discarding
     /// a failed throw (which would leave the Kotlin caller with no exception pending
@@ -191,16 +214,10 @@ namespace = "dev.sample_crate"
             unsupported_public_items: Vec::new(),
         };
         let content = emit_lib_rs(&api, &config);
-        // The generated helper must NOT use `let _ = env.throw_new(...)` which
-        // silently swallows a missing-class error.
         assert!(
             !content.contains("let _ = env.throw_new(ERROR_CLASS"),
             "throw_jni_error must not discard the throw_new result: {content}"
         );
-        // It must check the result and fall back to RuntimeException.
-        // (`ERROR_CLASS` / `msg` are now wrapped in `JNIString::from(...)` per
-        // the jni 0.22 API; assert on the structural pattern instead of the
-        // exact arg form.)
         assert!(
             content.contains("if env.throw_new(&class_jni, &msg_jni).is_err()"),
             "throw_jni_error must check throw_new result: {content}"
@@ -322,6 +339,84 @@ namespace = "dev.sample_crate"
         assert!(
             content.contains("client.load_at(&path, &raw)"),
             "call site must pass &path and &raw: {content}"
+        );
+    }
+
+    /// A client type listed in `[crates.kotlin_android].exclude_types` (or the shared
+    /// `[crates.ffi].exclude_types`) must not have any JNI shims emitted. The
+    /// kotlin_android binding backend already drops the Kotlin class via
+    /// `effective_exclude_types`; without the matching filter here the JNI side emits
+    /// orphan `#[no_mangle]` shims and re-exposes a type every other FFI-derived
+    /// binding hides (e.g. the test-only client). The exclusion must be *targeted*:
+    /// a sibling client that is not excluded keeps its shims.
+    #[test]
+    fn excluded_client_type_emits_no_shims_but_keeps_others() {
+        use crate::core::config::NewAlefConfig;
+        let raw: NewAlefConfig = toml::from_str(
+            r#"
+[workspace]
+languages = ["kotlin_android", "jni"]
+
+[[crates]]
+name = "demo"
+sources = ["src/lib.rs"]
+
+[crates.kotlin_android]
+package = "dev.sample_crate"
+namespace = "dev.sample_crate"
+exclude_types = ["Loader"]
+"#,
+        )
+        .unwrap();
+        let config = raw.resolve().unwrap().remove(0);
+        let method = |name: &str| crate::core::ir::MethodDef {
+            name: name.into(),
+            params: vec![crate::core::ir::ParamDef {
+                name: "path".into(),
+                ty: TypeRef::String,
+                is_ref: true,
+                ..Default::default()
+            }],
+            return_type: TypeRef::String,
+            error_type: Some("LoadError".into()),
+            receiver: Some(crate::core::ir::ReceiverKind::Ref),
+            ..Default::default()
+        };
+        let client = |name: &str, m: crate::core::ir::MethodDef| crate::core::ir::TypeDef {
+            name: name.into(),
+            rust_path: format!("demo::{name}"),
+            is_opaque: true,
+            methods: vec![m],
+            ..Default::default()
+        };
+        let api = crate::core::ir::ApiSurface {
+            crate_name: "demo".into(),
+            version: "0.1.0".into(),
+            types: vec![
+                client("Loader", method("excluded_call")),
+                client("Keeper", method("kept_call")),
+            ],
+            functions: vec![],
+            enums: vec![],
+            errors: vec![],
+            excluded_type_paths: Default::default(),
+            excluded_trait_names: ::std::collections::HashSet::new(),
+            services: vec![],
+            handler_contracts: vec![],
+            unsupported_public_items: Vec::new(),
+        };
+        let content = emit_lib_rs(&api, &config);
+        assert!(
+            !content.contains("excluded_call"),
+            "excluded client type must not emit method shims: {content}"
+        );
+        assert!(
+            !content.contains("FreeLoader") && !content.contains("nativeFreeLoader"),
+            "excluded client type must not emit a destructor shim: {content}"
+        );
+        assert!(
+            content.contains("client.kept_call"),
+            "a non-excluded sibling client must keep its shims: {content}"
         );
     }
 }

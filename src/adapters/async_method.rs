@@ -149,10 +149,6 @@ fn core_call_args(adapter: &AdapterConfig) -> Vec<String> {
         .collect()
 }
 
-// ---------------------------------------------------------------------------
-// Python (PyO3)
-// ---------------------------------------------------------------------------
-
 fn gen_python_body(adapter: &AdapterConfig, config: &ResolvedCrateConfig) -> String {
     let core_path = &adapter.core_path;
     let raw_returns = adapter.returns.as_deref().unwrap_or("()");
@@ -193,16 +189,11 @@ fn gen_python_body(adapter: &AdapterConfig, config: &ResolvedCrateConfig) -> Str
     )
 }
 
-// ---------------------------------------------------------------------------
-// Node (NAPI)
-// ---------------------------------------------------------------------------
-
 fn gen_node_body(adapter: &AdapterConfig, config: &ResolvedCrateConfig) -> String {
     let core_path = &adapter.core_path;
     let prefix = config.node_type_prefix();
     let raw_returns = adapter.returns.as_deref().unwrap_or("()");
 
-    // bytes::Bytes has no prefixed JS equivalent — convert to napi Buffer via Vec<u8>.
     let is_bytes = raw_returns == "bytes::Bytes";
     let map_expr = if raw_returns == "()" {
         format!(".map({raw_returns}::from)")
@@ -230,10 +221,6 @@ fn gen_node_body(adapter: &AdapterConfig, config: &ResolvedCrateConfig) -> Strin
         )
     }
 }
-
-// ---------------------------------------------------------------------------
-// Ruby (Magnus)
-// ---------------------------------------------------------------------------
 
 fn gen_ruby_body(adapter: &AdapterConfig, _config: &ResolvedCrateConfig) -> String {
     let core_path = &adapter.core_path;
@@ -268,15 +255,10 @@ fn gen_ruby_body(adapter: &AdapterConfig, _config: &ResolvedCrateConfig) -> Stri
     }
 }
 
-// ---------------------------------------------------------------------------
-// PHP (ext-php-rs)
-// ---------------------------------------------------------------------------
-
 fn gen_php_body(adapter: &AdapterConfig, _config: &ResolvedCrateConfig) -> String {
     let core_path = &adapter.core_path;
     let raw_returns = adapter.returns.as_deref().unwrap_or("()");
 
-    // PHP passes struct params by reference — clone before converting.
     let args = call_args_cloned(adapter);
 
     let inner_call = if args.is_empty() {
@@ -301,10 +283,6 @@ fn gen_php_body(adapter: &AdapterConfig, _config: &ResolvedCrateConfig) -> Strin
     )
 }
 
-// ---------------------------------------------------------------------------
-// Elixir (Rustler)
-// ---------------------------------------------------------------------------
-
 fn gen_elixir_body(adapter: &AdapterConfig, _config: &ResolvedCrateConfig) -> String {
     let core_path = &adapter.core_path;
     let raw_returns = adapter.returns.as_deref().unwrap_or("()");
@@ -326,10 +304,6 @@ fn gen_elixir_body(adapter: &AdapterConfig, _config: &ResolvedCrateConfig) -> St
     )
 }
 
-// ---------------------------------------------------------------------------
-// WASM (wasm-bindgen)
-// ---------------------------------------------------------------------------
-
 fn gen_wasm_body(adapter: &AdapterConfig, _config: &ResolvedCrateConfig) -> String {
     let core_path = &adapter.core_path;
     let raw_returns = adapter.returns.as_deref().unwrap_or("JsValue");
@@ -349,10 +323,6 @@ fn gen_wasm_body(adapter: &AdapterConfig, _config: &ResolvedCrateConfig) -> Stri
          .map_err(|e| JsValue::from_str(&e.to_string()))"
     )
 }
-
-// ---------------------------------------------------------------------------
-// FFI (C ABI) -- async becomes sync via block_on
-// ---------------------------------------------------------------------------
 
 fn gen_ffi_body(adapter: &AdapterConfig, config: &ResolvedCrateConfig) -> String {
     let core_path = &adapter.core_path;
@@ -455,10 +425,6 @@ fn gen_ffi_body(adapter: &AdapterConfig, config: &ResolvedCrateConfig) -> String
     )
 }
 
-// ---------------------------------------------------------------------------
-// Go (wraps C FFI)
-// ---------------------------------------------------------------------------
-
 fn gen_go_body(adapter: &AdapterConfig, config: &ResolvedCrateConfig) -> String {
     let name = &adapter.name;
     let prefix = config.ffi_prefix();
@@ -515,10 +481,6 @@ fn gen_go_body(adapter: &AdapterConfig, config: &ResolvedCrateConfig) -> String 
     )
 }
 
-// ---------------------------------------------------------------------------
-// Java (Panama FFI)
-// ---------------------------------------------------------------------------
-
 fn gen_java_body(adapter: &AdapterConfig, config: &ResolvedCrateConfig) -> String {
     let name = &adapter.name;
     let prefix = config.ffi_prefix();
@@ -556,10 +518,6 @@ fn gen_java_body(adapter: &AdapterConfig, config: &ResolvedCrateConfig) -> Strin
     )
 }
 
-// ---------------------------------------------------------------------------
-// C# (P/Invoke)
-// ---------------------------------------------------------------------------
-
 fn gen_csharp_body(adapter: &AdapterConfig, config: &ResolvedCrateConfig) -> String {
     let name = &adapter.name;
     let prefix = config.ffi_prefix();
@@ -583,10 +541,6 @@ fn gen_csharp_body(adapter: &AdapterConfig, config: &ResolvedCrateConfig) -> Str
     )
 }
 
-// ---------------------------------------------------------------------------
-// R (extendr)
-// ---------------------------------------------------------------------------
-
 fn gen_r_body(adapter: &AdapterConfig, _config: &ResolvedCrateConfig) -> String {
     let core_path = &adapter.core_path;
     let raw_returns = adapter.returns.as_deref().unwrap_or("Robj");
@@ -608,10 +562,6 @@ fn gen_r_body(adapter: &AdapterConfig, _config: &ResolvedCrateConfig) -> String 
          .map_err(|e| extendr_api::Error::Other(e.to_string()))"
     )
 }
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
 
 fn to_snake_case(s: &str) -> String {
     let mut result = String::new();

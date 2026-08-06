@@ -12,12 +12,83 @@ struct ResidualStep {
     work_dir: PathBuf,
 }
 
+/// A code formatter that shapes generated output and must be present for a run.
+#[derive(Clone, Copy)]
+struct RequiredFormatter {
+    tool: &'static str,
+    install_hint: &'static str,
+}
+
+/// The formatters whose presence is required for deterministic generation of
+/// `languages`.
+///
+/// `rustfmt` and `poly` are always required: every binding emits a Rust glue
+/// crate that rustfmt reflows, and poly formats each language's emitted package.
+/// `cargo-sort` is required only when a language whose residual pass runs
+/// `cargo sort` is generated (wasm, ffi, ruby, elixir, r).
+fn required_formatters(languages: &[Language]) -> Vec<RequiredFormatter> {
+    let mut required = vec![
+        RequiredFormatter {
+            tool: "rustfmt",
+            install_hint: "rustup component add rustfmt",
+        },
+        RequiredFormatter {
+            tool: "poly",
+            install_hint: "install polylint (`poly`) and put it on PATH",
+        },
+    ];
+    let needs_cargo_sort = languages.iter().any(|language| {
+        matches!(
+            language,
+            Language::Wasm | Language::Ffi | Language::Ruby | Language::Elixir | Language::R
+        )
+    });
+    if needs_cargo_sort {
+        required.push(RequiredFormatter {
+            tool: "cargo-sort",
+            install_hint: "cargo install cargo-sort",
+        });
+    }
+    required
+}
+
+/// Warn (never fail) when a formatter that shapes generated output is missing
+/// from PATH.
+///
+/// alef always applies formatting when the tools are present — poly in
+/// particular formats through `poly fmt` whenever it is on PATH and the pass is
+/// skipped otherwise. A missing formatter (`rustfmt`, `poly`, or `cargo-sort`)
+/// can leave output un(der)-formatted and host-dependent, which may trip the
+/// freshness check (#184); rather than abort generation, warn and name each
+/// missing tool and how to install it so the operator can restore deterministic
+/// output.
+pub fn warn_missing_formatters(languages: &[Language]) {
+    let missing: Vec<RequiredFormatter> = required_formatters(languages)
+        .into_iter()
+        .filter(|formatter| !is_tool_available(formatter.tool))
+        .collect();
+    if missing.is_empty() {
+        return;
+    }
+    let details = missing
+        .iter()
+        .map(|formatter| format!("  - {}: {}", formatter.tool, formatter.install_hint))
+        .collect::<Vec<_>>()
+        .join("\n");
+    warn!(
+        "code formatter(s) not found on PATH; generated output may be un(der)-formatted and \
+         host-dependent (#184). Install to restore deterministic formatting:\n{details}"
+    );
+}
+
 /// Run language-native formatters on emitted packages after generation.
 ///
-/// Formatting is always delegated to the `poly` (polylint) CLI — a single
-/// `poly fmt --fix` pass formats every language poly supports. A fixed set of
-/// residual native passes runs afterwards for the project-wide tools poly cannot
-/// wrap (`cargo sort -n`, wasm crate sort, ruby/elixir/R native crate sort).
+/// Formatting is always delegated to the `poly` (polylint) CLI. On a full regen
+/// (`only_languages = None`, the `alef all` path) this converges to a fixed point:
+/// see [`converge_full_regen_formatting`]. On a partial regen (a single language's
+/// files changed) a single `poly fmt --fix` pass runs over the changed language's
+/// package directory, followed by that language's residual native pass for the
+/// project-wide tools poly cannot wrap (wasm/ruby/elixir/R native crate sort).
 ///
 /// Best-effort: a missing `poly` binary, a poly error, or a missing residual tool
 /// is logged as a warning and never aborts the generate command.
@@ -27,7 +98,6 @@ pub fn format_generated(
     base_dir: &Path,
     only_languages: Option<&HashSet<Language>>,
 ) {
-    // Deduplicated languages present in this batch, in first-seen order.
     let mut seen = HashSet::new();
     let poly_langs: Vec<Language> = files
         .iter()
@@ -39,14 +109,131 @@ pub fn format_generated(
         return;
     }
 
-    let paths = poly_paths(config, base_dir, only_languages, &poly_langs);
-    poly_format(&paths, base_dir);
-
-    for &lang in &poly_langs {
-        let lang_str = lang.to_string().to_lowercase();
-        for step in language_residuals(config, lang, base_dir) {
-            run_residual(&step, &lang_str);
+    match only_languages {
+        None => converge_full_regen_formatting(base_dir),
+        Some(_) => {
+            let paths = poly_paths(config, base_dir, only_languages, &poly_langs);
+            poly_format(&paths, base_dir);
+            for &lang in &poly_langs {
+                let lang_str = lang.to_string().to_lowercase();
+                for step in language_residuals(config, lang, base_dir) {
+                    run_residual(&step, &lang_str);
+                }
+            }
         }
+    }
+}
+
+/// Maximum `poly fmt --fix` passes attempted while converging a full regen.
+///
+/// Some poly-bundled engines (`.cs`, `.java`, `.json` today) are not single-pass
+/// idempotent on freshly generated output: a first `poly fmt --fix` pass can still
+/// leave `poly fmt --check` reporting drift. Looping converges them so a full
+/// regen is committable without a manual cleanup pass downstream (see #184-style
+/// freshness-check failures).
+const MAX_POLY_FMT_PASSES: u32 = 3;
+
+/// Self-cleaning full-regen formatting pass, used on the `alef all` path
+/// (`only_languages = None`).
+///
+/// Loops `poly fmt --fix <base_dir>` to a fixed point (detected via `poly fmt
+/// --check`, bounded by [`MAX_POLY_FMT_PASSES`]), folding a workspace-wide
+/// `cargo fmt --all` and a workspace-wide `cargo sort -n -w` into *every* pass of
+/// the same loop. Running them inside the loop — rather than once, after —
+/// means that if either tool disagrees with poly's own formatting, the next
+/// pass's `poly fmt --fix`/`--check` observes and reconciles the drift instead of
+/// leaving the tree dirty.
+///
+/// This replaces the old per-language cargo-sort residuals on a full regen: those
+/// only covered the language whose crate directory they targeted (and the
+/// workspace-wide `-w` variant ran only when the ffi target was generated),
+/// leaving other generated crates (python, node, php, swift, dart, …) unsorted —
+/// exactly the gap that trips poly's own workspace-wide cargo-sort check
+/// downstream. A single `cargo sort -n -w` at the repo root covers every crate in
+/// the workspace regardless of which languages this run generated.
+///
+/// Best-effort throughout: a missing `poly`, `cargo`, `rustfmt`, or `cargo-sort`
+/// is a warning, never a failure, and generation is never aborted.
+fn converge_full_regen_formatting(base_dir: &Path) {
+    let poly_present = is_tool_available("poly");
+    if !poly_present {
+        warn!("poly not found on PATH (skipping post-generation formatting)");
+    }
+    let root = vec![base_dir.to_path_buf()];
+
+    for _pass in 1..=MAX_POLY_FMT_PASSES {
+        if poly_present {
+            poly_format(&root, base_dir);
+        }
+        run_cargo_fmt(base_dir);
+        run_workspace_cargo_sort(base_dir);
+
+        if !poly_present || poly_fmt_is_clean(base_dir) {
+            return;
+        }
+    }
+    warn!(
+        "poly fmt did not converge after {MAX_POLY_FMT_PASSES} passes (non-fatal); generated \
+         output may have residual formatting drift"
+    );
+}
+
+/// Check `poly fmt --check <base_dir>` for a clean (already-formatted) tree. Used
+/// only to detect convergence inside [`converge_full_regen_formatting`]'s loop.
+fn poly_fmt_is_clean(base_dir: &Path) -> bool {
+    let path_str = base_dir.to_string_lossy().into_owned();
+    run_formatter("poly", &["fmt", "--check", &path_str], base_dir).is_ok()
+}
+
+/// Run `cargo fmt --all` at the workspace root, when `cargo`, `rustfmt`, and a
+/// root `Cargo.toml` are all present. Folded into
+/// [`converge_full_regen_formatting`]'s loop rather than run once afterward, so a
+/// later `poly fmt` pass reconciles anything cargo fmt changes that poly's own
+/// per-file rustfmt invocation did not already produce. Best-effort: a missing
+/// root `Cargo.toml` is a debug/skip (not every generated tree is a cargo
+/// workspace); a missing tool is a warning/skip; a non-zero exit is a warning.
+fn run_cargo_fmt(base_dir: &Path) {
+    if !base_dir.join("Cargo.toml").exists() {
+        debug!(
+            "no root Cargo.toml at {}, skipping workspace cargo fmt",
+            base_dir.display()
+        );
+        return;
+    }
+    if !is_tool_available("cargo") || !is_tool_available("rustfmt") {
+        warn!("cargo/rustfmt not found on PATH (skipping workspace cargo fmt)");
+        return;
+    }
+    match run_formatter("cargo", &["fmt", "--all"], base_dir) {
+        Ok(()) => debug!("cargo fmt --all ok"),
+        Err(e) => warn!("cargo fmt --all failed (non-fatal): {e}"),
+    }
+}
+
+/// Run `cargo sort -n -w` once at the workspace root, covering every crate in the
+/// workspace regardless of which languages this run generated. See
+/// [`converge_full_regen_formatting`] for why this replaces the per-language
+/// residuals on a full regen. The `-n` flag skips cargo-sort's own post-sort
+/// formatting pass (which would otherwise fight poly's TOML formatter over
+/// whitespace/quote style); it does not affect table or dependency ordering, so
+/// it does not change what poly's bundled cargo-sort check accepts as sorted.
+/// Best-effort: a missing root `Cargo.toml` is a debug/skip; a missing
+/// `cargo-sort` binary is a warning/skip; a non-zero exit is a warning.
+fn run_workspace_cargo_sort(base_dir: &Path) {
+    if !base_dir.join("Cargo.toml").exists() {
+        debug!(
+            "no root Cargo.toml at {}, skipping workspace cargo sort",
+            base_dir.display()
+        );
+        return;
+    }
+    if !is_tool_available("cargo-sort") {
+        warn!("cargo-sort not found on PATH (skipping workspace cargo sort)");
+        return;
+    }
+    match run_formatter("cargo", &["sort", "-n", "-w"], base_dir) {
+        Ok(()) => debug!("cargo sort -n -w ok"),
+        Err(e) => warn!("cargo sort -n -w failed (non-fatal): {e}"),
     }
 }
 
@@ -81,15 +268,10 @@ pub fn poly_lint(base_dir: &Path) -> anyhow::Result<()> {
 /// Dart and swift have no cargo residuals (poly covers them).
 fn cargo_sort_residuals(config: &ResolvedCrateConfig, base_dir: &Path) -> Vec<ResidualStep> {
     let mut steps = Vec::new();
-    // Workspace-wide sort — normalises every in-workspace binding crate.
     steps.extend(language_residuals(config, Language::Ffi, base_dir));
-    // Wasm binding crate — often workspace-excluded.
     steps.extend(language_residuals(config, Language::Wasm, base_dir));
-    // Ruby native crate lives outside the consumer workspace.
     steps.extend(language_residuals(config, Language::Ruby, base_dir));
-    // Elixir NIF crate is workspace-excluded.
     steps.extend(language_residuals(config, Language::Elixir, base_dir));
-    // R extendr crate is workspace-excluded.
     steps.extend(language_residuals(config, Language::R, base_dir));
     steps
 }
@@ -129,6 +311,12 @@ fn poly_paths(
 /// files in place. `config_start` is poly's working directory; it walks up from
 /// there for `poly.toml`. Best-effort: a missing `poly` binary or a non-zero exit
 /// is logged and never propagated (matching the per-language formatter contract).
+///
+/// Executable permission bits are snapshotted before the pass and restored after:
+/// poly rewrites changed files via atomic rename, which resets the mode to `0644`
+/// and silently strips the exec bit from every generated shebang script it
+/// reformats (`run_tests.php`, `download_ffi.sh`, `mvnw`, `gradlew`, …) — which
+/// poly's own `file-safety` lint then rejects on the next commit.
 pub(crate) fn poly_format(paths: &[PathBuf], config_start: &Path) {
     if paths.is_empty() {
         return;
@@ -137,6 +325,7 @@ pub(crate) fn poly_format(paths: &[PathBuf], config_start: &Path) {
         warn!("poly not found on PATH (skipping post-generation formatting)");
         return;
     }
+    let executable_modes = snapshot_executable_modes(paths);
     let mut args: Vec<String> = vec!["fmt".to_owned(), "--fix".to_owned()];
     args.extend(paths.iter().map(|path| path.to_string_lossy().into_owned()));
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -144,7 +333,91 @@ pub(crate) fn poly_format(paths: &[PathBuf], config_start: &Path) {
         Ok(()) => debug!("poly fmt over {} path(s) ok", paths.len()),
         Err(e) => warn!("poly fmt failed (non-fatal): {e}"),
     }
+    restore_executable_modes(&executable_modes);
 }
+
+/// Directory names the executable-mode snapshot never descends into. They hold
+/// dependency caches and build output — never alef-generated scripts — and
+/// walking them on a repo-root pass costs far more than the whole format run.
+#[cfg(unix)]
+const EXEC_SNAPSHOT_SKIP_DIRS: &[&str] = &[
+    ".git",
+    "target",
+    "node_modules",
+    ".venv",
+    "venv",
+    "vendor",
+    "deps",
+    "_build",
+    "build",
+    ".build",
+    "zig-out",
+    "dist",
+    "__pycache__",
+    ".gradle",
+    ".dart_tool",
+    ".zig-cache",
+    ".cache",
+];
+
+/// Mode bits granting execute permission to owner, group, or other.
+#[cfg(unix)]
+const EXECUTE_BITS: u32 = 0o111;
+
+/// Record the mode of every regular file under `paths` that is currently
+/// executable, so [`restore_executable_modes`] can put back exactly what was
+/// there if `poly fmt` drops it.
+#[cfg(unix)]
+fn snapshot_executable_modes(paths: &[PathBuf]) -> Vec<(PathBuf, u32)> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let mut snapshot = Vec::new();
+    for root in paths {
+        let walker = walkdir::WalkDir::new(root).into_iter().filter_entry(|entry| {
+            !entry.file_type().is_dir()
+                || entry
+                    .file_name()
+                    .to_str()
+                    .is_none_or(|name| !EXEC_SNAPSHOT_SKIP_DIRS.contains(&name))
+        });
+        for entry in walker.filter_map(Result::ok) {
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let Ok(metadata) = entry.metadata() else { continue };
+            let mode = metadata.permissions().mode();
+            if mode & EXECUTE_BITS != 0 {
+                snapshot.push((entry.into_path(), mode));
+            }
+        }
+    }
+    snapshot
+}
+
+/// Re-apply each recorded mode whose execute bits the formatter dropped.
+#[cfg(unix)]
+fn restore_executable_modes(snapshot: &[(PathBuf, u32)]) {
+    use std::os::unix::fs::PermissionsExt as _;
+    for (path, mode) in snapshot {
+        let Ok(metadata) = std::fs::metadata(path) else {
+            continue;
+        };
+        if metadata.permissions().mode() & EXECUTE_BITS == mode & EXECUTE_BITS {
+            continue;
+        }
+        match std::fs::set_permissions(path, std::fs::Permissions::from_mode(*mode)) {
+            Ok(()) => debug!("restored exec bit on {}", path.display()),
+            Err(e) => warn!("failed to restore exec bit on {}: {e}", path.display()),
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn snapshot_executable_modes(_paths: &[PathBuf]) -> Vec<(PathBuf, u32)> {
+    Vec::new()
+}
+
+#[cfg(not(unix))]
+fn restore_executable_modes(_snapshot: &[(PathBuf, u32)]) {}
 
 /// Best-effort wiring of poly's git-hook shims (`poly hooks install`) into the
 /// generated repo. This installs the pre-commit + commit-msg stages declared in
@@ -182,40 +455,29 @@ pub(crate) fn install_poly_hooks(base_dir: &Path) {
 /// (no `mix format` / `dotnet format` system-toolchain dependency).
 fn language_residuals(config: &ResolvedCrateConfig, lang: Language, base_dir: &Path) -> Vec<ResidualStep> {
     match lang {
-        // The wasm binding crate is often excluded from the root workspace, so
-        // `cargo sort -w` never reaches it. Sort its Cargo.toml directly so it is
-        // already canonical when its hash is finalised.
         Language::Wasm => {
             let crate_dir = config
                 .output_for("wasm")
                 .map(resolve_crate_dir)
                 .unwrap_or_else(|| Path::new("crates").join(format!("{}-wasm", config.name)));
-            // Cargo accepts `/` on every platform; emit POSIX paths for cross-OS parity.
             let crate_dir_str = crate_dir.to_string_lossy().into_owned().replace('\\', "/");
             vec![cargo_sort(vec![crate_dir_str], base_dir.to_path_buf())]
         }
-        // Workspace-wide cargo sort normalises every in-workspace binding crate's
-        // Cargo.toml (FFI, PyO3, NAPI-RS, Magnus, ext-php-rs, Rustler, wasm-bindgen).
         Language::Ffi => vec![cargo_sort(vec!["-w".to_owned()], base_dir.to_path_buf())],
-        // Ruby's native crate lives outside the consumer workspace.
         Language::Ruby => {
             let gem_name = config.ruby_gem_name();
             let native_subdir = format!("ext/{gem_name}/native");
             vec![cargo_sort(vec![native_subdir], base_dir.join("packages/ruby"))]
         }
-        // Elixir: cargo sort for the workspace-excluded NIF crate. The `.ex`/
-        // `.exs` sources are formatted by poly's tier-2 tier (no `mix format`).
         Language::Elixir => {
             let app_name = config.elixir_app_name();
             let native_subdir = format!("native/{app_name}_nif");
             vec![cargo_sort(vec![native_subdir], base_dir.join("packages/elixir"))]
         }
-        // The extendr R crate is workspace-excluded.
         Language::R => vec![cargo_sort(
             vec!["packages/r/src/rust".to_owned()],
             base_dir.to_path_buf(),
         )],
-        // C# is formatted by poly's tier-2 tier — no `dotnet format` residual.
         _ => vec![],
     }
 }

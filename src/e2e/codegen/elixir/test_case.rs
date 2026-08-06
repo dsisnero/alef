@@ -160,7 +160,7 @@ pub(super) fn render_test_case(
         .map(|rt| rt.rsplit("::").next().unwrap_or(rt).to_string());
     let force_keyword_args = call_overrides.is_some_and(|o| o.keyword_args)
         || e2e_config.call.overrides.get(lang).is_some_and(|o| o.keyword_args);
-    let (mut setup_lines, args_str) = build_args_and_setup(
+    let (mut setup_lines, args_str, teardown_block) = build_args_and_setup(
         &fixture.input,
         resolved_args,
         &module_path,
@@ -219,7 +219,14 @@ pub(super) fn render_test_case(
             .get("elixir")
             .and_then(|o| o.client_factory.as_deref())
     });
-    let function_name = if call_config.r#async && client_factory.is_some() && !base_fn.ends_with("_async") {
+    // Streaming entry points (e.g. `chat_stream`) drive the FFI iterator handle and are not
+    // async-callable in the OpenAI sense — the binding exposes them under their base name, so the
+    // e2e must not append `_async`. Mirrors the guard at src/e2e/codegen/elixir.rs.
+    let function_name = if call_config.r#async
+        && client_factory.is_some()
+        && !base_fn.ends_with("_async")
+        && !base_fn.ends_with("_stream")
+    {
         format!("{base_fn}_async")
     } else {
         base_fn
@@ -274,6 +281,20 @@ pub(super) fn render_test_case(
             }
         } else {
             cleaned_setup_lines.push(line.clone());
+        }
+    }
+
+    // Register the trait-bridge teardown immediately after the GenServer starts (via
+    // `on_exit/1`), in every code path (validation-failure, expects-error, normal) below.
+    // `on_exit` runs even if the test body raises or an assertion fails partway through,
+    // unlike a plain trailing statement placed after the call+assertions — necessary here
+    // because ExUnit shares one BEAM VM (and one Rust-side plugin registry) across the
+    // whole suite. See `emit_test_backend`'s doc comment for the full rationale.
+    if !teardown_block.is_empty() {
+        for line in teardown_block.lines() {
+            if !line.is_empty() {
+                cleaned_setup_lines.push(line.to_string());
+            }
         }
     }
 
@@ -364,6 +385,13 @@ pub(super) fn render_test_case(
     for line in &cleaned_setup_lines {
         let _ = writeln!(out, "      {line}");
     }
+
+    // NOTE: the trait-bridge `on_exit` teardown (see `emit_test_backend`'s doc comment in
+    // stubs.rs) is already folded into `cleaned_setup_lines` above — right after the
+    // trait-bridge marker split, before any of the three code paths below — so it is emitted
+    // exactly once per test, in every path (validation-failure, expects-error, normal). Do
+    // not re-emit `teardown_block` here; doing so previously produced a duplicate
+    // `on_exit(fn -> ... end)` line per register_*_trait_bridge test.
 
     // Emit client creation when client_factory is configured.
     if let Some(factory) = client_factory {

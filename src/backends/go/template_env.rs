@@ -839,19 +839,17 @@ static TEMPLATES: &[(&str, &str)] = &[
         include_str!("templates/generate_cgo_flags.go.jinja"),
     ),
     (
-        "cmd_download_ffi_main.go.jinja",
-        include_str!("templates/cmd_download_ffi_main.go.jinja"),
+        "cmd_setup_main.go.jinja",
+        include_str!("templates/cmd_setup_main.go.jinja"),
     ),
     ("embed_ffi.go.jinja", include_str!("templates/embed_ffi.go.jinja")),
+    ("native_setup.go.jinja", include_str!("templates/native_setup.go.jinja")),
 ];
 
 pub(crate) fn make_env() -> Environment<'static> {
     let mut env = Environment::new();
     env.set_trim_blocks(true);
     env.set_lstrip_blocks(true);
-    // Preserve the trailing newline that each template file ends with.
-    // Inline-fragment templates (method_receiver_*, method_return*, method_empty_return)
-    // intentionally do NOT end with \n so they can be concatenated on the same line.
     env.set_keep_trailing_newline(true);
     for (name, src) in TEMPLATES {
         env.add_template(name, src).expect("built-in template is valid");

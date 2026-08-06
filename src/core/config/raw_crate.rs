@@ -41,9 +41,6 @@ use super::trait_bridge::TraitBridgeConfig;
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RawCrateConfig {
-    // -----------------------------------------------------------------
-    // Identity and source crate
-    // -----------------------------------------------------------------
     /// Crate name (e.g. `"sample_project"`). Must be unique within the workspace.
     pub name: String,
 
@@ -87,6 +84,14 @@ pub struct RawCrateConfig {
     #[serde(default)]
     pub features: Vec<String>,
 
+    /// Per-target build opt-out toggles for this crate, overriding the
+    /// workspace `[targets]` table per key. Keys are canonical target families
+    /// (see [`crate::publish::platform::CANONICAL_TARGET_KEYS`]); setting a key
+    /// to `false` drops every matching target triple from this crate's generated
+    /// target lists. Absent keys inherit the workspace value (default enabled).
+    #[serde(default)]
+    pub targets: std::collections::BTreeMap<String, bool>,
+
     /// Maps extracted rust_path prefixes to actual import paths in binding crates.
     #[serde(default)]
     pub path_mappings: HashMap<String, String>,
@@ -112,17 +117,11 @@ pub struct RawCrateConfig {
     #[serde(default)]
     pub source_crates: Vec<SourceCrate>,
 
-    // -----------------------------------------------------------------
-    // Language selection
-    // -----------------------------------------------------------------
     /// Override of the workspace `languages` list for this crate.
     /// When `None`, this crate inherits the workspace default.
     #[serde(default)]
     pub languages: Option<Vec<Language>>,
 
-    // -----------------------------------------------------------------
-    // Per-language settings (was top-level [python], [node], …)
-    // -----------------------------------------------------------------
     #[serde(default)]
     pub python: Option<PythonConfig>,
     #[serde(default)]
@@ -161,9 +160,6 @@ pub struct RawCrateConfig {
     pub zig: Option<ZigConfig>,
     pub crystal: Option<CrystalConfig>,
 
-    // -----------------------------------------------------------------
-    // Filters and output paths
-    // -----------------------------------------------------------------
     #[serde(default)]
     pub exclude: ExcludeConfig,
     #[serde(default)]
@@ -174,9 +170,6 @@ pub struct RawCrateConfig {
     #[serde(default)]
     pub output: OutputConfig,
 
-    // -----------------------------------------------------------------
-    // Per-crate generation, formatting, and DTO overrides.
-    // -----------------------------------------------------------------
     /// Override the workspace default `generate` flags. When `Some`, replaces the
     /// workspace value wholesale. When `None`, the crate inherits `workspace.generate`.
     #[serde(default)]
@@ -194,9 +187,6 @@ pub struct RawCrateConfig {
     #[serde(default)]
     pub generate_overrides: HashMap<String, super::GenerateConfig>,
 
-    // -----------------------------------------------------------------
-    // Per-crate pipeline overrides — merged field-wise with workspace defaults.
-    // -----------------------------------------------------------------
     #[serde(default)]
     pub lint: HashMap<String, LintConfig>,
     #[serde(default)]
@@ -210,9 +200,6 @@ pub struct RawCrateConfig {
     #[serde(default)]
     pub build_commands: HashMap<String, BuildCommandConfig>,
 
-    // -----------------------------------------------------------------
-    // Packaging, e2e, extensibility
-    // -----------------------------------------------------------------
     #[serde(default)]
     pub publish: Option<PublishConfig>,
     #[serde(default)]

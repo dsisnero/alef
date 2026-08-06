@@ -10,9 +10,7 @@ fn test_scaffold_ffi_with_core_import() {
     let cargo_toml = &files[0].content;
     assert!(cargo_toml.contains("serde"));
     assert!(cargo_toml.contains("serde_json"));
-    // Should have core_import as dependency
     assert!(cargo_toml.contains("my-lib ="));
-    // Should generate cmake config
     let cmake = &files[1].content;
     assert!(cmake.contains("find_package"));
     assert!(cmake.contains("my-lib-ffi::my-lib-ffi"));
@@ -20,9 +18,6 @@ fn test_scaffold_ffi_with_core_import() {
 
 #[test]
 fn test_scaffold_ffi_deps_are_pinned() {
-    // Audit: FFI Cargo.toml ships sensible, current dependency pins.
-    // Bumping cbindgen requires re-generating headers; treat this test as a
-    // canary — if it fails, audit cbindgen's changelog before adjusting.
     let config = test_config();
     let api = test_api();
     let all_files = scaffold(&api, &config, &[Language::Ffi]).unwrap();
@@ -40,10 +35,6 @@ fn test_scaffold_ffi_deps_are_pinned() {
 
 #[test]
 fn test_scaffold_ffi_merges_extra_dependencies() {
-    // Multi-crate workspaces (e.g. mylib's mylib-core/-http/-extra) emit FFI
-    // bindings that reference qualified crate paths. The scaffold must merge
-    // [crate.extra_dependencies] from alef.toml so the generated cdylib can
-    // resolve those imports.
     let mut config = test_config();
     let mut deps: std::collections::HashMap<String, toml::Value> = Default::default();
     deps.insert(
@@ -88,11 +79,6 @@ fn test_scaffold_ffi_injects_version_for_workspace_member_deps() {
     use std::fs;
     use tempfile::TempDir;
 
-    // `cargo publish` rejects path-only deps: "all dependencies must have a
-    // version requirement specified when publishing". Every internal workspace
-    // dep the FFI/umbrella manifest pulls in (auto-detected from the public
-    // surface via `[crate.extra_dependencies]`) must therefore carry the
-    // resolved workspace version alongside its path, mirroring the core dep.
     let tmp = TempDir::new().unwrap();
     let root = tmp.path();
     fs::write(
@@ -120,8 +106,6 @@ version = "4.2.0"
     let mut config = test_config();
     config.workspace_root = Some(root.to_path_buf());
     let mut deps: std::collections::HashMap<String, toml::Value> = Default::default();
-    // Path-only internal workspace member deps (as auto-detected and emitted
-    // into [crate.extra_dependencies]).
     for member in ["my-lib-core", "my-lib-http"] {
         deps.insert(
             member.to_string(),
@@ -131,7 +115,6 @@ version = "4.2.0"
             )])),
         );
     }
-    // A genuinely external dep must stay untouched (no spurious version inject).
     deps.insert("anyhow".to_string(), toml::Value::String("1.0".to_string()));
     config.extra_dependencies = deps;
 
@@ -141,13 +124,11 @@ version = "4.2.0"
     let cargo_toml = &files[0].content;
 
     for member in ["my-lib-core", "my-lib-http"] {
-        // Each internal member dep must carry the injected workspace version.
         assert!(
             cargo_toml.contains(&format!("{member} = {{ path = \"../{member}\", version = \"4.2.0\" }}")),
             "FFI manifest must version-inject internal workspace dep {member}; got:\n{cargo_toml}"
         );
     }
-    // External dep unchanged.
     assert!(
         cargo_toml.contains("anyhow = \"1.0\""),
         "external dep must be emitted unchanged, got:\n{cargo_toml}"
@@ -156,12 +137,7 @@ version = "4.2.0"
 
 #[test]
 fn test_scaffold_ffi_target_dep_overrides_emit_cfg_blocks() {
-    // When FfiConfig.target_dep_overrides is configured, the core-crate
-    // dependency moves out of the main [dependencies] table into per-cfg
     // [target.'cfg(...)'.dependencies] tables. This is the only shape that
-    // satisfies targets whose feature set differs from the default, e.g.
-    // x86_64-linux-android (no ONNX Runtime prebuilt) needs the
-    // `android-target` feature instead of `full`.
     use crate::core::config::FfiTargetDepOverride;
     use crate::core::config::languages::FfiConfig;
 
@@ -202,7 +178,6 @@ fn test_scaffold_ffi_target_dep_overrides_emit_cfg_blocks() {
         "default branch should keep the full feature set, got:\n{cargo_toml}"
     );
 
-    // The override branch keeps the explicit cfg and a reduced feature set.
     assert!(
         cargo_toml.contains("[target.'cfg(all(target_os = \"android\", target_arch = \"x86_64\"))'.dependencies]"),
         "expected override target table, got:\n{cargo_toml}"
@@ -212,8 +187,6 @@ fn test_scaffold_ffi_target_dep_overrides_emit_cfg_blocks() {
         "override branch should emit android-target feature, got:\n{cargo_toml}"
     );
 
-    // The main [dependencies] table still exists for ahash/serde_json/tokio but
-    // no longer contains the core-crate line.
     assert!(cargo_toml.contains("[dependencies]\nahash = \"0.8\""));
     assert!(
         !cargo_toml.contains("\n[dependencies]\nmy-lib ="),
@@ -226,12 +199,6 @@ fn test_scaffold_ffi_emits_android_target_aggregate_feature() {
     use std::fs;
     use tempfile::TempDir;
 
-    // When the core crate defines an `android-target` aggregate feature, the FFI
-    // crate must emit a matching `android-target` that (a) forwards to the core
-    // dep's `android-target` and (b) enables every binding passthrough feature
-    // that is a transitive member of the core aggregate — so consumers can build
-    // the FFI crate for Android with `--no-default-features --features
-    // android-target` and get a clean, ORT-free + libheif-free surface.
     let tmp = TempDir::new().unwrap();
     let root = tmp.path();
     fs::write(
@@ -241,8 +208,6 @@ fn test_scaffold_ffi_emits_android_target_aggregate_feature() {
     .unwrap();
     fs::create_dir_all(root.join("crates/kreuzberg/src")).unwrap();
     fs::write(root.join("crates/kreuzberg/src/lib.rs"), "pub fn f() {}").unwrap();
-    // android-target references a sub-aggregate (`no-ort-target`) plus a leaf
-    // (`ocr`); the resolver must transitively expand the sub-aggregate.
     fs::write(
         root.join("crates/kreuzberg/Cargo.toml"),
         r#"[package]
@@ -264,8 +229,6 @@ embeddings = []
     config.name = "kreuzberg".to_string();
     config.workspace_root = Some(root.to_path_buf());
     config.sources = vec![PathBuf::from("crates/kreuzberg/src/lib.rs")];
-    // The binding's passthrough surface. `embeddings` is NOT in android-target,
-    // and `full` is the umbrella the android target excludes — both must drop out.
     config.features = vec![
         "full".to_string(),
         "pdf".to_string(),
@@ -279,12 +242,10 @@ embeddings = []
     let files = language_files(&all_files);
     let cargo_toml = &files[0].content;
 
-    // Sorted, `embeddings` excluded (not in android-target), `full` excluded.
     assert!(
         cargo_toml.contains(r#"android-target = ["kreuzberg/android-target", "html", "ocr", "pdf"]"#),
         "FFI manifest must emit the android-target aggregate feature; got:\n{cargo_toml}"
     );
-    // Output must be valid TOML.
     toml::from_str::<toml::Value>(cargo_toml).expect("generated Cargo.toml must be valid TOML");
 }
 
@@ -293,8 +254,6 @@ fn test_scaffold_ffi_omits_android_target_when_core_lacks_it() {
     use std::fs;
     use tempfile::TempDir;
 
-    // Repos whose core crate has no `android-target` feature must not get a
-    // spurious `android-target` line in their FFI manifest.
     let tmp = TempDir::new().unwrap();
     let root = tmp.path();
     fs::write(
@@ -333,7 +292,6 @@ fn test_scaffold_go_production_format() {
     let api = test_api();
     let all_files = scaffold(&api, &config, &[Language::Go]).unwrap();
     let files = language_files(&all_files);
-    // go.mod + .golangci.yml + .lib/.gitkeep
     assert_eq!(files.len(), 3);
     let content = &files[0].content;
     assert!(content.contains("go 1.26"));
@@ -397,10 +355,7 @@ fn test_scaffold_java_production_features() {
     let api = test_api();
     let all_files = scaffold(&api, &config, &[Language::Java]).unwrap();
     let files = language_files(&all_files);
-    // pom.xml + checkstyle.xml + checkstyle.properties + checkstyle-suppressions.xml
-    // + versions-rules.xml + pmd-ruleset.xml. (eclipse-formatter.xml was removed
-    // along with the spotless-maven-plugin — formatting is delegated to poly.)
-    assert_eq!(files.len(), 6);
+    assert_eq!(files.len(), 5);
     let content = &files[0].content;
     assert!(content.contains("<properties>"));
     assert!(content.contains("<project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>"));
@@ -446,13 +401,10 @@ fn test_scaffold_ruby_production_features() {
     let api = test_api();
     let all_files = scaffold(&api, &config, &[Language::Ruby]).unwrap();
     let files = language_files(&all_files);
-    // scaffold_ruby: gemspec, rubocop, Rakefile, extconf.rb, Gemfile, Steepfile = 6 files.
-    // The `lib/<gem>.rb` entry point is emitted by the magnus backend (gen_bindings),
-    // not the scaffold — it requires `<gem>/native` and `<gem>/version`.
-    // scaffold_ruby_cargo: Cargo.toml = 1 file
     assert_eq!(files.len(), 7);
     let content = &files[0].content;
-    assert!(content.contains("spec.required_ruby_version"));
+    assert!(content.contains(r#"spec.required_ruby_version = ">= 3.2.0""#));
+    assert!(!content.contains("< 4.0"));
     assert!(content.contains("spec.extensions"));
     assert!(content.contains("README*"));
     assert!(content.contains("LICENSE*"));
@@ -462,9 +414,7 @@ fn test_scaffold_ruby_production_features() {
     assert!(content.contains("spec.metadata[\"keywords\"]"));
     assert!(content.contains("frozen_string_literal: true"));
     assert!(content.contains("spec.metadata[\"rubygems_mfa_required\"] = \"true\""));
-    // Check for .rubocop.yml generation
     assert_eq!(files[1].path, PathBuf::from("packages/ruby/.rubocop.yml"));
-    // Check for Rakefile generation
     assert_eq!(files[2].path, PathBuf::from("packages/ruby/Rakefile"));
     assert!(files[2].content.contains("RbSys::ExtensionTask"));
     assert!(files[2].content.contains("my_lib_rb"));
@@ -472,7 +422,6 @@ fn test_scaffold_ruby_production_features() {
     assert!(files[2].content.contains("MANIFEST_PATH"));
     assert!(files[2].content.contains("--manifest-path"));
     assert!(files[2].content.contains("task compile: \"compile:ruby\""));
-    // Check for extconf.rb generation
     assert_eq!(
         files[3].path,
         PathBuf::from("packages/ruby/ext/my_lib_rb/native/extconf.rb")
@@ -483,10 +432,8 @@ fn test_scaffold_ruby_production_features() {
         files[3].content.contains("config.ext_dir = \".\""),
         "extconf.rb must set ext_dir = \".\" so rb_sys finds the sibling Cargo.toml"
     );
-    // files[4] is Gemfile; files[5] is Steepfile; files[6] is the Cargo.toml from scaffold_ruby_cargo
     assert_eq!(files[4].path, PathBuf::from("packages/ruby/Gemfile"));
     assert_eq!(files[5].path, PathBuf::from("packages/ruby/Steepfile"));
-    // Check for Cargo.toml generation
     assert_eq!(
         files[6].path,
         PathBuf::from("packages/ruby/ext/my_lib_rb/native/Cargo.toml")
@@ -509,7 +456,6 @@ fn test_scaffold_ruby_gemspec_includes_sorbet_runtime_dependency() {
     let api = test_api();
     let all_files = scaffold(&api, &config, &[Language::Ruby]).unwrap();
     let files = language_files(&all_files);
-    // files[0] is the gemspec
     let gemspec = &files[0].content;
     assert!(
         gemspec.contains("sorbet-runtime"),
@@ -533,7 +479,6 @@ fn test_java_checkstyle_no_cosmetic_checks() {
     let all_files = scaffold(&api, &config, &[Language::Java]).unwrap();
     let files = language_files(&all_files);
     let checkstyle = files.iter().find(|f| f.path.ends_with("checkstyle.xml")).unwrap();
-    // Should NOT have cosmetic whitespace checks (Spotless handles formatting)
     assert!(!checkstyle.content.contains("WhitespaceAfter"));
     assert!(!checkstyle.content.contains("WhitespaceAround"));
     assert!(!checkstyle.content.contains("GenericWhitespace"));
@@ -541,18 +486,12 @@ fn test_java_checkstyle_no_cosmetic_checks() {
     assert!(!checkstyle.content.contains("NeedBraces"));
     assert!(!checkstyle.content.contains("MagicNumber"));
     assert!(!checkstyle.content.contains("JavadocPackage"));
-    // Should still have correctness checks
     assert!(checkstyle.content.contains("EqualsHashCode"));
     assert!(checkstyle.content.contains("UnusedImports"));
     assert!(checkstyle.content.contains("MethodLength"));
     assert!(checkstyle.content.contains("LineLength"));
-    // LineLength max is 200 to accommodate the alef-emitted DefaultClient FFM
-    // call shims (single-line chains of arena allocation + marshalling that
-    // don't reflow cleanly within shorter limits).
     assert!(checkstyle.content.contains("\"200\""));
 }
-
-// --- Go golangci v2 format tests ---
 
 #[test]
 fn test_go_golangci_v2_format() {
@@ -565,9 +504,7 @@ fn test_go_golangci_v2_format() {
     assert!(golangci.content.contains("version: \"2\""));
     assert!(golangci.content.contains("default: none"));
     assert!(golangci.content.contains("settings:"));
-    // Should NOT use old v1 format
     assert!(!golangci.content.contains("linters-settings:"));
-    // Should have detailed config
     assert!(golangci.content.contains("errcheck"));
     assert!(golangci.content.contains("govet"));
     assert!(golangci.content.contains("misspell"));
@@ -581,12 +518,10 @@ fn test_scaffold_csharp_csproj_at_package_root() {
     let api = test_api();
     let all_files = scaffold(&api, &config, &[Language::Csharp]).unwrap();
     let files = language_files(&all_files);
-    // csproj at package root + .editorconfig + Directory.Build.props
     let csproj = files
         .iter()
         .find(|f| f.path.to_string_lossy().ends_with(".csproj"))
         .expect("C# scaffold must produce a .csproj file");
-    // Must be at packages/csharp/<Namespace>.csproj (package root), NOT inside the source subdir
     assert_eq!(
         csproj.path,
         PathBuf::from("packages/csharp/MyLib/MyLib.csproj"),
@@ -629,22 +564,21 @@ fn test_scaffold_csharp_csproj_at_package_root() {
 }
 
 #[test]
-fn test_render_csharp_csproj_runtimes_glob_is_relative() {
-    // Regression: the runtimes glob must NOT have a "../" prefix.
-    // The csproj lives at packages/csharp/<Namespace>/<Namespace>.csproj, so
-    // `runtimes/**` resolves to packages/csharp/<Namespace>/runtimes/ — the exact
-    // directory where alef-publish stages the FFI shared libraries.
+fn test_render_csharp_csproj_is_thin_meta_package() {
     let config = test_config();
     let content = render_csharp_csproj(&config, "1.2.3");
     assert!(
-        content.contains(r#"Include="runtimes/**""#),
-        "runtimes glob must be relative (no ../ prefix): {content}"
+        !content.contains(r#"Include="runtimes/**""#),
+        "meta csproj must NOT pack the fat runtimes/** payload (413 regression): {content}"
     );
     assert!(
-        !content.contains(r#"Include="../runtimes"#),
-        "runtimes glob must NOT have ../: {content}"
+        content.contains(r#"Include="runtime.json" Pack="true" PackagePath="/" Condition="Exists('runtime.json')""#),
+        "meta csproj must pack the thin runtime.json RID-fallback graph: {content}"
     );
-    // The csproj lives at packages/csharp/<Namespace>/<Namespace>.csproj (3 levels deep),
+    assert!(
+        content.contains(r#"<Target Name="RequireRuntimeJson" BeforeTargets="Pack">"#),
+        "meta csproj must hard-error if runtime.json is missing before pack: {content}"
+    );
     // so ../../../LICENSE correctly reaches the workspace root.
     assert!(
         content.contains(r#"Include="../../../LICENSE""#),
@@ -658,19 +592,9 @@ fn test_render_csharp_csproj_runtimes_glob_is_relative() {
 
 #[test]
 fn test_render_csharp_csproj_stamps_assembly_version_properties() {
-    // Regression: tslp v1.9.0-rc.48 shipped a NuGet package whose consumers saw
-    //   warning CS8012: ... Version=0.0.0.0
-    //   FileNotFoundException: Could not load file or assembly 'TreeSitterLanguagePack, Version=0.0.0.0, ...'
-    // Root cause: the csproj had `<GenerateAssemblyInfo>false</GenerateAssemblyInfo>`
-    // and no explicit AssemblyVersion/FileVersion stamp, so the compiled assembly
-    // metadata defaulted to 0.0.0.0. The fix stamps AssemblyVersion/FileVersion
-    // as 4-component numeric (MAJOR.MINOR.PATCH.0) derived from the SemVer base
-    // and preserves the full SemVer (including any `-rc.N` suffix) on
-    // <Version> and <InformationalVersion>.
     let config = test_config();
     let content = render_csharp_csproj(&config, "1.9.0-rc.48");
 
-    // The full SemVer (with prerelease) lives on Version + InformationalVersion.
     assert!(
         content.contains("<Version>1.9.0-rc.48</Version>"),
         "Version must carry the full SemVer including prerelease: {content}"
@@ -680,7 +604,6 @@ fn test_render_csharp_csproj_stamps_assembly_version_properties() {
         "InformationalVersion must carry the full SemVer for diagnostics: {content}"
     );
 
-    // AssemblyVersion + FileVersion must be the 4-component numeric form .NET requires.
     assert!(
         content.contains("<AssemblyVersion>1.9.0.0</AssemblyVersion>"),
         "AssemblyVersion must be a 4-component numeric (prerelease stripped): {content}"
@@ -690,7 +613,6 @@ fn test_render_csharp_csproj_stamps_assembly_version_properties() {
         "FileVersion must be a 4-component numeric (prerelease stripped): {content}"
     );
 
-    // The metadata must never default to 0.0.0.0 — that's the bug we're fixing.
     assert!(
         !content.contains("0.0.0.0"),
         "no version property may be 0.0.0.0: {content}"
@@ -699,14 +621,6 @@ fn test_render_csharp_csproj_stamps_assembly_version_properties() {
 
 #[test]
 fn test_render_csharp_csproj_advertises_all_published_runtime_identifiers() {
-    // Regression: tslp v1.9.0-rc.48 csproj only listed osx-arm64/linux-x64/win-x64
-    // as conditional singular <RuntimeIdentifier>, which forced the binding NuGet
-    // build into single-RID mode and packaged a managed assembly with a
-    // processor-specific PE header — surfacing as `CS8012: ... targets a different
-    // processor` on consumers whose RID didn't match the build host. The fix
-    // advertises every published RID via <RuntimeIdentifiers> (plural) so the SDK
-    // packs all `runtimes/<rid>/native/` payloads, and pins the managed assembly
-    // to AnyCPU so the PE header is processor-neutral.
     let config = test_config();
     let content = render_csharp_csproj(&config, "1.9.0-rc.48");
 
@@ -738,6 +652,149 @@ fn test_render_csharp_csproj_advertises_all_published_runtime_identifiers() {
 }
 
 #[test]
+fn test_scaffold_csharp_emits_runtime_json_template() {
+    let config = test_config();
+    let api = test_api();
+    let all_files = scaffold(&api, &config, &[Language::Csharp]).unwrap();
+    let files = language_files(&all_files);
+    let template = files
+        .iter()
+        .find(|f| f.path.to_string_lossy().ends_with("runtime.json.template"))
+        .expect("C# scaffold must emit runtime.json.template so CI can render runtime.json before pack");
+
+    assert_eq!(
+        template.path,
+        PathBuf::from("packages/csharp/MyLib/runtime.json.template"),
+        "runtime.json.template must sit beside the csproj so the RequireRuntimeJson target finds it"
+    );
+    assert!(
+        !template.generated_header,
+        "runtime.json.template must be scaffold-once (no DO NOT EDIT header — it is JSON)"
+    );
+    assert!(
+        template.content.contains("{{VERSION}}"),
+        "template must keep the literal version placeholder for CI substitution: {}",
+        template.content
+    );
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(&template.content).expect("runtime.json.template must be valid JSON");
+    let runtimes = parsed["runtimes"]
+        .as_object()
+        .expect("runtime.json must have a runtimes object");
+
+    // Each enabled glibc/windows/macos RID pulls in its per-RID native package pinned
+    // to the placeholder. Assert against the actual package id so the test tracks config.
+    for rid in [
+        "win-x64",
+        "win-arm64",
+        "linux-x64",
+        "linux-arm64",
+        "osx-x64",
+        "osx-arm64",
+    ] {
+        let rid_entry = runtimes[rid]
+            .as_object()
+            .unwrap_or_else(|| panic!("RID {rid} entry must be an object"));
+        assert_eq!(
+            rid_entry.len(),
+            1,
+            "RID {rid} must map exactly one package id: {}",
+            template.content
+        );
+        let (package_id, dependencies) = rid_entry.iter().next().unwrap();
+        let expected_dependency = format!("{package_id}.runtime.{rid}");
+        assert_eq!(
+            dependencies.get(&expected_dependency).and_then(|value| value.as_str()),
+            Some("{{VERSION}}"),
+            "RID {rid} must depend on {expected_dependency} pinned to the version placeholder: {}",
+            template.content
+        );
+    }
+
+    // musl RIDs ship no native package of their own; they fall back to the glibc asset.
+    assert_eq!(
+        runtimes["linux-musl-x64"]["#import"][0].as_str(),
+        Some("linux-x64"),
+        "linux-musl-x64 must #import linux-x64: {}",
+        template.content
+    );
+    assert_eq!(
+        runtimes["linux-musl-arm64"]["#import"][0].as_str(),
+        Some("linux-arm64"),
+        "linux-musl-arm64 must #import linux-arm64: {}",
+        template.content
+    );
+}
+
+#[test]
+fn test_scaffold_csharp_emits_runtime_project_for_meta_split() {
+    let config = test_config();
+    let api = test_api();
+    let all_files = scaffold(&api, &config, &[Language::Csharp]).unwrap();
+    let files = language_files(&all_files);
+    let runtime = files
+        .iter()
+        .find(|f| f.path.to_string_lossy().ends_with(".Runtime.csproj"))
+        .expect("C# scaffold must emit the native-only .Runtime project (native half of the meta+runtime split)");
+
+    assert_eq!(
+        runtime.path,
+        PathBuf::from("packages/csharp/MyLib.Runtime/MyLib.Runtime.csproj"),
+        "runtime project must be the sibling ../<Namespace>.Runtime the meta csproj references"
+    );
+    assert!(
+        !runtime.generated_header,
+        "runtime csproj must be scaffold-once (generated_header = false)"
+    );
+}
+
+#[test]
+fn test_render_csharp_runtime_csproj_is_native_only_per_rid_package() {
+    let config = test_config();
+    let content = render_csharp_runtime_csproj(&config, "1.9.0-rc.48");
+
+    // PackageId is parameterized per RID so one project packs every enabled RID.
+    assert!(
+        content.contains("<PackageId>MyLib.runtime.$(PublishedRID)</PackageId>"),
+        "runtime package id must be <PackageId>.runtime.$(PublishedRID): {content}"
+    );
+    assert!(
+        content.contains("<PublishedRID Condition=\"'$(PublishedRID)' == ''\">"),
+        "runtime csproj must default PublishedRID so a bare pack still evaluates: {content}"
+    );
+    // Native payload comes from the meta package's staged runtimes/ dir.
+    assert!(
+        content.contains(
+            r#"Include="../MyLib/runtimes/$(PublishedRID)/native/**" Pack="true" PackagePath="runtimes/$(PublishedRID)/native/""#
+        ),
+        "runtime csproj must pack the meta package's staged native payload under runtimes/<rid>/native/: {content}"
+    );
+    // Native-only: no managed assembly, deps suppressed, NU5128 tolerated.
+    assert!(
+        content.contains("<IncludeBuildOutput>false</IncludeBuildOutput>"),
+        "runtime package must not ship a managed assembly: {content}"
+    );
+    assert!(
+        content.contains("NU5128"),
+        "runtime csproj must suppress the native-only NU5128 warning: {content}"
+    );
+    // Hard-error guard so an empty native payload fails the pack loudly.
+    assert!(
+        content.contains(r#"<Target Name="RequireRuntimeAssets" BeforeTargets="Pack">"#),
+        "runtime csproj must guard against packing without staged natives: {content}"
+    );
+    assert!(
+        content.contains("<Version>1.9.0-rc.48</Version>"),
+        "runtime version must be substituted: {content}"
+    );
+    assert!(
+        content.contains(r#"Include="../../../LICENSE""#),
+        "runtime project sits at the same depth as the meta package, so LICENSE is ../../../LICENSE: {content}"
+    );
+}
+
+#[test]
 fn test_scaffold_java_checkstyle_suppressions_use_config_location() {
     let config = test_config();
     let api = test_api();
@@ -762,10 +819,6 @@ fn test_scaffold_java_checkstyle_suppressions_use_config_location() {
 
 #[test]
 fn test_ruby_cargo_machete_rb_sys_only() {
-    // Regression test: v0.22.25 fixed the mingw sysroot bug via a cargo-dep pin on rb-sys.
-    // The NIF code now directly uses `tokio` and `async-trait` (not just transitively through
-    // the core crate), so they must NOT be in the cargo-machete ignored list. Only `rb-sys`
-    // should be ignored (it's pinned but used transitively through Magnus).
     use crate::core::ir::*;
 
     let config = test_config_from_toml(
@@ -775,7 +828,6 @@ gem_name = "test_lib"
 "#,
     );
 
-    // Minimal ApiSurface with no async/trait bridges to verify the baseline cargo-machete section
     let api = ApiSurface {
         crate_name: "test-lib".to_string(),
         version: "1.0.0".to_string(),
@@ -801,7 +853,6 @@ gem_name = "test_lib"
 
     let content = &cargo_toml_file.content;
 
-    // Verify the cargo-machete section exists and contains only rb-sys
     assert!(
         content.contains("[package.metadata.cargo-machete]"),
         "Should contain [package.metadata.cargo-machete] section; got:\n{}",
@@ -814,8 +865,6 @@ gem_name = "test_lib"
         content
     );
 
-    // Verify that the ignored list does NOT contain the conditional deps
-    // (tokio, async-trait, futures, ahash are now directly used by NIF code and should not be ignored)
     let ignored_section = content
         .split("[package.metadata.cargo-machete]")
         .nth(1)

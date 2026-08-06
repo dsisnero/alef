@@ -16,14 +16,12 @@ pub(super) fn gen_streaming_adapter_facade_method(
         )
     });
 
-    // Build Rust function signature
     let mut params: Vec<String> = vec![format!("engine: &{owner_type}")];
 
-    // Add request type parameter(s)
     for p in &adapter.params {
         let param_type = p.ty.rsplit("::").next().unwrap_or(&p.ty);
         let ref_indicator = if matches!(param_type, "String" | "Vec<String>") {
-            "" // Already reference via .into()
+            ""
         } else {
             "&"
         };
@@ -37,8 +35,6 @@ pub(super) fn gen_streaming_adapter_facade_method(
 
     let return_type = "std::result::Result<Vec<String>, ext_php_rs::exception::PhpException>";
 
-    // Body: call the instance method on the engine handle
-    // Note: adapter.name is already snake_case, so use it directly for the Rust method call
     let rust_method_name = &adapter.name;
     let call_args = adapter
         .params
@@ -66,21 +62,18 @@ pub(super) fn has_no_arg_new_returning_self(typ: &crate::core::ir::TypeDef) -> b
         .any(|m| m.name == "new" && m.receiver.is_none() && m.params.is_empty() && m.error_type.is_none())
 }
 
-pub(super) fn php_variant_wrapper_constructor(
+pub(crate) fn php_variant_wrapper_constructor_method(
     typ: &crate::core::ir::TypeDef,
     mapper: &crate::backends::php::type_map::PhpMapper,
     core_import: &str,
+    opaque_types: &ahash::AHashSet<String>,
 ) -> Option<String> {
     use crate::codegen::type_mapper::TypeMapper as _;
     let ctor = typ.methods.iter().find(|m| m.name == "new" && m.receiver.is_none())?;
     let map_fn = |t: &crate::core::ir::TypeRef| mapper.map_type(t);
     let sig_params = crate::codegen::shared::function_params(&ctor.params, &map_fn);
-    let call_args = ctor
-        .params
-        .iter()
-        .map(|p| p.name.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
+    let call_args =
+        crate::backends::php::gen_bindings::helpers::gen_php_call_args(&ctor.params, opaque_types, &mapper.enum_names);
     let core_path = crate::codegen::conversions::core_type_path(typ, core_import);
     let body = if call_args.is_empty() {
         format!("Self {{ inner: std::sync::Arc::new({core_path}::new()) }}")
@@ -92,10 +85,7 @@ pub(super) fn php_variant_wrapper_constructor(
     } else {
         format!("pub fn new({sig_params}) -> Self")
     };
-    Some(format!(
-        "#[php_impl]\nimpl {name} {{\n    #[php(constructor)]\n    {fn_sig} {{\n        {body}\n    }}\n}}\n",
-        name = typ.name,
-    ))
+    Some(format!("#[php(constructor)]\n{fn_sig} {{\n    {body}\n}}"))
 }
 
 /// Generate config.m4 for PIE (PHP Installer for Extensions) to enable building Rust-based PHP extensions.
@@ -105,8 +95,6 @@ pub(super) fn php_variant_wrapper_constructor(
 /// and directs the build to use cargo. This allows PIE to fall back from pre-packaged binaries
 /// to source compilation without errors.
 pub(super) fn generate_config_m4(extension_name: &str, package_name: &str) -> String {
-    // Convert extension_name (with underscores) back to cargo crate name (with hyphens)
-    // e.g., "my_ext" → "my-ext" for directory lookup
     let cargo_crate_name = package_name;
     let lib_name = extension_name.replace('_', "-");
 
@@ -169,5 +157,3 @@ fi
         extension_name,
     )
 }
-
-// ───────────────────────────────────────────────────────────────────── tests ──

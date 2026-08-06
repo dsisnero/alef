@@ -47,11 +47,9 @@ pub fn generate(api: &ApiSurface, config: &ResolvedCrateConfig) -> anyhow::Resul
 
     let service_rs = gen_service_rs(api, config);
 
-    // Extension name matches the Rust crate name with hyphens replaced by underscores.
     let extension_name = config.name.replace('-', "_");
     let service_php = gen_service_php(api, &extension_name);
 
-    // PHP package output base (same logic as generate_public_api)
     let output_base = config
         .php
         .as_ref()
@@ -59,7 +57,12 @@ pub fn generate(api: &ApiSurface, config: &ResolvedCrateConfig) -> anyhow::Resul
         .map(|s| PathBuf::from(&s.output))
         .unwrap_or_else(|| {
             let package_name = config.name.replace('-', "_");
-            PathBuf::from(format!("packages/php/{}", package_name))
+            let default_dir = format!("packages/php/{}", package_name);
+            PathBuf::from(resolve_output_dir(
+                config.output_paths.get("php"),
+                &config.name,
+                &default_dir,
+            ))
         });
 
     Ok(vec![

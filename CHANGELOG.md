@@ -7,6 +7,1145 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`alef update`/`upgrade` no longer corrupt a pnpm project's `package.json`.** The default Node
+  recipes ran bare `pnpm up -r` (and `pnpm up --latest -r -w`). With pnpm's default
+  `auto-install-peers`/`dedupe-peer-dependents`, `pnpm up` promotes the optional peer deps of
+  installed packages (e.g. napi-rs's `@emnapi/core`, `@emnapi/runtime`, `@octokit/core`, `typanion`)
+  into the project's own `dependencies` and stamps them with the *workspace* version — so every
+  update rewrote `package.json` with bogus, version-mismatched dependencies. Both recipes now pass
+  `--config.auto-install-peers=false --config.dedupe-peer-dependents=false`, so only the real,
+  declared dependency ranges are bumped. (`src/core/config/update_defaults.rs`)
+
+- **PHP streaming methods are emitted in adapter-declaration order.** The PHP backend collected the
+  streaming method keys into an `AHashSet` and then *iterated* it to emit the `#[php_impl]` methods —
+  the only place in the backend where a hash container drove output order. ahash seeds itself per
+  process, so regenerating an unchanged tree could swap two streaming methods in the generated Rust
+  binding, producing a spurious diff and an intermittently red `alef verify` freshness gate. The keys
+  are now an order-preserving, deduplicated `Vec` built from `config.adapters`, matching the
+  config-declared order every other PHP emitter already uses.
+  (`src/backends/php/gen_bindings/rust_bindings.rs`,
+  `src/backends/php/gen_bindings/types/structs.rs`)
+
+- **The scaffolded PHP `composer.json` declares a PHPUnit constraint that is installable on the PHP
+  version it claims to support.** The generated manifests paired `"php": ">=8.2"` with
+  `"phpunit/phpunit": "^13.1"`, but PHPUnit 13 requires PHP >= 8.4.1 — so `composer install` could
+  not resolve on 8.2 or 8.3, and Dependabot, which resolves Composer against the declared platform
+  floor rather than the runtime PHP, failed on every run in the consumer repos. The constraint is now
+  `^11.5 || ^12.0 || ^13.1`, letting Composer pick the newest major the actual PHP supports.
+  (`src/core/template_versions.rs`)
+
+- **Java enum wire names now match serde's actual no-`rename_all` fallback.** The Java backend's
+  tagged-discriminator and simple-enum generators lowercased the variant name (`listitem`) when an
+  enum had no `#[serde(rename_all)]`, but serde with no rename attributes emits the PascalCase
+  variant name verbatim (`ListItem`). Generated `json_name` values — and the matching
+  `excluded_variants` handling — now fall through to the same verbatim behavior as every other
+  backend. (`src/backends/java/gen_bindings/types/enums.rs`)
+
+- **NAPI tagged-enum sanitized fields no longer drop data or emit non-compiling conversions.**
+  #218 (@thisislvca) fixed the tagged-enum discriminator wire names but its sanitized-field
+  handling had follow-on gaps: an unreachable `optional` branch inside the `sanitized` arm meant
+  `field_conversion_from_core` was always called with `optional: false`; checking `f.optional`
+  before `f.sanitized` meant an `Option<Vec<(String, String)>>` field never reached the sanitized
+  path in either direction; gating on any `Vec<_>` shape (rather than the specific
+  `Vec<Vec<String>>` shape actually handled) could emit a `format!("{:?}", …)` assigned to a
+  `Vec<_>`-typed field, which does not compile; and the core→binding direction re-parsed a
+  rendered `"name: expr"` string with `strip_prefix`/`replace` instead of composing an expression
+  directly. Sanitized `Vec<Vec<String>>` (optional and non-optional) and `Map<String, String>`
+  fields now convert correctly in both directions; every other sanitized shape keeps the
+  pre-#218 `Default::default()` / `None` fallback, which always compiles.
+  (`src/backends/napi/gen_bindings/methods.rs`,
+  `src/codegen/conversions/helpers/field_fragments.rs`)
+
+## [0.55.6] - 2026-08-06
+
+### Fixed
+
+- **The Dart native loader downloads and caches the library again on a cold cache.** alef had
+  two divergent implementations of the same injected `_alefResolveExternalLibrary` prologue: a
+  hardcoded `format!` in `frb_rewrite::external_library_loader` and
+  `dart_init_prologue_replacement.jinja`, rendered into the generated bridge crate's `build.rs`.
+  Within alef's own pipeline the `format!` variant always wins — a `post_build` FRB regeneration
+  clobbers `build.rs`'s patch before `FrbDartSealedVariants` runs — and that variant only ever
+  *read* the versioned cache, so a cache miss threw `StateError` even though
+  `nativeDownloadAndCacheLibrary()` was defined and exported for exactly that case. Both call
+  sites now render the one template, which keeps the `format!` variant's improvements
+  (absolute-path `dlopen`, the `Platform.script` package-root fallback, the descriptive miss) and
+  restores the download-on-miss step ahead of the `StateError`.
+  (`src/backends/dart/templates/dart_init_prologue_replacement.jinja`,
+  `src/backends/dart/frb_rewrite/external_library_loader.rs`,
+  `src/backends/dart/gen_rust_crate/cargo.rs`)
+
+- **`build.rs`'s embedded loader searches for the library that is actually built.** The bridge
+  crate emitted at `packages/dart/rust/` is `<source>-dart`, so its cdylib is
+  `lib<source>_dart.dylib` — but the source crate name was passed as the candidate stem, leaving
+  the embedded loader looking for a `libhtml_to_markdown_rs.dylib` that no build produces. Only
+  reachable when a consumer builds the bridge crate outside alef's pipeline, where it silently
+  degraded every bundled-native lookup into a cache lookup.
+  (`src/backends/dart/gen_rust_crate/mod.rs`)
+
+- **The loader's "not found" message now names the actual environment variable.** The override
+  was suggested as an escaped `\$nativeLibDirEnv`, so Dart printed the identifier rather than
+  interpolating it and the reader was told to set a variable whose name was never given. The
+  lookup also repeated the variable's value as a string literal instead of reading the
+  `nativeLibDirEnv` constant, leaving two places that had to agree on it.
+  (`src/backends/dart/templates/dart_init_prologue_replacement.jinja`)
+
+## [0.55.5] - 2026-08-06
+
+### Fixed
+
+- **The CLI release now includes a Windows binary.** The publish matrix built only
+  linux-x86_64, linux-aarch64 and macos-arm64, while the archive step's `.zip` branch and
+  its `disable-cache` toggle were already written for Windows — the matrix entry was simply
+  missing. `xberg-io/actions/install-alef` therefore found no asset on a Windows runner and
+  fell back to `cargo install --git --tag`, building alef from source on every Windows job that
+  installs it: 441s, 550s and 651s in html-to-markdown's three Windows Python e2e jobs alone.
+  (`.github/workflows/publish.yaml`)
+
+## [0.55.4] - 2026-08-06
+
+### Fixed
+
+- **The generated `poly.toml` is now poly-canonical when it is written.** `toml_array` hard-coded a
+  4-space indent while its doc-comment claimed to emit "taplo's canonical multi-line form" — taplo
+  uses 2 — and several inline arrays carried inner padding (`select = [ "correctness", … ]`). The
+  freshly written file therefore never matched the committed one, so the byte-equality skip in
+  `write_scaffold_files_with_overwrite` never fired and `poly.toml` was rewritten on every run in
+  every repo. What normally hid this is the post-generation `poly fmt --fix` pass repairing it
+  afterwards — but that runs after post-build, stubs, README, e2e and docs, so an abort in any of
+  those leaves the raw file behind (observed on xberg, where the run died in the Dart FRB
+  post-build), and the partial-regen paths never pass the repo root to poly at all. The emitter now
+  matches taplo, and `poly.toml` is handed to poly immediately after it is written rather than many
+  fallible stages later.
+  (`src/scaffold/languages/poly.rs`, `src/cli/pipeline/generate/scaffold.rs`)
+
+### Added
+
+- **`[tools.mix]` is emitted for repos with an Elixir binding.** poly has no native Elixir formatter
+  and `tree-sitter-elixir` ships no `indents.scm`, so poly reindented `.ex`/`.exs` with a hand-rolled
+  query that modelled only `do…end` and `fn…end`; every other construct was re-emitted at column 0
+  and poly then fought `mix format` indefinitely. Declaring the catalog tool hands the language to
+  `mix format` — poly ≥0.19.6 drops its own reindenter when a runnable catalog formatter owns the
+  language. (`src/scaffold/languages/poly.rs`)
+
+## [0.55.1] - 2026-08-05
+
+### Fixed
+
+- **Generated Rust e2e harness compiles under edition 2024.** `tests/common.rs` called
+  `std::env::set_var` at three points to publish the mock-server URLs, which edition 2024 made an
+  unsafe function, so every integration-test binary failed to build with `error[E0133]` and the
+  whole Rust e2e suite was uncompilable (seen on liter-llm). The calls are now wrapped in `unsafe`
+  with a SAFETY note: they run inside the `OnceLock` initializer, before any test thread exists.
+  (`src/e2e/codegen/rust/mock_server/common_module.rs`)
+
+## [0.55.0] - 2026-08-05
+
+### Changed
+
+- **Python: a field whose name matches a method is an attribute again, not a bound method.** When a
+  core type declared both a public field and a same-named inherent method, the PyO3 backend emitted
+  a `#[pyo3(get)]` getter *and* a `#[pymethods]` wrapper. The wrapper is registered last and kills
+  the getter, so `config.providers` silently returned a bound method while the generated stub and
+  the constructor keyword both promised a list. The method wrapper is now skipped and the attribute
+  wins, matching every other binding. Any caller written against the accidental `config.providers()`
+  spelling must drop the parentheses.
+
+### Fixed
+
+- **A field and a same-named method no longer collide in the Go, Ruby, Swift and C# backends.** The
+  same defect already fixed for the FFI (0.54.1) and WASM (0.54.2) backends, in four more emitters
+  an earlier survey wrongly cleared. Go emitted both into one struct (`field and method with the
+  same name Providers` — a hard compile error); Ruby emitted a duplicate inherent method
+  (`error[E0592]`), a duplicate `define_method`, and an RBS `DuplicatedMethodDefinition` that failed
+  `steep`; Swift and C# admitted the collision but had no live instance downstream. Each backend now
+  emits the field and skips the method. A parameterized method of the same name is still emitted.
+- **alef's own CI is green again.** The e2e PHP composer tests hardcoded real downstream project
+  names, which `check_project_mentions.py` forbids — alef must stay project-agnostic — failing
+  `no_project_name_special_casing_in_enforced_files` on all three platforms.
+
+## [0.54.2] - 2026-08-05
+
+### Fixed
+
+- **Generated FFI code is clean under edition 2024's stricter lints.** Two more consequences of
+  0.54.0's edition bump: the `ffi_set_out_error` helper nested `if let Ok(cs) = …` inside a null
+  check, which edition 2024 rejects as `collapsible_if` now that let-chains are stable; and the
+  error-method emitter wrote raw-pointer dereferences and `CString::from_raw` as bare statements
+  inside `unsafe extern "C"` bodies, which `unsafe_op_in_unsafe_fn` — on by default in 2024 — turns
+  into a hard `error[E0133]` for any error type declaring methods. Consumers lint generated crates
+  with `-D warnings`, so both broke their builds.
+- **The WASM backend no longer emits a duplicate binding for a field and a same-named method.**
+  Mirroring the FFI fix in 0.54.1: the field-getter and method-wrapper loops both emitted
+  `pub fn <name>` into one `#[wasm_bindgen] impl`, so a type with a `providers` field and a
+  `providers()` method failed to compile with `error[E0592]`. The method wrapper is skipped when a
+  field getter of that name was already emitted, leaving the getter as the callable surface. A
+  survey of the other backends found napi, php, jni, go, dart and java unaffected.
+
+## [0.54.1] - 2026-08-05
+
+### Fixed
+
+- **The generated FFI error accessors compile under edition 2024.** 0.54.0 moved generated Rust
+  crates to edition 2024 and converted the FFI templates to `#[unsafe(no_mangle)]`, but the sweep
+  missed `error_gen`'s shared emitter, which builds the `status_code`, `is_transient`, `error_type`
+  and `error_type_free` functions from Rust string literals rather than templates. Those four kept a
+  bare `#[no_mangle]`, which edition 2024 rejects (`unsafe attribute used without unsafe`), so any
+  repo with a core error type failed to build its `-ffi` crate after regenerating on 0.54.0.
+- **A field and a method sharing a name no longer emit a duplicate FFI symbol.** The field-accessor
+  and method-wrapper emitters each minted `{prefix}_{type}_{name}` with no collision check, so a
+  type with both a `providers` field and a `providers()` method produced two definitions of the same
+  `#[unsafe(no_mangle)]` function (`error[E0428]`). The method wrapper is now skipped when a
+  same-named field accessor was already emitted, which keeps the existing symbol and its semantics.
+
+## [0.54.0] - 2026-08-05
+
+### Added
+
+- `crates.readme.languages.<name>.snippet_language` lets a README language borrow its code
+  snippets from a differently-named snippet directory (e.g. an `ffi` README pulling examples
+  from a `c/` snippet root, since the FFI binding's usage examples are C code and a consumer
+  repo already maintains one `c/` snippet set rather than a duplicate `ffi/` one). Defaults to
+  the language's own code, so existing configs are unaffected. Only applies to
+  `include_snippet(language)` calls using the current README's own language variable — a
+  template calling `include_snippet` with an explicit literal (e.g. `include_snippet("python")`)
+  is unaffected.
+
+### Changed
+
+- Generated Rust crates (e2e `Cargo.toml`, scaffolded FFI crates) now declare `edition = "2024"`
+  instead of `"2021"`, matching every other scaffolded language crate.
+
+### Fixed
+
+- **The generated PHP e2e `composer.json` uses the configured namespace verbatim as its PSR-4
+  prefix.** The autoload key was re-derived from the *composer package name* by splitting it on
+  `-` and upper-camel-casing each part, so `xberg/html-to-markdown` produced the three-segment
+  prefix `Html\To\Markdown\` while the emitted PHP declared the one-segment `namespace
+  HtmlToMarkdown;`. The prefix never matched, Composer never autoloaded the facade class, and
+  every PHP e2e test failed with `Class "…\HtmlToMarkdown" not found`. A namespace that really
+  does contain separators (e.g. `Xberg\Crawlberg`) is still preserved as written.
+- **Generated Dart FRB loader code derives its `package:` URIs from `pubspec_name`.** The package
+  segment was reconstructed from the bridge crate's file stem (`<crate>_dart` → `<crate>`), so a
+  repository whose Dart package is named differently from its Rust crate emitted
+  `package:html_to_markdown_rs/src/native_loader.dart` for a package actually named `h2m`. Every
+  Dart e2e test failed to load with `Not found: 'package:…/src/native_loader.dart'`. This affected
+  the loader import, both `Isolate.resolvePackageUri` calls, and the `dart run …:download_libs`
+  hint. The bridge output directory stays crate-derived, since that is a Rust output path.
+- The C FFI backend's static-constructor, string-parameter, and trait-bridge registration
+  templates now compile under edition 2024. Three emitters (`ffi_opaque_constructor_header.jinja`
+  and the `service_api_*`/`registration_variant` templates) still wrote a bare `#[no_mangle]`,
+  which edition 2024 rejects outright (`unsafe attribute used without unsafe`). Several
+  trait-bridge templates also dereferenced raw pointers (`&*vtable`) and called the `unsafe fn`
+  `ffi_set_out_error` without an explicit `unsafe { }` block, which edition 2024 now warns on
+  (`unsafe_op_in_unsafe_fn`) even inside an `unsafe fn` body. No generated symbol name, signature,
+  or behavior changed.
+- Generated shebang scripts keep their executable bit across a regen. `poly fmt` rewrites changed
+  files via atomic rename, which resets the mode to `0644`, so every full regen silently stripped the
+  bit from the scripts poly reformatted (`run_tests.php`, `download_ffi.sh`, `mvnw`, `gradlew`) and
+  poly's own `file-safety` hook then rejected the next commit. The formatting pass now snapshots
+  executable modes beforehand and restores any the formatter dropped.
+- The generated `credo` pre-commit hook runs `mix deps.get` before `mix credo --strict`. poly runs
+  hooks from a staged snapshot outside the repo and Elixir resolves dependencies strictly
+  project-locally into a gitignored `deps/`, so credo's own package was missing there and every
+  commit touching `.ex`/`.exs` files failed with "Unchecked dependencies for environment dev". The
+  snapshot persists between runs, so the fetch is a one-time cost.
+
+## [0.53.1] - 2026-08-04
+
+### Added
+
+- `[workspace.poly] lint-workspace` controls the generated `poly.toml`'s `[lint] workspace` setting.
+  Repos whose CI installs only a subset of toolchains need `poly lint` to skip its whole-project
+  phase; that setting previously existed only as a hand-edit to the generated file, which the next
+  scaffold run silently dropped. Omitting the key emits no `[lint]` table, leaving poly's own
+  default in force, so existing output is unchanged.
+
+### Fixed
+
+- A crate-local `Result` alias declared in one module is now honoured by functions in other modules.
+  Extraction walks a crate file by file and replaced the alias hint map on every file, so the alias
+  from `error.rs` was discarded before the module using it was resolved and its functions fell back
+  to `anyhow::Error`. Hints now accumulate across a crate's modules and are reset once per crate, so
+  a crate without its own alias no longer inherits the previous crate's error type.
+- Swift e2e: a `count_min` assertion on an optional `Vec<Named>` field of a first-class parent DTO
+  no longer emits `field()?.count ?? 0`. `emit_vec_struct_serde_getter` collapses that shape to a
+  whole-field `-> String`, so the Swift side sees a `RustString` and the generated test failed to
+  compile. The countable-vs-JSON-bridged classifier now mirrors the getter emitter's optional split.
+
+## [0.53.0] - 2026-08-04
+
+### Changed
+
+- **An unresolvable README or docs snippet is now a hard error instead of a silent placeholder.**
+  `crates.readme.snippets_dir` and `workspace.docs.snippets.dirs` entries that do not exist on disk
+  are rejected up front, naming the config key and both the configured and resolved path; a snippet
+  reference that cannot be resolved fails the run instead of emitting
+  `<!-- snippet not found: ... -->` into the output. The README path previously never failed at all,
+  so that placeholder shipped verbatim to package registries while `alef readme` reported success.
+  The configured-directory check runs even when no template references a snippet, so a stale path
+  cannot hide behind a template that happens not to use the filter.
+
+  **Breaking:** repositories whose snippet references are already broken now fail `alef readme` /
+  `alef docs` until the missing snippet files are added or the references removed.
+
+### Fixed
+
+- **Closing code fences in generated API reference docs are no longer tagged with a language.**
+  `replace_fence_lang` appended the language to every line starting with a fence, including the
+  closing one, turning ` ``` ` into ` ```rust ` and reopening the block instead of closing it. This
+  corrupted every `**Example:**` block rendered from a doc comment.
+- **A generic `Result<T>` alias now yields the crate's real error type in generated signatures.**
+  Hint extraction was gated on the alias having no generic parameters, so the idiomatic
+  `pub type Result<T> = std::result::Result<T, MyError>;` was skipped and signatures fell back to
+  the placeholder `anyhow::Error`, rendered as a nonexistent `Error` type.
+- **Magnus tagged-enum predicate methods emit Ruby booleans.** The value was interpolated through
+  minijinja, which stringifies a bool Python-style, producing `def system? = True` — parsed by Ruby
+  as a constant lookup, so any predicate call raised `NameError`.
+- **Scaffold `.cargo/config.toml` `[env]` structured values render valid TOML booleans.** The
+  `relative` flag was interpolated straight from a bool through minijinja, which stringifies it
+  Python-style as `True`/`False` — invalid TOML that broke `cargo` on any scaffold using a
+  structured env entry (e.g. the Ruby `preferred-ruby.sh` path). The value is now emitted as a
+  lowercase `true`/`false` literal.
+- **Generated Kotlin Android `build.gradle.kts` no longer stamps a downstream issue reference into
+  every consuming project.** The release JNI guard's explanatory comment carried a cross-project
+  issue link that no other repository can resolve; the technical rationale is retained.
+
+## [0.52.0] - 2026-08-04
+
+### Added
+
+- **WASM binding crates can declare additional opt-in core features.** The new
+  `[crates.wasm].extra_features` list emits each entry as a generated binding-crate feature that
+  forwards to the matching core-crate feature without enabling it by default. This supports
+  hand-written WASM modules whose `#[cfg(feature = "...")]` gates are not visible in Alef's extracted
+  API surface.
+
+### Fixed
+
+- **Swift bindings link the Rust staticlibs by explicit `.a` path.** The generated `Package.swift`
+  linked them via a bare `.linkedLibrary(...)`; with both `lib<name>.a` and `lib<name>.dylib` present
+  in `target/`, ld64 preferred the `dynamic_lookup` dylib, so swift-bridge glue symbols (e.g.
+  `__swift_bridge__$<Type>$_free`) were never linked and the swift test bundle failed to `dlopen`.
+  The scaffold now emits a `resolvedStaticLib` helper and links the two Rust staticlibs by absolute
+  `.a` path so the linker cannot substitute the sibling dylib.
+- **PHP e2e/test_apps autoload path follows the crate move.** The generated composer autoload
+  pkg-path defaulted to the historical `../../packages/php`, stale since 0.51 relocated the PHP
+  source to `crates/<pkg>-php`; it now derives from the configured php crate output path (falling
+  back to `packages/php` when unconfigured).
+
+## [0.51.2] - 2026-08-04
+
+### Fixed
+
+- **Swift e2e: `Option<Vec<Named>>` fields no longer emit non-compiling `.count` assertions.**
+  Fields like `elements: Option<Vec<Element>>` are natively bridged by swift-bridge as
+  `Optional<RustVec<T>>`, not JSON-bridged to `RustString`. The e2e classifier previously
+  treated every optional Vec field as JSON-bridged, so `count_min`/`count_equals`/`min_length`
+  assertions emitted `<accessor>().toString().count` against `RustVec<T>?`, which does not
+  compile ("value of type 'RustVec<Element>?' has no member 'toString'"). Classification now
+  matches the real getter shape used by the Swift binding generator.
+- **PHP e2e `composer.json` accepts guzzle 7 or 8.** The generated `require-dev` constraint was
+  pinned to `^7.0`, which hard-fails `composer install` against a `composer.lock` that already
+  resolved `guzzlehttp/guzzle` to `8.0.0`. The constraint is now `^7.0 || ^8.0`.
+
+## [0.51.1] - 2026-08-04
+
+### Fixed
+
+- Generated Ruby wrappers no longer publish binding types into the global `Object` namespace.
+  The previous `Object.const_set` loop exported every module (e.g. `Parser`) globally, colliding
+  with unrelated gems such as `parser` (`TypeError: Parser is not a module`). Generated types now
+  stay namespaced under their binding module; consumers reference them qualified.
+
+## [0.51.0] - 2026-08-03
+
+### Changed
+
+- PHP userland classes and stubs now honor `[crates.output] php`, co-locating with the generated
+  composer.json in the crate (unset config unchanged: `packages/php/`).
+
+## [0.50.0] - 2026-08-03
+
+### Added
+
+- **Configurable logging across alef and its generated bindings.** All of alef's own diagnostics now
+  flow through `tracing` (with `error!`/`warn!`/`info!`/`debug!`/`trace!` levels) instead of raw
+  `eprintln!`/`println!`, filterable via `-v`/`-vv`/`-q`/`RUST_LOG`. Generated Rust binding glue logs
+  host-callback failures through `tracing::warn!` and generated Java bindings through
+  `java.lang.System.Logger`, so consuming libraries configure verbosity through their own logging
+  setup. Genuine machine-readable command output (JSON reports, schema, diffs, listings) stays on
+  stdout through a single sanctioned output helper.
+- **A clippy print-guard forbids raw print macros on production code paths.** `print_stdout` and
+  `print_stderr` are denied crate-wide (enforced by `poly lint` and the pre-commit hook); the few
+  legitimate stdout sites (the output helper, report modules, e2e harness, and test code) carry a
+  narrow `#[allow]`.
+
+### Changed
+
+- **Verbosity is reconciled to a single channel.** `-v` now raises the log level to `debug` and `-vv`
+  to `trace` (previously `-v` did not change the level); the separate `DispatchContext.verbose` flag
+  was removed and its per-file detail folded into `debug!`.
+- **Generated Rust crates gain a `tracing` dependency** when trait bridges are present, sourced from
+  the centralized version registry (Renovate-managed). The WASM `__log_host_failure` JS-console helper
+  was removed in favor of a Rust-side `tracing::warn!`; consumers wanting browser output wire a wasm
+  tracing subscriber.
+
+### Fixed
+
+- **Swift `RustBridgeC` target now emits a real object file.** The Swift backend declared
+  `RustBridgeC` as a compiled SwiftPM target over a directory that held only `RustBridgeC.h`, with no
+  translation unit. `swift build` tolerated the header-only target, but Xcode's XCBuild expected a
+  `RustBridgeC.o` and failed to link, breaking every Xcode/iOS consumer of the published SPM package.
+  The backend now also emits a minimal `RustBridgeC.c`, so a real object file is produced
+  (html-to-markdown#449).
+
+## [0.49.0] - 2026-08-01
+
+### Added
+
+- **Swift binding: `ffi_features` config knob.** The swift-bridge Rust shim's injected FFI-crate
+  dependency (`<crate>-ffi`) can now be emitted with `default-features = false` and an explicit
+  feature list via the new `[crates.<name>.swift] ffi_features` field. Previously this secondary
+  dependency was always emitted in plain `{ version, path }` form, inheriting the FFI crate's default
+  features with no way to drop cross-compile-hostile features (e.g. `heic` via `libheif-sys`, whose
+  `build.rs` cannot satisfy `pkg-config` under cross-compilation). The primary core dependency's
+  `features` / `excluded_default_features` / `target_dep_overrides` do not reach this injection.
+  Empty (the default) preserves the previous plain form.
+
+## [0.48.8] - 2026-07-29
+
+### Fixed
+
+- **Swift e2e `.count` assertions no longer emit uncompilable `RustString` accesses.** The Vec-field
+  classifier in `build_swift_first_class_map` had dropped the `f.optional` disjunct, so optional
+  `Vec<Named>` metadata fields (`headings`/`favicons`/`hreflangs`) — which the swift-bridge layer
+  JSON-bridges to a `-> RustString` getter with no `.count` — were recorded as countable and emitted
+  `headings()?.count`, failing to compile. Restore the disjunct: optional vecs are skipped while
+  non-optional vecs (`urls`, `nodes`, `tables`) stay countable.
+
+## [0.48.5] - 2026-07-27
+
+### Added
+
+- **Generated Zig e2e projects now expose a dedicated `smoke` build step** (`zig build smoke`) that
+  runs `smoke_test.zig` in isolation, outside the serial test chain, as a fast published-package
+  sanity check. Zig 0.16's `zig build` has no `--test-filter`, so the isolation is wired as its own
+  build step with its own `RunStep` over the same compiled binary; it is emitted only when a
+  `smoke_test.zig` fixture exists, so no dead step is generated.
+
+### Fixed
+
+- **The Dart flutter_rust_bridge loader is now upgraded in place when a stale one was injected by an
+  older alef.** The marker-based idempotency check previously froze any already-injected loader
+  forever, so a binding shipped with a cache-unaware loader never picked up the fix on regeneration:
+  the download script populated the versioned cache, but the frozen loader never looked there. A file
+  carrying the loader marker but not the current-template sentinel (`nativeCachedLibPath()`) now has
+  its injected region replaced with the current template while preserving the original `init` body.
+- **Zig e2e dependency resolution now treats repeated-character fill hashes (`AAAA…`) as placeholders,
+  not just the explicit `STALE_HASH_REGENERATE` marker.** Such fills — used to keep `build.zig.zon`
+  syntactically valid before a release exists to hash — were being emitted as real dependency hashes,
+  failing `zig build` with a hash mismatch. They now fall through to the cache/network/omit-hash path.
+  The heuristic requires a run of at least 16 identical characters, so it cannot misfire on a genuine
+  base64 content multihash.
+
+## [0.48.4] - 2026-07-27
+
+### Fixed
+
+- **C# NuGet packing no longer fails on a missing `runtime.json`.** `scaffold_csharp` now emits
+  `packages/csharp/<Namespace>/runtime.json.template` alongside the csproj — the file the csproj's
+  `RequireRuntimeJson` target has always required but that nothing ever generated, so every consumer
+  `dotnet pack` errored. The template carries NuGet's RID-fallback graph (one `<PackageId>.runtime.<rid>`
+  dependency per enabled published RID, plus `linux-musl-*` `#import` fallbacks) with a literal
+  `{{VERSION}}` placeholder that CI substitutes before pack.
+- **The generated Maven pom's enforcer floor no longer exceeds the CI runner's Maven version.**
+  `MAVEN_CORE` (which feeds `<requireMavenVersion>`) had been renovate-bumped to `3.9.16`, above the
+  `3.9.11` GitHub-hosted runners ship, so `enforce-maven` failed during publish. It is now a fixed
+  compatibility floor (`3.6.3`) with the `renovate:` annotation removed so it is not auto-bumped again.
+
+## [0.48.3] - 2026-07-26
+
+### Fixed
+
+- **Magnus RBS stubs now emit the real owning class for `Self`-returning methods instead of the
+  `json_value` fallback.** When a type is managed by another codegen pass (e.g. a service owner
+  type that is `binding_excluded`) it is still emitted as a `class` stub here, so builder-style
+  methods and constructors returning `Self` (resolved to the owning type during extraction) must
+  reference that class. A new `substitute_excluded_types_except_owner` never substitutes the owner
+  type, restoring `-> App`-style return types (regression from 0.42→0.48).
+- **Generated Go service templates no longer leave errors assigned to the blank identifier**, so
+  they pass `golangci-lint` with `errcheck.check-blank = true`. The background `Run()` goroutine and
+  the TCP readiness probe's `conn.Close()` in `service_start_background.jinja`, and the error-branch
+  `json.Marshal` in `service_handler_registry.jinja`, now check their errors explicitly.
+
+## [0.48.2] - 2026-07-26
+
+### Fixed
+
+- **A full regen (`alef all`) now converges to a zero-drift tree** instead of needing 2-3 manual
+  `poly fmt --fix` passes downstream. `poly fmt --fix <root>` now loops to a fixed point (bounded
+  at 3 passes, detected via `poly fmt --check`) — some poly-bundled engines (`.cs`, `.java`,
+  `.json`) were not single-pass idempotent on freshly generated output.
+- **Rust crates are no longer left rustfmt-dirty after a full regen.** A workspace-wide `cargo fmt
+  --all` now runs (best-effort, skipped with a warning when `cargo`/`rustfmt` are unavailable),
+  folded into the same convergence loop as `poly fmt` so any drift it introduces is reconciled by
+  the next pass.
+- **Cargo-sort now covers every crate in the workspace on a full regen, not just the languages
+  that happened to be generated.** The old per-language cargo-sort residuals only ran for
+  wasm/ffi/ruby/elixir/R, and the workspace-wide (`-w`) variant only ran when the ffi target was
+  present — leaving python, node, php, swift, and dart binding crates unsorted and tripping poly's
+  own bundled cargo-sort check. A full regen now runs a single `cargo sort -n -w` at the repo root
+  covering the whole workspace regardless of target languages (partial/single-language regens keep
+  the existing per-language residuals unchanged).
+
+### Changed
+
+- `format_generated`'s full-regen path (`only_languages = None`, used by `alef all`) now converges
+  `poly fmt`, `cargo fmt`, and workspace-wide `cargo sort` together in one bounded loop instead of a
+  single `poly fmt` pass plus fixed per-language residuals.
+
+## [0.48.1] - 2026-07-26
+
+### Fixed
+
+- **Generated C# `.csproj` no longer embeds a downstream project name.** The thin meta-package
+  `.csproj` template carried a comment referencing a specific consumer project's issue tracker
+  (`xberg #1280`), leaking a downstream project name into every generated csproj and tripping alef's
+  project-agnosticism enforcement. The internal issue references are removed from both the source
+  doc comment and the emitted csproj comment.
+
+## [0.48.0] - 2026-07-26
+
+### Added
+
+- **cbindgen C headers are formatted by poly.** When an FFI target is present, the generated
+  `poly.toml` enables poly's `clang-format` catalog tool (`[tools.clang-format] enabled = true`) and a
+  canonical `.clang-format` is scaffolded, so `poly fmt` and the pre-commit hook format the
+  build-time-generated `crates/*-ffi/include/*.h` headers consistently across repos.
+- **Per-language lint defaults extended so consumer repos can drop identical `[crates.lint.*]`
+  overrides:** ruby runs `bundle install` before rubocop, and elixir runs `mix deps.get` before credo.
+
+### Changed (BREAKING)
+
+- **Removed the hidden `--format` flag** from `alef generate` / `all` / `init` / `e2e generate` /
+  `test-apps generate`. Formatting always runs, delegating to `poly fmt` whenever poly is on PATH; when
+  poly is absent, generation now warns and continues (emitting unformatted output) instead of aborting.
+- **ktfmt (`--kotlinlang-style`) is now the single Kotlin formatter** for both the `kotlin` and
+  `kotlin_android` backends (was `gradle ktlintCheck`), and the **Swift default formats only `Sources`**
+  (not `Tests`). Both match what every consumer repo already overrode to; regenerating changes the
+  Kotlin, Kotlin-Android, and Swift lint commands.
+
+### Fixed
+
+- **Swift: generated `Package.swift` links `libbz2`** at both the dev and artifactbundle sites, fixing
+  undefined `_BZ2_bzDecompress*` symbols in the RustBridge target.
+- **Python `.pyi` enum stubs no longer emit `# noqa: PYI029`** on the generated `__str__`/`__repr__`
+  stubs. PYI029 is not enabled in the generated ruff config, so ruff flagged the suppression itself as
+  an unused directive (`RUF100`).
+- **Kotlin-Android `build.gradle.kts` formatting cleaned up.** The host-JNI `else` branch keeps a
+  single-spaced trailing `// linux` comment (was double-spaced), and the
+  `mavenPublishing { configure(...) }` call wraps its multi-line `AndroidSingleVariantLibrary(...)`
+  argument onto its own line.
+- **Ruby `.rbs` stubs no longer reference undeclared types (`steep RBS::UnknownTypeName`).** Streaming
+  methods now declare `Enumerator[<ItemType>]` from the adapter's real item type instead of an
+  undeclared `<Method>Iterator`, and any signature referencing a binding-excluded or opaque
+  (`alef(skip)`) type substitutes the declared `json_value` alias.
+- **Ruby `.rbs` trait-typed parameters/returns now reference the interface name.** A parameter or
+  return whose type is a trait was emitted with the bare trait name (e.g. `DocumentExtractor`), but
+  traits are surfaced only as host-implementable `interface _TraitName` declarations, so `steep`
+  failed with `RBS::UnknownTypeName`. Such references are now substituted to their `_`-prefixed
+  interface name.
+- **Python PyO3 trait-bridge Protocol methods with numeric returns are typed `Iterable` (#203).**
+  A Protocol method is implemented by the host and its return extracted by the bridge, so typing it
+  with the parameter rule (e.g. `Vec<Vec<f32>>` → `list[list[float]]`) rejected NumPy values the
+  bridge already accepts, forcing a `.tolist()` at every call. Numeric `Vec` returns now render as
+  `Iterable`; only numeric leaves widen, and parameters and ordinary function stubs are unchanged.
+
+### Removed
+
+- **PMD/CPD dropped from the generated Java package.** PMD ran the built-in `quickstart` ruleset
+  (the emitted `pmd-ruleset.xml` was never referenced by the `pom.xml`), and PMD/CPD mostly fought
+  alef-generated code. The `pmd` workspace hook, the `maven-pmd-plugin` build plugin and its
+  `pmd.skip`/`cpd.skip` publish-profile properties, and the scaffolded `pmd-ruleset.xml` are all
+  removed. `checkstyle` continues to run as before.
+- **ktlint removed entirely from generated Kotlin and Kotlin-Android projects.** ktfmt is the single
+  Kotlin formatter, and ktlint's rule set fought ktfmt's output on generated code. The
+  `org.jlleitschuh.gradle.ktlint` gradle plugin (and its `ktlint {}` config block), the `ktlint`
+  `poly.toml` workspace hook (`gradle ktlintCheck`), and the `ktlint_standard_*` `.editorconfig`
+  overrides are all removed from both backends.
+
+## [0.47.2] - 2026-07-25
+
+### Fixed
+
+- **Generated Go binding is cgo-safe again.** The `// If linking fails … cannot find -lxberg_ffi …` note
+  was emitted directly above the `/* #cgo … */` preamble, so cgo fed it to the C compiler
+  (`error: unknown type name 'If'`, stray backtick) and every cgo build failed. The note is now
+  separated from the cgo preamble by a blank line.
+
+## [0.47.1] - 2026-07-25
+
+### Fixed
+
+- **C# meta-package is thin again (fixes NuGet HTTP 413 on publish).** The generated
+  `packages/csharp/<Namespace>/<Namespace>.csproj` packed the entire native closure via
+  `<None Include="runtimes/**">`, pushing the `XbergIo.Xberg` meta package past NuGet's size limit
+  (HTTP 413; regressed since rc.37 — the per-RID split from #1280/rc.35 had slimmed it). The template
+  now packs only `runtime.json` — the RID-fallback graph rendered from `runtime.json.template` by CI —
+  plus the managed assembly, and adds a `RequireRuntimeJson` pre-pack target that hard-errors if
+  `runtime.json` is missing. Native closures continue to ship in the per-RID
+  `<PackageId>.runtime.<rid>` packages.
+
+## [0.47.0] - 2026-07-25
+
+### Fixed
+
+- **Python `__all__` now honors `exclude_functions`.** An excluded function leaked into the generated
+  `__init__.py` `__all__` even though it was correctly kept out of the `.api` import list — most
+  visibly an excluded `*_async` variant whose sync sibling was already dropped. The undefined name in
+  `__all__` tripped pyrefly's `bad-dunder-all` (now enforced by `poly lint .`) and would break
+  `from <pkg> import *`. The `__all__` builder applies the same exclude filter as the import list.
+
+## [0.46.0] - 2026-07-25
+
+### Added
+
+- **poly is now the single lint orchestrator: `poly lint .` invokes the external linters poly does not
+  bundle.** The generated `poly.toml` emits a `workspace = true` hook per configured language for the
+  tools poly has no built-in engine for — pyrefly (Python type-check), rubocop + steep (Ruby),
+  golangci-lint (Go), checkstyle + pmd (Java), ktlint (Kotlin/Android), `dart analyze` (Dart), and
+  credo (Elixir). Each runs once over its package directory, discovers its own native config
+  (`.rubocop.yml`, `.golangci.yml`, `checkstyle.xml`, `.credo.exs`, `analysis_options.yaml`, …), and is
+  skipped gracefully when its toolchain is absent. The existing `pyrefly` hook gains `workspace = true`
+  so it actually runs during `poly lint .` (previously it only fired on git pre-commit). Downstream
+  repos can drop their per-language lint tasks in favour of `poly lint .`.
+
+### Changed
+
+- **Python generated `pyproject.toml` no longer declares a `ruff` dev-dependency.** poly bundles ruff
+  for lint+format, so a standalone `ruff` in the dev group is redundant; only the `pyrefly`
+  type-checker (which poly does not provide) remains.
+- **Python `poly.toml`: `[lint.python.ruff]` now uses an explicit `select` allowlist** instead of
+  `select = ["ALL"]` minus an ignore list. Enabling every rule then suppressing the noise meant each
+  ruff release could silently start firing a new deny-by-default rule (e.g. the `CPY` copyright-header
+  family) on generated bindings. The scaffold now selects the rule families we want; families that were
+  only ever carried to be fully ignored (`COM`, `FBT`, `FIX`, `TD`, `PD`, `EM`, `TRY`, `BLE`) are no
+  longer selected, and `ignore` is trimmed to the in-family sub-rules that remain relevant.
+
+## [0.45.0] - 2026-07-25
+
+### Added
+
+- **Go backend: download-at-consume native distribution.** Published Go modules no longer require
+  native libraries inside the module (module zips only contain the git tag's files; `.lib/` stays
+  gitignored). The generated `cmd/setup` tool replaces `cmd/download_ffi`: it downloads the platform
+  FFI library from the GitHub release into a versioned user cache
+  (`os.UserCacheDir()/<name>/go/<version>/<platform>`), verifies its SHA-256 sidecar, and writes a
+  machine-local, gitignored cgo link shim (`<name>_cgo_link.go`) with absolute `-L`/`-rpath` flags
+  into the consumer's package. The binding exports a per-version `RequireNativeSetup_<version>`
+  sentinel referenced by the shim, turning shim/module version skew into a compile error.
+  `embed_ffi.go` now embeds only `include/*` so `go mod vendor` carries the C header; `go generate`
+  runs `cmd/setup -lib-dir .lib`; test-app run defaults use `go run <module>/cmd/setup` instead of
+  the copy-module-out-of-cache workaround.
+
+### Fixed
+
+- **PHP: registry-mode e2e `composer.json` now declares the userland PSR-4 autoload.** Only the
+  `Local` dependency mode emitted the `"autoload"` section mapping the binding's PHP namespace to
+  the local `packages/php/src/`, so registry-mode test apps could not resolve the userland classes
+  layered over the native ext-php-rs extension — every test failed with `Class not found` even after
+  PIE installed the extension. Both modes now emit the mapping via a shared helper.
+
+## [0.44.0] - 2026-07-24
+
+### Fixed
+
+- **Swift: link the C++ standard library in the generated `Package.swift`**: the Rust staticlib pulls in
+  C++ dependencies (onnxruntime, tesseract, ClipperLib) whose C++ ABI symbols (`__cxa_throw`,
+  `__gxx_personality_v0`, `__cxa_guard_acquire`, …) were left undefined at the SwiftPM link step, so
+  consuming a published Swift package failed to link. Both the in-tree and the published
+  `.binaryTarget` root manifests now link `c++` on Apple platforms and `stdc++` on Linux,
+  platform-conditionally.
+
+- **Renovate now actually maintains the generated dependency version pins**: the `renovate.json`
+  regex customManager targeted a stale path (`crates/alef-core/src/template_versions.rs`, gone
+  since the crate went root-flat in 0.18.0) and required `// renovate:` marker comments that no
+  const carried, so it bumped nothing. The path is corrected to `src/core/template_versions.rs`
+  and every auto-bumpable const now carries a `datasource`/`depName` marker. An explicit top-level
+  `"enabled": true` re-enables the repo (a closed onboarding PR had left it flagged disabled). Pins
+  no longer drift stale, which is what was driving Dependabot churn (jackson, guzzle, junit, …) in
+  the generated `/packages/*` and `/e2e/*` directories of consumer repos.
+
+- **Generated dependency versions are fully centralized in `template_versions.rs`**: several
+  versions were hardcoded outside the registry and had drifted. The Java scaffold `pom.xml` (a raw
+  `format!` string, also a jinja-templates rule violation) is converted to a Minijinja template and
+  sources every version from `template_versions::maven`/`toolchain` (fixing stale jackson `2.21.2`,
+  junit `5.11.4`, and six maven-plugin pins). The Java e2e pom template (`org.jetbrains:annotations`,
+  `maven-antrun-plugin`), Python e2e (`pytest`/`pytest-asyncio`/`pytest-timeout`/`setuptools`), Gleam
+  e2e (`gleam_http` range), Dart scaffold (`http`, `crypto`), and Rust e2e (`serde`/`serde_json`/
+  `tokio`) now all draw from the central consts.
+
+- **Renovate marker datasources corrected so no pins error out**: the Dart pins used
+  `datasource=pub`, but Renovate's Dart datasource id is `dart` — the invalid id produced
+  "Missing datasource" / "Unsupported range strategy" warnings and blocked those bumps. The Gradle
+  plugin pins (`ktlint-gradle`, `gradle-versions-plugin`, `gradle-maven-publish-plugin`) resolve
+  from the Gradle Plugin Portal rather than Maven Central, so a `registryUrls` package rule points
+  their maven lookups there (fixing the `ktlint-gradle: no-result` lookup failure). Renovate has no
+  CRAN datasource, so the `rextendr` pin is now manually tracked (marker removed) rather than
+  emitting a "Missing datasource" warning, and the custom manager carries an explicit
+  `rangeStrategy: replace`. The Ruby gem pins used pessimistic (`~>`) constraints that
+  Renovate's regex custom manager cannot bump — the `ruby` versioning then logged an
+  "Unsupported range strategy" warning and produced no update — so those markers are removed
+  and the gems are tracked manually (their `~>` floors already admit newer releases at
+  `bundle install`).
+
+## [0.42.1] - 2026-07-22
+
+### Added
+
+- **Node (NAPI): the ergonomic `/service` module re-exports the native value types it wraps**: the
+  generated `service.ts` exported only the service class, so consumers (and e2e harnesses) importing
+  from `<pkg>/service` could not reach the `Method` enum or `RouteBuilder` the service API expects —
+  a `Method`-is-`undefined` `TypeError` at runtime. The service module now also re-exports the native
+  value types referenced by the service surface, skipping its internal aliased self-import.
+
+- **Ruby (Magnus): ABI-aware native extension loading and staging**: the generated `native.rb`
+  wrapper now resolves the compiled extension through `RbConfig` — searching ABI-specific candidates
+  (`lib/<ext>/<ruby_version>/...`) across `DLEXT`/`DLEXT2`, with the legacy flat path as a fallback —
+  and raises a `LoadError` listing every expanded candidate when none match. The Ruby packager stages
+  native libraries under `lib/<ext_name>/<ruby_abi>/...`, deriving the ABI from `RbConfig`'s
+  `ruby_version` unless `RUBY_ABI` is set. This makes alef the canonical place for multi-ABI Ruby
+  distribution. A `RUBY_ABI` override is now trimmed and rejected when blank, and a failing `ruby`
+  invocation surfaces its stderr for diagnosability.
+
+### Fixed
+
+- **Elixir e2e: ExUnit test names are bounded to stay under the 255-character limit**: a fixture with
+  a long description produced a computed test name (`test {describe} {description}`) of 255+ characters,
+  which ExUnit rejects with `SystemLimitError`, failing the whole suite at compile time. The description
+  portion of the test name is now truncated on a UTF-8 char boundary to keep the full name under the
+  limit; each describe wraps a single test, so names remain unique.
+
+- **`[crates.exclude].fields` now applies to external type roots**: fields hidden globally were only
+  pruned from the primary crate's surface, so a field on an externally-extracted DTO root could pull
+  in a colliding foreign type and fail merge with a same-name host conflict. Excluded fields are now
+  applied to each external type root before its DTO roots are expanded, matching the behavior on the
+  primary surface.
+
+## [0.39.0] - 2026-07-20
+
+### Added
+
+- **WASM: configurable `wasm-opt` pass via `[crates.wasm].wasm_opt`**: the generated wasm binding
+  `Cargo.toml` hard-coded `[package.metadata.wasm-pack.profile.release] wasm-opt = false`, so
+  wasm-pack always skipped the size-optimization pass. A new `wasm_opt` field (a list of `wasm-opt`
+  flags, e.g. `["-Oz"]`) is now emitted as `wasm-opt = [...]` when set, letting large wasm builds
+  stay under CDN per-file size caps. Defaults to empty, which still emits `wasm-opt = false` — the
+  historical behavior is unchanged for consumers that don't set it.
+
+## [0.38.4] - 2026-07-20
+
+### Fixed
+
+- **Ruby (Magnus): `&mut self` methods on opaque types are now bound**: the module-init
+  registration loop unconditionally skipped every `RefMut`-receiver method, so an opaque type whose
+  methods all take `&mut self` (e.g. a tree-sitter `Parser` with `set_language`/`parse`/`parse_bytes`/
+  `reset`) was exposed to Ruby with zero callable methods. Opaque wrappers are `Arc<Mutex<T>>` and
+  their instance methods already delegate through the lock, so these methods now register. The gate
+  stays scoped to opaque types — non-opaque by-value DTOs have no delegating wrapper and are
+  unchanged.
+- **Ruby (Magnus): a `Bytes` parameter now decodes from a Ruby `String`**: the generated `.rbs`
+  advertised `String` but the wrapper took `Vec<u8>` (a Ruby `Array`), so a `bytes` argument such as
+  `parse_bytes(source)` could not be called with a String. Magnus `Bytes` params now take
+  `magnus::RString` and copy into a `Vec<u8>` before the core call, matching the advertised contract.
+- **Swift: `count_min`/`count_equals` assertions on an opaque-parent `Optional<RustVec<T>>` field**
+  now count the decoded array directly instead of `.toString().count`, which counted characters of a
+  JSON string rather than elements.
+- **Swift: DTO `CodingKeys` now honor serde `rename`/`rename_all`**: a discriminant field renamed at
+  the serde layer (e.g. `call_type` serialized as the wire key `type` on a tool-call variant) is now
+  decoded from its wire key instead of throwing `keyNotFound` on a key the payload never contains.
+- **Swift: `Optional<Vec<struct/tagged-enum>>` accessors no longer double-encode**: the
+  `getter_vec_enum_string_optional` template encoded each element to a JSON string and collected an
+  array of JSON strings, which Swift's strongly-typed `[T]?` `init(from:)` rejected with a
+  `typeMismatch` (expected object, found string). The accessor now serializes the field directly via
+  `serde_json`. The non-optional `Vec<String>` path (which strips quotes element-wise) is unchanged.
+- **Elixir: the e2e generator no longer appends an `_async` suffix to streaming entry points**
+  (e.g. `chat_stream`), which produced calls to a nonexistent `chat_stream_async/2`
+  (`UndefinedFunctionError`). The binding was always correct; only the generated e2e was wrong.
+- **Internal: removed downstream project-name references from enforced source files** (a Swift
+  forwarder test's error-type fixture and a conversions doc-comment example) so the
+  project-agnostic guard passes.
+
+## [0.38.3] - 2026-07-20
+
+### Fixed
+
+- **Go: free-function name no longer collides with a same-named type**: when a Rust crate exposed
+  both a free function and a struct that mapped to the same Go PascalCase identifier (e.g.
+  `model_info` / `ModelInfo`), the Go backend emitted both `func ModelInfo(...)` and
+  `type ModelInfo struct`, which the Go compiler rejects as a redeclaration. Free functions whose
+  Go name collides with a generated type name are now `Get`-prefixed (`GetModelInfo`); the type name
+  and the underlying C FFI symbol are unchanged.
+- **Ruby (Magnus): enum data-variant `Map` fields flattened to `String` now round-trip via JSON**:
+  Magnus collapses a `Map` field on an enum data-variant to a JSON `String` DTO field, but the
+  generated `From` impls still emitted the `HashMap::into_iter().map(...).collect()` template,
+  producing uncompilable Rust (`into_iter` on `String`). Such fields now round-trip via
+  `serde_json`. Struct `Map` fields (which Magnus keeps as native `HashMap`) are unaffected.
+- **Swift: free functions returning a `String`-backed enum no longer emit an invalid initializer**:
+  the forwarder used the struct positional-init template (`EnumType(_rb_obj)`) for enum returns,
+  but a `String`-backed enum only synthesizes `init(from:)`. Enum returns now decode via the enum's
+  `RawValue` initializer, matching the existing enum-typed DTO-field pattern.
+
+### Added
+
+- **Multipart request-body synthesis for TestClient-driven languages**: the shared `http_call`
+  driver (Go, Zig, Gleam) now synthesizes a `multipart/form-data` request body from the handler's
+  object body schema when a fixture declares that content type but carries no explicit body —
+  matching the Python/Ruby/TypeScript generators. Previously these languages emitted an empty
+  request body, so the core rejected multipart upload fixtures with 422 before the handler ran.
+
+## [0.38.1] - 2026-07-19
+
+### Fixed
+
+- **`alef all --clean` now poly-formats root-level generated files**: the full-regen format pass
+  only ran `poly fmt --fix` over each language's package directory, so generated files that live
+  outside every package dir — `poly.toml`, `.cargo/config.toml`, and the docs/skills output — were
+  never formatted and failed `poly fmt --check` in consuming repos (0.38.0 regression). A `--clean`
+  run now formats the whole base directory.
+
+## [0.38.0] - 2026-07-19
+
+### Added
+
+- **`[crates.ruby] required-ruby-version` config**: the scaffolded gemspec's
+  `required_ruby_version` constraint is now configurable per repo. Unset, it defaults to
+  `">= 3.2.0"` (see Fixed).
+- **`[[workspace.poly.hooks-sources]]` passthrough**: external git-sourced pre-commit hook
+  sources (e.g. an `ai-rulez` validation hook pinned by `git` + `revision`) are now modeled in
+  `[workspace.poly]` and rendered as `[[hooks.sources]]` blocks in the generated `poly.toml`, so
+  consumers relying on such hooks no longer have to hand-edit the generated file (which regen
+  would clobber). Empty by default — output stays byte-identical when unused.
+
+### Fixed
+
+- **Ruby gemspec no longer pins `< 4.0`**: the scaffolded gemspec hardcoded
+  `required_ruby_version = [">= 3.2.0", "< 4.0"]`, blocking `gem install` on Ruby 4.x. It now
+  defaults to `">= 3.2.0"` (no upper bound). Affects every repo with a Ruby binding.
+- **Elixir positional JSON-encoded NIF args now handle `nil` and pre-encoded strings**: the
+  positional constructor arg (e.g. `create_engine/1`) unconditionally re-encoded via
+  `Jason.encode!`, so a `nil` default config encoded to `"null"` and a pre-encoded JSON string
+  (the documented `Jason.encode!(%Struct{})` form) double-encoded — both rejected by serde at the
+  NIF boundary. The generated wrapper now forwards `nil` and binaries as-is and encodes native
+  terms, mirroring the keyword-arg path. Affects all rustler bindings.
+- **Generated Rust e2e test code is now clippy-clean under `--all-targets`**: the `min_length`
+  assertion emitted `x.len() >= 1` (trips `clippy::len_zero`); for `n == 1` it now emits
+  `!x.is_empty()` and keeps `len() >= n` for `n > 1`. The generated mock-server `Child` singleton
+  is annotated `#[allow(clippy::zombie_processes)]`.
+
+### Changed
+
+- **Dependencies bumped to latest**: `syn` `2` → `3` and `jsonschema` `0.46` → `0.48`. The `syn` 3
+  upgrade restructured `ItemImpl.trait_` (3-tuple → `(Path, For)`) and `Receiver` (`reference`/
+  `mutability` → `kind: ReceiverKind`); the Rust-source extractor was adapted accordingly. No
+  change to generated output.
+
+## [0.37.2] - 2026-07-19
+
+### Fixed
+
+- **Swift e2e `.length`/`.count` assertions on JSON-bridged collections no longer emit
+  uncompilable `.count`**: a length/count/size assertion whose collection leaf is a swift-bridge
+  scalar `RustString` getter — an `Option<Vec<T>>`, `Map`, or `Vec<Vec<_>>` field, which bridges
+  to a single JSON string with no `.count` — generated `<collection>()?.count`, which does not
+  compile. Such assertions are now skipped with a "not available on result type" comment,
+  matching the go/csharp/java backends. Countable `RustVec` getters (plain `Vec<T>`) are
+  unaffected and still emit `.count`.
+
+## [0.37.1] - 2026-07-19
+
+### Fixed
+
+- **Elixir streaming NIFs now compile**: the generated Rustler streaming start NIF
+  (`crawl_stream`/`batch_crawl_stream`-style methods on an opaque resource) cloned the
+  `Arc<RwLock<Handle>>` and called the core stream method on it, which does not exist
+  (`E0599`). Streaming codegen now read-locks and clones the inner handle first, matching the
+  non-streaming opaque method path.
+- **Swift `Option<Vec<serde-struct>>` getters on opaque parents no longer collapse to `String`**:
+  an optional `Vec` of a serde-deriving struct on an opaque (non-first-class) parent was
+  JSON-degraded to a single `RustString` getter while the constructor kept a real
+  `Optional<RustVec<T>>`, so `.field()?.count` did not compile. The getter now returns
+  `Option<Vec<T>>` (matching the constructor and the opaque element accessors); the JSON
+  degradation is retained only for first-class Codable parents whose Swift decoder needs it.
+- **Project-agnostic fixtures**: renamed real downstream project names used as sample fixtures in
+  `src/core/ir/surface.rs` and the C# e2e test-app generator to neutral names, restoring the
+  project-mention guard to green.
+
+## [0.37.0] - 2026-07-19
+
+### Added
+
+- **`custom_modules` entries for backends that ignore them are now flagged** (#183): `alef generate`
+  emits a warning when `[custom_modules].<lang>` carries entries for a language whose backend never
+  consumes them (`node`, `wasm`, `go`, `java`, `csharp`). Only pyo3, ffi, php, magnus, rustler, and
+  extendr read `custom_modules`; entries elsewhere silently did nothing. The warning names the
+  language and, for wasm, points at `[crates.wasm].custom_rust_modules` — the knob that actually
+  declares hand-written Rust modules. The misleading `custom_rust_modules` doc comment (which
+  claimed `[custom_modules].wasm` adds TypeScript re-exports) is corrected.
+- **`alef verify` flags hash-inconsistent trees** (#184): verify now reports when the generated tree
+  carries more distinct `alef:hash` values than there are generating crates — the signature of a
+  partial regeneration where some files were regenerated and others left with an older hash. The
+  check is host-independent (it never recomputes the inputs hash), so partial regens are caught at
+  commit time regardless of environment. Surfaces under `--exit-code`.
+
+### Changed (BREAKING)
+
+- **Generation fails fast when a required formatter is missing** (#184): `alef generate` and
+  `alef all` now abort up front if `rustfmt`, `poly`, or (for languages with a cargo-sort residual:
+  wasm/ffi/ruby/elixir/r) `cargo-sort` is not on `PATH`, instead of warning and emitting
+  differently-formatted, host-dependent output. The error names each missing tool and how to install
+  it. This makes generation deterministic modulo the config; install the listed tools to proceed.
+- **Generated node/e2e dependency bumps**: `@napi-rs/cli` `^3.6.2` → `^3.7.3` (devDependency and the
+  default build command), `@types/node` `^22.10.2` → `^26.0.0`, and `vitest` `^4.1.5` → `^4.1.10`.
+
+### Fixed
+
+- **`alef generate --lang <one>` no longer deletes other languages' output** (#178): the orphan
+  sweep computed its keep set from the filtered language but widened its roots unconditionally
+  (always including `packages/wasm` and `packages/typescript`), so a filtered run deleted every other
+  binding's still-valid generated files. Filtered runs now scope the sweep roots to the requested
+  languages' own directories; unfiltered `alef all` behavior is unchanged.
+- **`alef all` no longer deletes the generated docs reference tree based on host state** (#184): the
+  set of reference pages `generate_docs_stage` emits varies with the host (CLI/MCP source presence,
+  doc-language subset), so a host that regenerated fewer pages let orphan cleanup delete the
+  committed pages it did not produce. Committed pages under `[docs].reference_output` are now
+  protected from orphan cleanup.
+
+## [0.36.2] - 2026-07-13
+
+### Fixed
+
+- **Generated test apps had four runtime-breaking defects when run against published packages**:
+  - **C# registry test app referenced the wrong NuGet id**: `render_csproj` emitted
+    `<PackageReference Include="{project_name}">` (the C# assembly/namespace, e.g. `Xberg`) instead
+    of the published NuGet id from `[crates.csharp].package_id` (e.g. `XbergIo.Xberg`), so
+    `dotnet restore` failed with `NU1101: Unable to find package`. The registry-mode reference now
+    resolves `package_id` → namespace → project name.
+  - **Go test app's `go.mod` was an incomplete dependency graph**: only `github.com/stretchr/testify`
+    was required, with none of its transitive deps, so `go test` aborted demanding `go mod tidy`.
+    `render_go_mod` now emits testify's pinned indirect deps (`go-spew`, `go-difflib`, `yaml.v3`) as
+    an `// indirect` block so the app builds offline without a manual tidy.
+  - **Dart test app never fetched its native library**: the `download_libs` invocation had been
+    dropped on the false premise that natives ship via pub.dev (they exceed pub.dev's 100 MB cap and
+    are fetched from the GitHub release). Restored: the run config derives the under-test package name
+    and runs `dart run <pkg>:download_libs` between `pub get` and `dart test`, so `RustLib.init()`
+    finds the native.
+  - **WASM/node test apps shipped a stale JS lockfile across `--clean`**: `pnpm-lock.yaml` pinned an
+    older version than `package.json` wanted, tripping pnpm's `minimumReleaseAge` supply-chain gate.
+    JS lockfiles (`pnpm-lock.yaml`, `package-lock.json`, `yarn.lock`) are no longer preserved across
+    `--clean` for `node`/`wasm`, so the post-generate `pnpm install --lockfile-only` regenerates them
+    fresh; non-JS locks are still preserved.
+
+## [0.36.1] - 2026-07-13
+
+### Fixed
+
+- **`alef docs` over-documented `#[cfg(feature = "…")]`-gated items for feature-restricted bindings**:
+  the reference-docs generator rendered the full extracted API surface without evaluating each
+  binding's effective feature set, so a binding whose feature set excludes a gate (e.g. the wasm
+  binding — `wasm-target`, which does not enable `tree-sitter`) still documented the gated types,
+  struct fields, enum variants, and functions, diverging from the surface the binding actually
+  compiles. `generate_lang_doc` now filters the surface through the new
+  `ApiSurface::with_cfg_filtered_deep` — which drops cfg-gated *members* (fields, enum variants,
+  variant fields), not just top-level items — using each backend's real effective feature set
+  (Swift/Dart force-enable every cfg-referenced feature minus `excluded_default_features`; other
+  backends use their configured feature list). `cfg_feature_satisfied` gains three-valued (Kleene)
+  evaluation with full `all`/`any`/`not` and nested-predicate support, and keeps any item whose gate
+  depends on an unresolved non-feature leaf (e.g. `target_arch`), so target-conditional items are
+  never wrongly dropped.
+
+## [0.34.7] - 2026-07-10
+
+### Fixed
+
+- **dart native loader emitted unparseable Dart (`\${...}` instead of `${...}`)**: the
+  `StateError` raised on a full native-library cache miss escaped `${nativeCacheDir() ...}` and
+  `${nativeAssetUrlBase()}` as a literal `\$` instead of real Dart string interpolation. The stray
+  backslash meant the enclosing single-quoted string terminated early at the nested
+  `'<unresolved cache dir>'` literal, producing bare identifiers (`unresolved`, `cache`, `dir`)
+  that fail to compile in every consumer of `frb_generated.dart`. Fixed in
+  `frb_init_prologue_replacement`; added a regression test asserting real interpolation.
+- **e2e shebang scripts lost their executable bit after formatting**: the scaffold writer chmods
+  generated shebang scripts (e.g. `run_tests.php`) to `0o755`, but the subsequent `poly fmt --fix`
+  pass in the e2e formatter rewrites them via atomic rename, resetting the mode to `0o644`. The
+  generated suites then committed a non-executable `run_tests.php`, which trips the
+  `check-shebang-scripts-are-executable` file-safety hook downstream. `run_formatters` now
+  re-asserts the shebang chmod after every formatter pass, so shebang e2e scripts stay executable.
+
+## [0.34.5] - 2026-07-09
+
+### Added
+
+- **dart native loader**: the Dart backend now generates a runtime loader that fetches the
+  platform-matched native from the package's GitHub Release (version-pinned, SHA-256 verified)
+  into a versioned user-cache dir on first use, instead of bundling all-platform natives in the
+  published package. Adds a shared `native_loader.dart` helper, a cache-resolution loader stage
+  that errors actionably on a full miss (naming the asset URL and the `download_libs` / env-var
+  escape hatches), and the `crypto` dependency for SHA-256 verification.
+
+### Fixed
+
+- **cargo-machete false positives on binding scaffolds**: the R (extendr), Dart, and Ruby crate
+  manifests declare `async-trait` — and Ruby additionally declares `tokio` — for trait-bridge
+  support, but a synchronous trait bridge (e.g. a visitor) never imports them in the generated
+  shim, so `cargo-machete` flagged them as unused and failed `poly lint`. Each generator now adds
+  the emitted-but-unused dependency to its `[package.metadata.cargo-machete]` ignored list: R gains
+  the stanza (it previously emitted none), Dart appends `async-trait` (its bridge genuinely uses
+  `tokio`), and Ruby appends `async-trait` plus `tokio` when the bridge carries no real async. This
+  removes the need to hand-patch the generated manifests after regeneration.
+
+## [0.34.4] - 2026-07-09
+
+### Fixed
+
+- **java visitor codegen**: the upcall `FunctionDescriptor` for visitor callbacks now declares
+  `ValueLayout.JAVA_INT` as its return layout, matching the `int`-returning `handleVisit*` bridge
+  methods and the `int.class` `MethodType`. It previously emitted `ValueLayout.JAVA_LONG`, so the
+  Java Linker rejected every visitor upcall stub with `IllegalArgumentException: Wrong method
+  handle type: (MemorySegment×5)int`, making `withVisitor(...)` unusable — even a no-op visitor
+  threw before any callback ran. The `JAVA_LONG` parameter layouts for genuine i64 arguments
+  (e.g. `depth`, `index_in_parent`) are unchanged. Mirrors the `JAVA_INT` return layout the
+  lifecycle/JSON-convention trait-bridge stubs already use.
+
+## [0.34.3] - 2026-07-09
+
+### Fixed
+
+- **magnus (Ruby) codegen**: a non-variadic, infallible, synchronous free function whose
+  parameters require fallible serde deserialization — a non-opaque `Named`, `Vec<Named>`, or
+  sanitized `Vec<String>` param — now emits a `Result`-returning wrapper that `Ok(...)`-wraps
+  the core call, instead of a stub whose `?`-based argument conversion failed to compile in a
+  non-`Result` body (`E0277`). Surfaced by `max_sim_score(&MultiVectorEmbedding,
+  &MultiVectorEmbedding) -> f64` and `max_sim_rank(...) -> Vec<LateInteractionMatch>`. Scoped
+  strictly to this previously-broken case: variadic / error-returning / async functions keep
+  their existing codegen path unchanged.
+- **rustler (Elixir) codegen**: same-named NIF entries — a real definition plus its crate-root
+  re-export under a narrower `cfg` (e.g. `max_sim_score`, gated `any(presets, late-interaction)`
+  in its module and re-exported under `presets`) — are now collapsed via
+  `dedup_same_name_functions` before re-gating. Emitting both produced two same-named
+  `#[rustler::nif]` items whose cfgs overlap, which rustler auto-discovers and rejects at
+  `on_load` with "Duplicate NIF entry". The other single-surface and Rust-cfg-gated backends
+  already deduplicated; the native NIF generator was the last to only re-gate.
+
+## [0.34.2] - 2026-07-08
+
+### Fixed
+
+- **dart scaffold**: the generated `.pubignore` now excludes native library binaries
+  (`*.so`, `*.dylib`, `*.dll`) in addition to `lib/src/native/`. The FRB build stages the
+  compiled library (every platform in CI) into `lib/src/<module>_bridge_generated/`, which
+  is not covered by the `lib/src/native/` rule and pushed the published archive past
+  pub.dev's 100MB cap (269MB observed). Native binaries are fetched at install time by
+  `bin/download_libs.dart`, so none belong in the pub archive.
+- **swift e2e codegen**: `count_min` / `count_equals` assertions on a scalar-string leaf no
+  longer emit `.toString()?.count`. `.toString()` yields a non-optional Swift `String`, so
+  optional-chaining `?.count` onto it failed to compile ("cannot use optional chaining on
+  non-optional value of type 'String'"); such targets now take `.count` directly.
+
+## [0.34.1] - 2026-07-08
+
+### Fixed
+
+- **codegen**: generated binding→core struct conversions now survive additive core
+  changes. Every public-field `From<Binding> for Core` literal (and the lossy
+  method-body and mirror-crate constructor literals in the magnus, php, dart, and
+  swift backends) ends with `..Default::default()` whenever the core type
+  implements `Default` — previously the trailer was emitted only when a field was
+  skipped at generation time. A field added to a core config struct after
+  generation now falls back to its core default instead of breaking every
+  generated binding except napi with `E0063: missing field`, until the bindings
+  are regenerated. Currently-mapped fields are still assigned explicitly, so
+  existing conversions behave identically. `CODEGEN_FORMAT_VERSION` is bumped to
+  `2` so `alef verify` re-stamps existing bindings with the forward-compatible
+  literals.
+
+## [0.34.0] - 2026-07-07
+
+### Fixed
+
+- **verify**: stop reporting every binding stale after unrelated changes. The inputs hash
+  (`compute_inputs_hash`) no longer folds in the alef crate version (`ALEF_REV`) — a dedicated
+  `CODEGEN_FORMAT_VERSION`, bumped only on output-affecting codegen changes, replaces it — and it
+  now hashes a canonical, normalized serialization of `alef.toml` rather than its raw bytes. As a
+  result, crate version bumps, comment/whitespace/key-order edits, and CRLF/LF differences no longer
+  invalidate freshness. Source paths are normalized (repo-relative, forward-slash) before hashing.
+  Adds `alef verify --verbose`, which prints the computed vs. embedded hash for each stale file.
+- **scaffold (dart)**: emit `packages/dart/.pubignore` excluding bundled native libraries and
+  development directories (`android/`, `ios/`, `blobs/`, `lib/src/native/`, `rust/`, `example/`,
+  `test/`), so `dart pub publish` stays under pub.dev's 100 MB archive limit. The runtime
+  `download_libs` script fetches the correct platform library from the GitHub release at install time.
+- **e2e (swift)**: bind Vec-of-opaque accessors to a local before indexing
+  (`let _vec = result.results(); _vec[0].tables()`) to prevent a use-after-free crash when
+  swift-bridge releases the parent `RustVec` temporary mid-expression.
+- **e2e (swift)**: emit `<expr>.toString().count` for scalar and optional-chain String
+  count/emptiness assertions (previously skipped), parenthesize the optional form as
+  `(… .count ?? 0)`, and bind `let result =` for `not_error` contract fixtures.
+
+### Changed
+
+- **rustler**: the generated `native.ex` `nif_versions` list is now driven by
+  `[crates.publish.languages.elixir].nif_versions` (previously a hardcoded `["2.16", "2.17"]`),
+  keeping the RustlerPrecompiled declaration in lockstep with packaging and the CI build matrix.
+
+## [0.33.0] - 2026-07-07
+
+### Changed
+
+- **docs**: emit deprecation notices as Starlight-compatible `:::caution[…]` asides
+  instead of mkdocs-Material `!!! warning "…"` admonitions, so generated reference
+  pages render correctly under Astro Starlight. Reference pages stay `.md` (no other
+  mkdocs-only syntax is generated), so type signatures with `<`, `{`, `[` need no
+  MDX escaping.
+
+### Fixed
+
+- **docs (cli)**: expand `#[command(flatten)]` args in struct-like enum-variant
+  commands. The CLI-doc generator handled `flatten` only on struct-derived commands,
+  so subcommands defined as enum variants (e.g. a CLI whose `extract`/`batch` variants
+  flatten an `ExtractionOverrides` args struct) emitted an opaque struct row instead of
+  the flattened flags. A shared `process_command_field` helper now expands flattened
+  args inline on both the struct and enum-variant paths.
+
+## [0.32.11] - 2026-07-07
+
+### Fixed
+
+- **scaffold**: the generated repo-root `poly.toml` now emits the `[hooks.builtin]`
+  keys `lint`/`fmt` instead of `polylint`/`polyfmt`, matching the current poly
+  config schema. 0.32.10 fixed alef's own committed `poly.toml`, but the generator
+  still emitted the old keys, so every downstream regen (e.g. xberg) reverted the
+  config to a form poly rejects (`unknown field 'polyfmt'`). Fixed the emitter in
+  `scaffold::languages::poly` and its tests.
+
+## [0.32.10] - 2026-07-07
+
+### Fixed
+
+- **config**: rename the `[hooks.builtin]` keys `polylint`/`polyfmt` to `lint`/`fmt`
+  in `poly.toml` to match the current poly config schema. The old keys made poly
+  fail to load its config (`unknown field 'polyfmt'`), which broke the
+  `poly-validate` CI job.
+- **zig**: correct the trait-bridge complex-return test to assert the pass-through
+  path. In the Zig trait-bridge ABI every complex return (`Bytes`, `Vec<T>`, struct,
+  enum, Map) is a pre-serialized JSON `[*c]const u8` that the host impl returns
+  directly, so the fallible thunk hands it back via `@constCast` rather than
+  re-serializing with `std.json.fmt` (which zig 0.16 cannot apply to
+  `[*c]const u8`). The codegen (shipped in 0.32.9) was already correct; the test
+  still asserted the old `std.json.fmt` path. Test-only change, no codegen change.
+
 ## [0.32.6] - 2026-07-05
 
 ### Fixed
@@ -888,7 +2027,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **extendr (R): skip per-variant factory constructors whose fields cannot cross the extendr input boundary.**
   A tagged data enum (e.g. `NodeContent`) generates a `_factory_<variant>` `#[extendr]` constructor per
   struct variant. When a variant field was a Named DTO (`grid: TableGrid`) or `Vec<DTO>`
-  (`entries: Vec<MetadataEntry>`), the constructor took it _by value_, which the `#[extendr]` proc-macro
+  (`entries: Vec<MetadataEntry>`), the constructor took it *by value*, which the `#[extendr]` proc-macro
   cannot accept (`error[E0277]: T: TryFrom<&Robj> not satisfied`) — extendr derives `TryFrom<&Robj>` only
   for `&T`, never owned `T`, and has no R-list conversion for `Vec<DTO>`. `gen_extendr_enum_variant_constructors`
   and `extendr_enum_variant_constructor_registrations` now skip such variants (predicate

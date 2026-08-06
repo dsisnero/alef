@@ -16,7 +16,6 @@ buildscript {
 plugins {
     id("com.android.library") version "9.2.1"
     id("com.vanniktech.maven.publish") version "0.37.0"
-    id("org.jlleitschuh.gradle.ktlint") version "14.2.0"
     id("com.github.ben-manes.versions") version "0.54.0"
 }
 
@@ -47,12 +46,6 @@ kotlin {
     }
 }
 
-ktlint {
-    version.set("1.8.0")
-    android.set(true)
-    ignoreFailures.set(false)
-}
-
 dependencies {
     implementation("org.jetbrains.kotlin:kotlin-stdlib")
     // Generated Kotlin facade uses suspend functions and Flow wrappers, both of
@@ -63,9 +56,9 @@ dependencies {
     // data-class deserialization (handles nullable, default values, etc.).
     // jackson-datatype-jdk8 is required because the generated DefaultClient.kt
     // registers Jdk8Module for Optional<T> / java.util.Optional support.
-    implementation("com.fasterxml.jackson.core:jackson-databind:2.19.0")
-    implementation("com.fasterxml.jackson.module:jackson-module-kotlin:2.19.0")
-    implementation("com.fasterxml.jackson.datatype:jackson-datatype-jdk8:2.19.0")
+    implementation("com.fasterxml.jackson.core:jackson-databind:2.22.1")
+    implementation("com.fasterxml.jackson.module:jackson-module-kotlin:2.22.1")
+    implementation("com.fasterxml.jackson.datatype:jackson-datatype-jdk8:2.22.1")
     testImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test.ext:junit:1.3.0")
     androidTestImplementation("androidx.test.espresso:espresso-core:3.7.0")
@@ -105,7 +98,7 @@ tasks.register("copyHostJni", Copy::class) {
         val libName = when (hostPlatform) {
             "darwin" -> "libdemo_jni.dylib"
             "windows" -> "demo_jni.dll"
-            else -> "libdemo_jni.so"  // linux
+            else -> "libdemo_jni.so" // linux
         }
 
         from(buildDir) {
@@ -145,9 +138,16 @@ tasks.matching { it.name.startsWith("processDebug") || it.name.startsWith("proce
 // during the publish phase. The publish workflow must extract jniLibs from
 // pre-built AARs and stage them into src/main/jniLibs before invoking gradle.
 // This check catches the bug where jniLibs are lost during publish-time rebuild.
+// NOTE: gate on task *name* via allTasks.any, not gradle.taskGraph.hasTask(name),
+// because hasTask(String) matches the fully-qualified path (":assembleRelease")
+// and a bare name never matches — which silently disabled this guard and let a
+// jni-less AAR ship.
 tasks.register("validateJniLibsForRelease") {
     doFirst {
-        if (gradle.taskGraph.hasTask("assembleRelease") || gradle.taskGraph.hasTask("publishAndReleaseToMavenCentral")) {
+        val releaseAssemble = gradle.taskGraph.allTasks.any {
+            it.name == "assembleRelease" || it.name == "publishAndReleaseToMavenCentral"
+        }
+        if (releaseAssemble) {
             val jniLibsDir = file("src/main/jniLibs")
             if (!jniLibsDir.exists() || jniLibsDir.listFiles()?.isEmpty() != false) {
                 throw GradleException(
@@ -156,6 +156,23 @@ tasks.register("validateJniLibsForRelease") {
                     "Ensure the publish workflow stages jniLibs from pre-built AARs " +
                     "into src/main/jniLibs/{arm64-v8a,x86_64}/ before invoking assembleRelease. " +
                     "Aborting to prevent shipping a jni-less AAR to Maven Central."
+                )
+            }
+            // Every ABI directory must also contain the JNI crate's own library.
+            // A non-empty jniLibs holding a differently-named .so (e.g. the C-FFI
+            // lib*_ffi.so instead of libdemo_jni.so) passes the emptiness
+            // check above but fails at runtime with UnsatisfiedLinkError, because
+            // System.loadLibrary("demo_jni") needs the JNI entry points.
+            val expectedJniLib = "libdemo_jni.so"
+            val abisMissingJniLib = (jniLibsDir.listFiles()?.filter { it.isDirectory } ?: emptyList())
+                .filter { abiDir -> !abiDir.resolve(expectedJniLib).exists() }
+            if (abisMissingJniLib.isNotEmpty()) {
+                throw GradleException(
+                    "FATAL: " + expectedJniLib + " is missing from jniLibs ABI dir(s): " +
+                    abisMissingJniLib.joinToString(", ") { it.name } + ". " +
+                    "A differently-named native library (e.g. the C-FFI lib*_ffi.so) does not " +
+                    "export the JNI symbols System.loadLibrary(\"demo_jni\") requires and " +
+                    "fails at runtime. Aborting to prevent shipping a broken AAR to Maven Central."
                 )
             }
         }
@@ -168,11 +185,13 @@ tasks.named("preBuild") {
 }
 
 mavenPublishing {
-    configure(AndroidSingleVariantLibrary(
-        variant = "release",
-        sourcesJar = com.vanniktech.maven.publish.SourcesJar.Sources(),
-        javadocJar = com.vanniktech.maven.publish.JavadocJar.Empty(),
-    ))
+    configure(
+        AndroidSingleVariantLibrary(
+            variant = "release",
+            sourcesJar = com.vanniktech.maven.publish.SourcesJar.Sources(),
+            javadocJar = com.vanniktech.maven.publish.JavadocJar.Empty(),
+        ),
+    )
 
     publishToMavenCentral()
     signAllPublications()

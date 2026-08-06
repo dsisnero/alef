@@ -161,6 +161,14 @@ impl E2eCodegen for GoCodegen {
             generated_header: false,
         });
 
+        // `cmd/setup` writes a machine-local cgo link shim into this test app when run
+        // against the published module; it must never be committed.
+        files.push(GeneratedFile {
+            path: output_base.join(".gitignore"),
+            content: render_gitignore(&config.name),
+            generated_header: false,
+        });
+
         // Determine if any fixture needs jsonString helper across all groups.
         let emits_executable_test =
             |fixture: &Fixture| fixture.is_http_test() || fixture_has_go_callable(fixture, e2e_config);
@@ -338,6 +346,14 @@ fn fix_go_major_version(module_path: &str, version: &str) -> String {
     format!("v{n}.0.0")
 }
 
+/// Render `.gitignore` for the generated Go test app directory. `cmd/setup` writes the
+/// machine-local cgo link shim (`<crate_name>_cgo_link.go`) into whatever `-dir` it's
+/// pointed at, including the test app's own package — it must never be committed since
+/// it embeds an absolute, machine-specific cache path.
+fn render_gitignore(crate_name: &str) -> String {
+    format!("{crate_name}_cgo_link.go\n")
+}
+
 fn render_go_mod(
     go_module_path: &str,
     replace_path: Option<&str>,
@@ -345,7 +361,20 @@ fn render_go_mod(
     extras: Option<&crate::core::config::manifest_extras::ManifestExtras>,
 ) -> String {
     let mut out = String::new();
-    let _ = writeln!(out, "module {go_module_path}/e2e");
+    // The generated test module must not be a subpath of the module under test.
+    // In local mode a `replace` directive redirects the required module to a local
+    // path, so a nested `{path}/e2e` main module resolves fine. In registry mode the
+    // required module is fetched from the proxy; a nested `{path}/e2e` main module
+    // shadows it — Go treats that path as owned by the main module, ignores the
+    // `require`, and "finds" a stray upstream tag (e.g. `v4.9.9+incompatible`)
+    // instead of the pinned version. Use a sibling `{path}-e2e` path in registry
+    // mode so the `require` directive is authoritative.
+    let main_module = if replace_path.is_some() {
+        format!("{go_module_path}/e2e")
+    } else {
+        format!("{go_module_path}-e2e")
+    };
+    let _ = writeln!(out, "module {main_module}");
     let _ = writeln!(out);
     let _ = writeln!(out, "go 1.26");
     let _ = writeln!(out);
@@ -370,6 +399,19 @@ fn render_go_mod(
 
     let _ = writeln!(out, ")");
 
+    // Emit testify's transitive dependencies as an explicit `// indirect` require
+    // block. Without them `go test` / `go mod download` abort with
+    // "updates to go.mod needed; to update it: go mod tidy" because the generated
+    // go.mod would be an incomplete dependency graph. Listing them here makes the
+    // published test_app build without a manual `go mod tidy` (and offline). These
+    // are the pinned transitive deps of `github.com/stretchr/testify v1.11.1`.
+    let _ = writeln!(out);
+    let _ = writeln!(out, "require (");
+    for (module_path, module_version) in TESTIFY_INDIRECT_DEPS {
+        let _ = writeln!(out, "\t{module_path} {module_version} // indirect");
+    }
+    let _ = writeln!(out, ")");
+
     if let Some(path) = replace_path {
         let _ = writeln!(out);
         let _ = writeln!(out, "replace {go_module_path} => {path}");
@@ -377,6 +419,16 @@ fn render_go_mod(
 
     out
 }
+
+/// Transitive (indirect) dependencies of `github.com/stretchr/testify v1.11.1`,
+/// pinned to the versions its own `go.mod` selects. These must appear in the
+/// generated test_app's go.mod (as `// indirect`) so `go test` builds without a
+/// manual `go mod tidy` — otherwise Go reports the go.mod as incomplete.
+const TESTIFY_INDIRECT_DEPS: &[(&str, &str)] = &[
+    ("github.com/davecgh/go-spew", "v1.1.1"),
+    ("github.com/pmezard/go-difflib", "v1.0.0"),
+    ("gopkg.in/yaml.v3", "v3.0.1"),
+];
 
 /// Emit environment variable setup code for the TestMain function.
 /// Returns a Go code snippet that calls os.Setenv for each env var in the config,

@@ -1,12 +1,72 @@
 //! NAPI-RS tagged-enum From-impl code generation (binding ↔ core conversions).
 
-use crate::core::ir::EnumDef;
+use crate::{
+    codegen::{
+        conversions::helpers::{
+            sanitized_field_to_binding_expr, sanitized_map_field_to_core_expr, sanitized_vec_field_to_core_expr,
+        },
+        naming::wire_variant_value,
+    },
+    core::ir::{EnumDef, TypeRef},
+};
 
 use super::enums::{
     tagged_enum_binding_struct_fields, tagged_enum_field_is_tuple, tagged_enum_field_name,
     tagged_enum_mixed_named_fields, variant_data_field_names,
 };
 use super::functions::{core_prim_str, needs_napi_cast};
+
+/// Build the binding→core conversion expression for a sanitized tagged-enum field, gated to
+/// the specific shapes this backend can invert (`Vec<Vec<String>>` and `Map<String, String>`,
+/// matching what `sanitized_vec_field_to_core_expr`/`sanitized_map_field_to_core_expr`
+/// support). Every other sanitized shape keeps the pre-#218 `Default::default()` fallback,
+/// which always compiles. The binding-side struct field is always `Option<T>` regardless of
+/// the core field's own optionality (see `tagged_enum_binding_struct_fields` field emission in
+/// `enums.rs`), so `optional` only changes whether the *result* is re-wrapped in `Option<_>`.
+fn sanitized_binding_to_core_expr(binding_field_name: &str, ty: &TypeRef, optional: bool) -> String {
+    let is_vec_vec_string = matches!(
+        ty,
+        TypeRef::Vec(outer) if matches!(outer.as_ref(), TypeRef::Vec(inner) if matches!(inner.as_ref(), TypeRef::String))
+    );
+    if is_vec_vec_string {
+        return if optional {
+            format!(
+                "val.{binding_field_name}.map(|v| {})",
+                sanitized_vec_field_to_core_expr("v", ty)
+            )
+        } else {
+            sanitized_vec_field_to_core_expr(&format!("val.{binding_field_name}.as_deref().unwrap_or_default()"), ty)
+        };
+    }
+    if optional {
+        if let Some(inner) = sanitized_map_field_to_core_expr("m", ty) {
+            return format!("val.{binding_field_name}.map(|m| {inner})");
+        }
+    } else if let Some(expr) =
+        sanitized_map_field_to_core_expr(&format!("val.{binding_field_name}.unwrap_or_default()"), ty)
+    {
+        return expr;
+    }
+    "Default::default()".to_string()
+}
+
+/// Build the core→binding field-init expression for a sanitized tagged-enum field, gated to
+/// the same shapes as [`sanitized_binding_to_core_expr`] via
+/// `sanitized_field_to_binding_expr`. `f` is the already-destructured core-side variable
+/// name; unsupported shapes fall back to `None`, which always compiles (and matches the
+/// `destructured` pattern binding that field with an ignored `_`-prefixed name).
+fn sanitized_core_to_binding_expr(f: &str, ty: &TypeRef, optional: bool) -> String {
+    if optional {
+        return match sanitized_field_to_binding_expr("v", ty) {
+            Some(inner) => format!("{f}: {f}.map(|v| {inner})"),
+            None => format!("{f}: None"),
+        };
+    }
+    match sanitized_field_to_binding_expr(f, ty) {
+        Some(expr) => format!("{f}: Some({expr})"),
+        None => format!("{f}: None"),
+    }
+}
 
 /// Generate `From<JsTaggedEnum> for core::TaggedEnum` for a flattened struct representation.
 pub(super) fn gen_tagged_enum_binding_to_core(
@@ -15,27 +75,22 @@ pub(super) fn gen_tagged_enum_binding_to_core(
     prefix: &str,
     struct_names: &ahash::AHashSet<String>,
 ) -> String {
-    use crate::core::ir::TypeRef;
     let core_path = crate::codegen::conversions::core_enum_path(enum_def, core_import);
     let binding_name = format!("{prefix}{}", enum_def.name);
     let tag_field = enum_def.serde_tag.as_deref().unwrap_or("type");
 
-    // Determine which Named fields use binding structs vs serde JSON String.
-    // A field uses a binding struct only if: (1) it has a binding struct in struct_names,
-    // (2) it's not sanitized, and (3) the field name maps to a single Named type across
-    // all variants (not shared with different types).
     let fields_with_binding_struct = tagged_enum_binding_struct_fields(enum_def, struct_names);
-    // Fields with different Named types across variants are stored as String (JSON) in the
-    // binding struct and must be deserialized per-variant via serde_json.
     let mixed_named_fields = tagged_enum_mixed_named_fields(enum_def);
 
-    // Precompute all variant data for template
     let variants = enum_def
         .variants
         .iter()
         .map(|variant| {
-            let default_tag = variant.name.to_lowercase();
-            let tag_value = variant.serde_rename.as_deref().unwrap_or(&default_tag);
+            let tag_value = wire_variant_value(
+                &variant.name,
+                variant.serde_rename.as_deref(),
+                enum_def.serde_rename_all.as_deref(),
+            );
             let is_tuple = crate::codegen::conversions::is_tuple_variant(&variant.fields);
             let is_empty = variant.fields.is_empty();
 
@@ -57,7 +112,10 @@ pub(super) fn gen_tagged_enum_binding_to_core(
                             && tagged_enum_field_is_tuple(f)
                             && matches!(&f.ty, TypeRef::Named(_));
                         let is_mixed = !is_single_tuple_named && mixed_named_fields.contains(&f.name);
-                        if f.optional {
+                        if f.sanitized {
+                            let expr = sanitized_binding_to_core_expr(&binding_field_name, &f.ty, f.optional);
+                            if f.is_boxed { format!("Box::new({expr})") } else { expr }
+                        } else if f.optional {
                             match &f.ty {
                                 TypeRef::Path => {
                                     format!("val.{binding_field_name}.map(std::path::PathBuf::from)")
@@ -88,9 +146,6 @@ pub(super) fn gen_tagged_enum_binding_to_core(
                                     format!("val.{binding_field_name}")
                                 }
                             }
-                        } else if f.sanitized {
-                            let expr = "Default::default()".to_string();
-                            if f.is_boxed { format!("Box::new({expr})") } else { expr }
                         } else {
                             let expr = match &f.ty {
                                 TypeRef::Named(n) if is_mixed => {
@@ -138,7 +193,7 @@ pub(super) fn gen_tagged_enum_binding_to_core(
 
                 minijinja::context! {
                     name => variant.name.clone(),
-                    tag_value => tag_value.to_string(),
+                    tag_value => tag_value,
                     is_empty => false,
                     is_tuple => is_tuple,
                     field_exprs => field_exprs,
@@ -148,7 +203,6 @@ pub(super) fn gen_tagged_enum_binding_to_core(
         })
         .collect::<Vec<_>>();
 
-    // Default fallback to first variant
     let default_variant = enum_def.variants.first().map(|first| {
         let is_tuple = crate::codegen::conversions::is_tuple_variant(&first.fields);
         let is_empty = first.fields.is_empty();
@@ -205,11 +259,8 @@ pub(super) fn gen_tagged_enum_core_to_binding(
     let binding_name = format!("{prefix}{}", enum_def.name);
     let tag_field = enum_def.serde_tag.as_deref().unwrap_or("type");
     let fields_with_binding_struct = tagged_enum_binding_struct_fields(enum_def, struct_names);
-    // Fields with different Named types across variants are stored as String (JSON) in the
-    // binding struct and must be serialized per-variant via serde_json.
     let mixed_named_fields = tagged_enum_mixed_named_fields(enum_def);
 
-    // Collect all field names across all variants
     let all_fields: Vec<String> = {
         let mut fields = std::collections::BTreeSet::new();
         for v in &enum_def.variants {
@@ -223,19 +274,17 @@ pub(super) fn gen_tagged_enum_core_to_binding(
         fields.into_iter().collect()
     };
 
-    // Collect synthesized variant-data field names (e.g. `pdf`, `docx`, `archive`).
-    // These are the per-variant optional properties added to the binding struct for
-    // single-tuple Named variants, enabling direct property access in TypeScript.
     let synth_field_names = variant_data_field_names(enum_def);
 
-    // Precompute all variant data for template
     let variants = enum_def
         .variants
         .iter()
         .map(|variant| {
-            let default_tag = variant.name.to_lowercase();
-            let tag_value = variant.serde_rename.as_deref().unwrap_or(&default_tag);
-            // Synthesized field name for this variant (snake_case of variant name), if any
+            let tag_value = wire_variant_value(
+                &variant.name,
+                variant.serde_rename.as_deref(),
+                enum_def.serde_rename_all.as_deref(),
+            );
             let this_synth_field = if variant.fields.len() == 1 {
                 let field = &variant.fields[0];
                 if tagged_enum_field_is_tuple(field) && matches!(&field.ty, crate::core::ir::TypeRef::Named(_)) {
@@ -249,7 +298,6 @@ pub(super) fn gen_tagged_enum_core_to_binding(
 
             if variant.fields.is_empty() {
                 let mut all_fields_none: Vec<String> = all_fields.iter().map(|f| format!("{f}: None")).collect();
-                // Include synthesized fields as None for empty variants
                 for sf in &synth_field_names {
                     all_fields_none.push(format!("{sf}: None"));
                 }
@@ -273,7 +321,7 @@ pub(super) fn gen_tagged_enum_core_to_binding(
                     .iter()
                     .map(|f| {
                         let binding_field_name = tagged_enum_field_name(variant, f);
-                        if f.sanitized {
+                        if f.sanitized && sanitized_field_to_binding_expr("_", &f.ty).is_none() {
                             if is_tuple {
                                 format!("_{binding_field_name}")
                             } else {
@@ -290,10 +338,10 @@ pub(super) fn gen_tagged_enum_core_to_binding(
                         if let Some(field) = variant_field_map.get(f) {
                             let has_binding = fields_with_binding_struct.contains(f.as_str());
                             let is_mixed = mixed_named_fields.contains(field.name.as_str());
-                            // For Box<T> the destructured variable binds the Box; we must deref
-                            // before calling `.into()` because `Box<T>: Into<JsT>` is not provided.
                             let boxed_deref = if field.is_boxed { "*" } else { "" };
-                            if field.optional {
+                            if field.sanitized {
+                                sanitized_core_to_binding_expr(f, &field.ty, field.optional)
+                            } else if field.optional {
                                 match &field.ty {
                                     TypeRef::Path => format!("{f}: {f}.map(|p| p.to_string_lossy().to_string())"),
                                     TypeRef::Named(_) if is_mixed => {
@@ -310,8 +358,6 @@ pub(super) fn gen_tagged_enum_core_to_binding(
                                     }
                                     _ => format!("{f}: {f}"),
                                 }
-                            } else if field.sanitized {
-                                format!("{f}: None")
                             } else {
                                 match &field.ty {
                                     TypeRef::Named(_) if is_mixed => {
@@ -340,11 +386,8 @@ pub(super) fn gen_tagged_enum_core_to_binding(
                         }
                     })
                     .collect();
-                // Append synthesized variant-data fields. The field matching this variant gets
-                // Some(inner.into()), all others get None.
                 for sf in &synth_field_names {
                     if this_synth_field.as_deref() == Some(sf.as_str()) {
-                        // The destructured tuple variable is the first field name
                         let field = &variant.fields[0];
                         let var_name = tagged_enum_field_name(variant, field);
                         let is_boxed = field.is_boxed;
@@ -360,7 +403,7 @@ pub(super) fn gen_tagged_enum_core_to_binding(
 
                 minijinja::context! {
                     name => variant.name.clone(),
-                    tag_value => tag_value.to_string(),
+                    tag_value => tag_value,
                     is_empty => false,
                     is_tuple => is_tuple,
                     destructured => destructured,
@@ -370,8 +413,6 @@ pub(super) fn gen_tagged_enum_core_to_binding(
         })
         .collect::<Vec<_>>();
 
-    // When the core enum has cfg-gated variants excluded from the IR, emit a wildcard arm
-    // to keep the match exhaustive under --all-features builds.
     let has_excluded_variants = !enum_def.excluded_variants.is_empty();
 
     crate::backends::napi::template_env::render(
@@ -384,17 +425,4 @@ pub(super) fn gen_tagged_enum_core_to_binding(
             has_excluded_variants => has_excluded_variants,
         },
     )
-}
-
-/// Determine which Named fields in a tagged enum have **different** Named types across variants.
-/// These fields cannot use a single `JsXxx` binding type, so they are stored as `String` (JSON)
-/// and converted via `serde_json` per variant in the From impls.
-#[cfg(test)]
-mod tests {
-    /// gen_tagged_enum_binding_to_core is tested via integration tests in gen_bindings_test.rs.
-    /// This unit test verifies the function exists and is callable.
-    #[test]
-    fn tagged_enum_from_impls_exist() {
-        // Compilation check only — integration tests cover the generated output.
-    }
 }
