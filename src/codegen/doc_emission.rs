@@ -6,9 +6,9 @@ mod sanitize;
 mod sections;
 
 pub use emitters::{
-    emit_c_doxygen, emit_csharp_doc, emit_dartdoc, emit_elixir_doc, emit_gleam_doc, emit_javadoc, emit_kdoc,
-    emit_kdoc_ktfmt_canonical, emit_phpdoc, emit_roxygen, emit_rustdoc, emit_swift_doc, emit_yard_doc, emit_zig_doc,
-    render_yard_sections,
+    emit_c_doxygen, emit_crystal_doc, emit_csharp_doc, emit_dartdoc, emit_elixir_doc, emit_gleam_doc, emit_javadoc,
+    emit_kdoc, emit_kdoc_ktfmt_canonical, emit_phpdoc, emit_roxygen, emit_rustdoc, emit_swift_doc, emit_yard_doc,
+    emit_zig_doc, render_yard_sections, render_crystal_sections,
 };
 pub use sanitize::{DocTarget, sanitize_rust_idioms, sanitize_rust_idioms_keep_sections};
 pub use sections::{

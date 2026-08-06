@@ -640,6 +640,90 @@ pub fn render_yard_sections(sections: &RustdocSections) -> String {
     out
 }
 
+/// Emit Crystal `#` doc comments.
+///
+/// Crystal uses `#` for both regular and doc comments. The emitter produces
+/// a `# Summary` line followed by section headers and content, matching the
+/// conventions used by `crystal docs`.
+pub fn emit_crystal_doc(out: &mut String, doc: &str, indent: &str) {
+    if doc.is_empty() {
+        return;
+    }
+    let sections = parse_rustdoc_sections(doc);
+    let any_section = sections.arguments.is_some()
+        || sections.returns.is_some()
+        || sections.errors.is_some()
+        || sections.example.is_some();
+    let body = if any_section {
+        render_crystal_sections(&sections)
+    } else {
+        doc.to_string()
+    };
+    for line in body.lines() {
+        out.push_str(indent);
+        out.push_str("# ");
+        out.push_str(line);
+        out.push('\n');
+    }
+}
+
+/// Render `RustdocSections` as Crystal doc comment body (plain `#` lines).
+///
+/// - `# Arguments` → `# Arguments:\n# - name: desc`
+/// - `# Returns`   → `# Returns:\n#   desc`
+/// - `# Errors`    → `# Raises:\n#   desc`
+/// - `# Example`   → language-fenced code block
+pub fn render_crystal_sections(sections: &RustdocSections) -> String {
+    let mut out = String::new();
+    if !sections.summary.is_empty() {
+        out.push_str(&sections.summary);
+    }
+    if let Some(args) = sections.arguments.as_deref() {
+        for (name, desc) in parse_arguments_bullets(args) {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            if desc.is_empty() {
+                out.push_str("Arguments:\n- ");
+                out.push_str(&name);
+            } else {
+                out.push_str("Arguments:\n- ");
+                out.push_str(&name);
+                out.push_str(": ");
+                out.push_str(&desc);
+            }
+        }
+    }
+    if let Some(ret) = sections.returns.as_deref() {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str("Returns:\n  ");
+        out.push_str(ret.trim());
+    }
+    if let Some(err) = sections.errors.as_deref() {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str("Raises:\n  ");
+        out.push_str(err.trim());
+    }
+    if let Some(example) = sections.example.as_deref() {
+        if let Some(body) = example_for_target(example, "crystal") {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str("Example:\n");
+            for line in body.lines() {
+                out.push_str("  ");
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+    }
+    out
+}
+
 /// Escape Javadoc line: handle XML special chars and backtick code blocks.
 ///
 /// HTML entities (`<`, `>`, `&`) are also escaped *inside* `{@code …}` blocks.
