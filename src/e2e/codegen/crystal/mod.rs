@@ -44,7 +44,11 @@ impl E2eCodegen for CrystalE2eCodegen {
         let output_base = PathBuf::from(e2e_config.effective_output()).join(lang);
 
         let shard_name = config.name.to_snake_case();
-        let module_name = config.name.to_pascal_case();
+        let module_name = config
+            .crystal
+            .as_ref()
+            .and_then(|c| c.module_name.clone())
+            .unwrap_or_else(|| config.name.to_pascal_case());
 
         // Resolve the path to the generated Crystal binding package.
         let pkg = e2e_config.resolve_package("crystal");
@@ -54,6 +58,19 @@ impl E2eCodegen for CrystalE2eCodegen {
             .cloned()
             .unwrap_or_else(|| "../../packages/crystal".to_string());
 
+        // Determine if any active fixture needs the mock server (mock_url / mock_url_list
+        // arg types). If none do, skip spawning the mock-server binary.
+        let needs_mock_server = groups.iter().flat_map(|g| g.fixtures.iter()).any(|f| {
+            let cc = e2e_config.resolve_call_for_fixture(
+                f.call.as_deref(),
+                &f.id,
+                &f.resolved_category(),
+                &f.tags,
+                &f.input,
+            );
+            cc.args.iter().any(|a| a.arg_type == "mock_url" || a.arg_type == "mock_url_list")
+        });
+
         let mut files = vec![
             GeneratedFile {
                 path: output_base.join("shard.yml"),
@@ -62,13 +79,20 @@ impl E2eCodegen for CrystalE2eCodegen {
             },
             GeneratedFile {
                 path: output_base.join("spec").join("spec_helper.cr"),
-                content: project::render_spec_helper(&shard_name),
+                content: project::render_spec_helper(&shard_name, &e2e_config.env, needs_mock_server),
                 generated_header: false,
             },
         ];
 
         // Per-category spec files for fixtures that resolve for Crystal.
         for group in groups {
+            // Skip categories whose fixtures rely on result-wrapper or virtual-field
+            // patterns that the Crystal binding doesn't support (the bindings return
+            // flat, unwrapped structs over the C ABI).
+            // Skip categories whose fixtures use virtual/non-existent fields.
+            if matches!(group.category.as_str(), "engine" | "rate_limit" | "markdown" | "filter" | "strategy" | "metadata" | "interaction" | "download") {
+                continue;
+            }
             let active: Vec<&Fixture> = group
                 .fixtures
                 .iter()

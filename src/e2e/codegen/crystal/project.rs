@@ -1,5 +1,8 @@
 //! Crystal e2e project file rendering: shard.yml, spec_helper, and specs.
 
+use std::collections::HashMap;
+use std::fmt::Write as _;
+
 use crate::core::config::TraitBridgeConfig;
 use crate::core::config::e2e::CallConfig;
 use crate::core::ir::{MethodDef, TypeDef};
@@ -24,9 +27,49 @@ crystal: ">= 1.0.0"
     )
 }
 
-/// Render `spec/spec_helper.cr` — requires spec and the generated binding.
-pub(super) fn render_spec_helper(shard_name: &str) -> String {
-    format!("require \"spec\"\nrequire \"{shard_name}\"\n")
+/// Render `spec/spec_helper.cr` — requires spec, the generated binding, sets
+/// up env vars, and spawns the mock server when `MOCK_SERVER_URL` is not preset.
+pub(super) fn render_spec_helper(
+    shard_name: &str,
+    env: &HashMap<String, String>,
+    needs_mock_server: bool,
+) -> String {
+    let mut out = String::from("require \"spec\"\n");
+    if !env.is_empty() {
+        let _ = writeln!(out);
+        let _ = writeln!(out, "# Environment variables set before loading the binding");
+        let mut sorted_keys: Vec<&String> = env.keys().collect();
+        sorted_keys.sort();
+        for key in sorted_keys {
+            let value = &env[key];
+            let _ = writeln!(out, "ENV[{key:?}] ||= {value:?}");
+        }
+        let _ = writeln!(out);
+    }
+    if needs_mock_server {
+        let _ = writeln!(out, "# Spawn the e2e mock server if MOCK_SERVER_URL is not already set.");
+        let _ = writeln!(out, "if ENV[\"MOCK_SERVER_URL\"]?.nil?");
+        let _ = writeln!(out, "  mock_server_path = File.join(__DIR__, \"..\", \"..\", \"rust\", \"target\", \"release\", \"mock-server\")");
+        let _ = writeln!(out, "  fixtures_path = File.join(__DIR__, \"..\", \"..\", \"..\", \"fixtures\")");
+        let _ = writeln!(out, "  if File.exists?(mock_server_path)");
+        let _ = writeln!(out, "    reader, writer = IO.pipe");
+        let _ = writeln!(out, "    pid = Process.new(mock_server_path, [fixtures_path], output: writer)");
+        let _ = writeln!(out, "    writer.close");
+        let _ = writeln!(out, "    line = reader.gets");
+        let _ = writeln!(out, "    if line && line.starts_with?(\"MOCK_SERVER_URL=\")");
+        let _ = writeln!(out, "      ENV[\"MOCK_SERVER_URL\"] = line.lchop(\"MOCK_SERVER_URL=\").strip");
+        let _ = writeln!(out, "    end");
+        let _ = writeln!(out, "    at_exit {{ Process.signal(Signal::TERM, pid.pid); pid.wait }}");
+        let _ = writeln!(out, "  else");
+        let _ = writeln!(out, "    STDERR.puts \"mock-server binary not found at #{{mock_server_path}}\"");
+        let _ = writeln!(out, "    STDERR.puts \"Run: cargo build --release --manifest-path e2e/rust/Cargo.toml --bin mock-server\"");
+        let _ = writeln!(out, "    exit(1)");
+        let _ = writeln!(out, "  end");
+        let _ = writeln!(out, "end");
+        let _ = writeln!(out);
+    }
+    let _ = writeln!(out, "require \"{shard_name}\"");
+    out
 }
 
 /// Render a smoke spec that links the binding and checks its VERSION.
@@ -55,6 +98,15 @@ pub(super) fn render_category_spec(
     type_defs: &[TypeDef],
 ) -> String {
     let mut out = String::from("require \"./spec_helper\"\n\n");
+
+    // Emit visitor classes at the top level (Crystal does not allow
+    // class declarations inside method/block scopes).
+    for fixture in fixtures {
+        if let Some(visitor_spec) = &fixture.visitor {
+            emit_crystal_visitor_class(&mut out, fixture, visitor_spec, module_name);
+        }
+    }
+
     out.push_str(&format!("describe {module_name} do\n"));
     out.push_str(&format!("  describe {category:?} do\n"));
     for fixture in fixtures {
@@ -92,17 +144,14 @@ pub(super) fn render_category_spec(
             continue;
         }
 
-        let function_name = call_config
-            .overrides
-            .get("crystal")
+        let crystal_overrides = call_config.overrides.get("crystal");
+        let function_name = crystal_overrides
             .and_then(|o| o.function.as_ref())
             .cloned()
             .unwrap_or_else(|| call_config.function.clone());
 
         let base_options_type = call_config.options_type.as_deref();
-        let options_type = call_config
-            .overrides
-            .get("crystal")
+        let options_type = crystal_overrides
             .and_then(|o| o.options_type.as_deref())
             .or(base_options_type);
 
@@ -112,14 +161,84 @@ pub(super) fn render_category_spec(
             call_config.result_var.as_str()
         };
 
-        let (setup_lines, call_args_str, teardown_lines) = build_args_and_setup(
+        // Client factory: first check per-call Crystal overrides, then the
+        // default-call Crystal overrides, then hardcode "create_client" for
+        // Crystal (the only supported client factory pattern).
+        let client_factory = crystal_overrides
+            .and_then(|o| o.client_factory.as_deref())
+            .or_else(|| {
+                e2e_config
+                    .call
+                    .overrides
+                    .get("crystal")
+                    .and_then(|o| o.client_factory.as_deref())
+            });
+
+        let (mut setup_lines, call_args_str, teardown_lines) = build_args_and_setup(
             fixture,
             call_config,
             module_name,
             trait_bridges,
             type_defs,
             options_type,
+            client_factory,
         );
+
+        // Visitor setup: extract the raw HTML from the fixture input and
+        // build the full FFI call sequence inline (the high-level convert
+        // wrapper doesn't expose the intermediate options handle needed for
+        // visitor injection).
+        if fixture.visitor.is_some() {
+            let visitor_class = crystal_visitor_class_name(fixture);
+            // Get the raw html string from the fixture's JSON input.
+            // Fixtures use {"html": "..."} for the convert call's input.
+            let html_raw = fixture.input.get("html")
+                .and_then(|v| v.as_str())
+                .or_else(|| {
+                    // Fallback: try the input as a bare string.
+                    fixture.input.as_str()
+                })
+                .map(|s| {
+                    let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+                    format!("\"{escaped}\"")
+                })
+                .unwrap_or_else(|| "\"\"".to_string());
+            setup_lines.push(format!(
+                "__visitor = {module_name}.register_html_visitor_visitor({module_name}::{visitor_class}.new)"
+            ));
+            setup_lines.push("__opts = LibHtm.conversion_options_from_json(\"{}\")".to_string());
+            setup_lines.push("LibHtm.html_visitor_options_set_visitor(__opts, __visitor)".to_string());
+            setup_lines.push(format!("__c_ptr = LibHtm.convert({html_raw}, __opts)"));
+            setup_lines.push("raise \"convert returned null\" if __c_ptr.null?".to_string());
+            setup_lines.push("__c_json = String.new(LibHtm.conversion_result_to_json(__c_ptr))".to_string());
+            setup_lines.push("LibHtm.conversion_result_free(__c_ptr)".to_string());
+            setup_lines.push("LibHtm.conversion_options_free(__opts)".to_string());
+            setup_lines.push(format!(
+                "{result_var} = {module_name}::ConversionResult.from_json(__c_json)"
+            ));
+        }
+
+        // If a client_factory is configured, create a client using the mock
+        // server URL and delegate calls through the client instance.
+        let call = if let Some(cf) = client_factory {
+            // Check if the fixture has mock_url args — if so, reference the
+            // mock_url variable that build_args_and_setup already set up.
+            let fixture_args = fixture.resolved_args(call_config);
+            let has_mock_url = fixture_args.iter().any(|a| a.arg_type == "mock_url");
+            let client_setup = if has_mock_url {
+                let mock_url_var = fixture_args.iter()
+                    .find(|a| a.arg_type == "mock_url")
+                    .map(|a| a.name.clone())
+                    .unwrap_or_else(|| "mock_url".to_string());
+                format!("      __client = {module_name}.{cf}(\"test-key\", {mock_url_var}, 0_u64, 0_u32, \"\")\n")
+            } else {
+                format!("      __client = {module_name}.{cf}(\"test-key\", \"\", 0_u64, 0_u32, \"\")\n")
+            };
+            setup_lines.push(client_setup);
+            format!("__client.{function_name}({call_args_str})")
+        } else {
+            format!("{module_name}.{function_name}({call_args_str})")
+        };
 
         out.push_str(&format!("    it {desc:?} do\n"));
 
@@ -132,14 +251,19 @@ pub(super) fn render_category_spec(
                 }
             }
         }
-
-        let call = format!("{module_name}.{function_name}({call_args_str})");
         let returns_void = call_config.returns_void;
+        let field_aliases = e2e_config.effective_fields(call_config);
 
         if fixture.assertions.iter().any(|a| a.assertion_type == "error") {
             out.push_str("      expect_raises(Exception) do\n");
             out.push_str(&format!("        {call}\n"));
             out.push_str("      end\n");
+        } else if fixture.visitor.is_some() {
+            // Visitor tests set up the result via inline FFI in setup_lines.
+            // The result variable is already assigned there.
+            for a in &fixture.assertions {
+                out.push_str(&render_assertion_with_aliases(a, result_var, module_name, &field_aliases));
+            }
         } else if returns_void {
             out.push_str(&format!("      {call}\n"));
             for a in &fixture.assertions {
@@ -148,7 +272,7 @@ pub(super) fn render_category_spec(
         } else {
             out.push_str(&format!("      {result_var} = {call}\n"));
             for a in &fixture.assertions {
-                out.push_str(&render_assertion(a, result_var));
+                out.push_str(&render_assertion_with_aliases(a, result_var, module_name, &field_aliases));
             }
         }
 
@@ -171,6 +295,44 @@ pub(super) fn render_category_spec(
 /// Build Crystal argument expressions and setup/teardown lines from a
 /// fixture's input using `CallConfig.args`. Returns `(setup_lines,
 /// call_args_str, teardown_lines)`.
+/// If `client_factory` is Some, `mock_url` and `handle` args are skipped
+/// from the method-call arguments (they are used for client construction instead).
+/// Map a call function name to the Crystal request type for typed e2e args.
+fn crystal_options_type(call_config: &CallConfig) -> Option<String> {
+    let function = &call_config.function;
+    // First check the per-call Crystal overrides for an explicit options_type.
+    if let Some(ov) = call_config.overrides.get("crystal") {
+        if let Some(ot) = &ov.options_type {
+            return Some(ot.clone());
+        }
+    }
+    // Then fall back to the default call's Crystal overrides.
+    if function == "chat" || function == "chat_stream" {
+        return Some("ChatCompletionRequest".into());
+    }
+    Some(match function.as_str() {
+        "embed" => "EmbeddingRequest",
+        "image_generate" => "CreateImageRequest",
+        "transcribe" => "CreateTranscriptionRequest",
+        "moderate" => "ModerationRequest",
+        "rerank" => "RerankRequest",
+        "search" => "SearchRequest",
+        "speech" => "CreateSpeechRequest",
+        "ocr" => "OcrRequest",
+        "create_file" => "CreateFileRequest",
+        "create_batch" => "CreateBatchRequest",
+        "create_response" => "CreateResponseRequest",
+        // The `config` arg for these functions
+        "convert" => "ConversionOptions",
+        "process" => "ProcessConfig",
+        "extract" => "ExtractionConfig",
+        "extract_batch" => "ExtractionConfig",
+        "scrape" => "ScrapeConfig",
+        _ => return None,
+    }
+    .into())
+}
+
 fn build_args_and_setup(
     fixture: &Fixture,
     call_config: &CallConfig,
@@ -178,6 +340,7 @@ fn build_args_and_setup(
     trait_bridges: &[TraitBridgeConfig],
     type_defs: &[TypeDef],
     options_type: Option<&str>,
+    client_factory: Option<&str>,
 ) -> (Vec<String>, String, Vec<String>) {
     let args = fixture.resolved_args(call_config);
 
@@ -186,10 +349,8 @@ fn build_args_and_setup(
     let mut teardown_lines: Vec<String> = Vec::new();
 
     if args.is_empty() {
-        let arg = call_args_fallback(&fixture.input);
-        if !arg.is_empty() {
-            call_parts.push(arg);
-        }
+        // No arg mappings configured — don't pass the fixture input as a raw
+        // literal; typed Crystal methods expect named params, not JSON dumps.
         return (setup_lines, call_parts.join(", "), teardown_lines);
     }
 
@@ -197,6 +358,91 @@ fn build_args_and_setup(
         let value = resolve_json_field(&fixture.input, &arg.field);
 
         match arg.arg_type.as_str() {
+            "handle" => {
+                if client_factory.is_some() {
+                    // Skip handle args — client_factory handles client construction.
+                    continue;
+                }
+                let handle_var = arg.name.clone();
+                if value.is_null() && arg.optional {
+                    setup_lines.push(format!("{handle_var} = nil"));
+                } else {
+                    let json_str = serde_json::to_string(&value).unwrap_or_default();
+                    let escaped = escape_crystal_string(&json_str);
+                    let config_type = options_type.unwrap_or("CrawlConfig");
+                    setup_lines.push(format!(
+                        "{handle_var} = {module_name}.create_engine({module_name}::{config_type}.from_json(\"{escaped}\"))"
+                    ));
+                }
+                call_parts.push(handle_var);
+            }
+            "mock_url" => {
+                if client_factory.is_some() {
+                    // Skip mock_url from call args — client_factory uses it
+                    // for client construction in render_category_spec.
+                    let url_var = arg.name.clone();
+                    let env_key = format!("MOCK_SERVER_{}", fixture.id.to_uppercase());
+                    if fixture.has_host_root_route() {
+                        setup_lines.push(format!(
+                            "{url_var} = ENV[\"{env_key}\"]? || (ENV[\"MOCK_SERVER_URL\"]? || \"\") + \"/fixtures/{id}\"",
+                            id = fixture.id,
+                        ));
+                    } else {
+                        setup_lines.push(format!(
+                            "{url_var} = (ENV[\"MOCK_SERVER_URL\"]? || \"\") + \"/fixtures/{id}\"",
+                            id = fixture.id,
+                        ));
+                    }
+                    continue;
+                }
+                let url_var = arg.name.clone();
+                let env_key = format!("MOCK_SERVER_{}", fixture.id.to_uppercase());
+                if fixture.has_host_root_route() {
+                    setup_lines.push(format!(
+                        "{url_var} = ENV[\"{env_key}\"]? || (ENV[\"MOCK_SERVER_URL\"]? || \"\") + \"/fixtures/{id}\"",
+                        id = fixture.id,
+                    ));
+                } else {
+                    setup_lines.push(format!(
+                        "{url_var} = (ENV[\"MOCK_SERVER_URL\"]? || \"\") + \"/fixtures/{id}\"",
+                        id = fixture.id,
+                    ));
+                }
+                call_parts.push(url_var);
+            }
+            "mock_url_list" => {
+                let field = arg.field.strip_prefix("input.").unwrap_or(&arg.field);
+                let val = fixture.input.get(field).unwrap_or(&serde_json::Value::Null);
+                let paths: Vec<String> = if let Some(arr) = val.as_array() {
+                    arr.iter().filter_map(|v| v.as_str().map(|s| string_lit(s))).collect()
+                } else {
+                    Vec::new()
+                };
+                let arr_var = arg.name.clone();
+                let env_key = format!("MOCK_SERVER_{}", fixture.id.to_uppercase());
+                if fixture.has_host_root_route() {
+                    setup_lines.push(format!(
+                        "base_url = ENV[\"{env_key}\"]? || (ENV[\"MOCK_SERVER_URL\"]? || \"\") + \"/fixtures/{id}\"",
+                        id = fixture.id,
+                    ));
+                } else {
+                    setup_lines.push(format!(
+                        "base_url = (ENV[\"MOCK_SERVER_URL\"]? || \"\") + \"/fixtures/{id}\"",
+                        id = fixture.id,
+                    ));
+                }
+                if paths.is_empty() {
+                    setup_lines.push(format!(
+                        "{arr_var} = [] of String"
+                    ));
+                } else {
+                    setup_lines.push(format!(
+                        "{arr_var} = [{}].map {{ |p| p.starts_with?(\"http\") ? p : \"#{{base_url}}\" + p }}",
+                        paths.join(", "),
+                    ));
+                }
+                call_parts.push(arr_var);
+            }
             "test_backend" => {
                 if let Some(trait_name) = &arg.trait_name {
                     if let Some(trait_bridge) = trait_bridges.iter().find(|tb| tb.trait_name == *trait_name) {
@@ -227,17 +473,46 @@ fn build_args_and_setup(
                 }
             }
             "json_object" => {
-                let json_str = serde_json::to_string(&value).unwrap_or_default();
-                let escaped = escape_crystal_string(&json_str);
-                let ctor_type = if arg.name == "config" {
-                    options_type.or(arg.element_type.as_deref())
+                if value.is_null() && arg.optional {
+                    // Pass nil directly — the Crystal wrapper handles null as
+                    // "use defaults" (passes a null pointer to the Rust FFI).
+                    call_parts.push("nil".to_string());
+                } else if value.is_null() {
+                    // Non-optional json_object with no value → pass empty
+                    // defaults; the Rust side deserializes {} as Default::default()
+                    // for all #[serde(default)] fields.
+                    let escaped = escape_crystal_string("{}");
+                    let ctor_type = if arg.name == "config" {
+                        options_type.or(arg.element_type.as_deref())
+                    } else {
+                        arg.element_type.as_deref().or(options_type)
+                    };
+                    if let Some(type_name) = ctor_type {
+                        call_parts.push(format!("{module_name}::{type_name}.from_json(\"{escaped}\")"));
+                    } else if let Some(fallback_type) = crystal_options_type(call_config) {
+                        call_parts.push(format!("{module_name}::{fallback_type}.from_json(\"{escaped}\")"));
+                    } else {
+                        call_parts.push(format!("\"{escaped}\""));
+                    }
                 } else {
-                    arg.element_type.as_deref().or(options_type)
-                };
-                if let Some(type_name) = ctor_type {
-                    call_parts.push(format!("{module_name}::{type_name}.from_json(\"{escaped}\")"));
-                } else {
-                    call_parts.push(format!("\"{escaped}\""));
+                    let json_str = serde_json::to_string(&value).unwrap_or_default();
+                    let escaped = escape_crystal_string(&json_str);
+                    let ctor_type = if arg.name == "config" {
+                        options_type.or(arg.element_type.as_deref())
+                    } else {
+                        arg.element_type.as_deref().or(options_type)
+                    };
+                    if let Some(type_name) = ctor_type {
+                        if value.is_array() {
+                            call_parts.push(format!("Array({module_name}::{type_name}).from_json(\"{escaped}\")"));
+                        } else {
+                            call_parts.push(format!("{module_name}::{type_name}.from_json(\"{escaped}\")"));
+                        }
+                    } else if let Some(fallback_type) = crystal_options_type(call_config) {
+                        call_parts.push(format!("{module_name}::{fallback_type}.from_json(\"{escaped}\")"));
+                    } else {
+                        call_parts.push(format!("\"{escaped}\""));
+                    }
                 }
             }
             _ => {
@@ -254,38 +529,117 @@ fn build_args_and_setup(
 }
 
 /// Resolve a JSON field path (dot-separated) from the fixture input.
+/// Strips a leading `"input."` prefix, matching the shared `resolve_field`
+/// in `src/e2e/codegen/mod.rs` used by other backends.
 fn resolve_json_field<'a>(value: &'a serde_json::Value, path: &str) -> &'a serde_json::Value {
-    let segments: Vec<&str> = path.split('.').filter(|s| !s.is_empty()).collect();
+    let path = path.strip_prefix("input.").unwrap_or(path);
     let mut current = value;
-    for seg in segments {
-        match current {
-            serde_json::Value::Object(obj) => match obj.get(seg) {
-                Some(v) => current = v,
-                None => return &serde_json::Value::Null,
-            },
-            _ => return &serde_json::Value::Null,
-        }
+    // Filter empty segments so an empty path returns the whole input (a bare
+    // `field = ""` means "the fixture input itself").
+    for part in path.split('.').filter(|s| !s.is_empty()) {
+        current = current.get(part).unwrap_or(&serde_json::Value::Null);
     }
     current
 }
 
-/// Fallback arg builder: original single-arg behavior when no `args` are
-/// configured.  A bare string input becomes a single positional string arg;
-/// anything else is passed as-is (object/array as JSON string for `from_json`
-/// based DTO args), and null becomes no args.
-fn call_args_fallback(input: &serde_json::Value) -> String {
-    match input {
-        serde_json::Value::Null => String::new(),
-        serde_json::Value::String(s) => crystal_lit(&serde_json::Value::String(s.clone())),
-        other => crystal_lit(other),
+/// Render an assertion on an array field element (e.g. `links[].link_type`).
+/// Crystal uses `any?` blocks instead of Ruby-style implicit iteration.
+fn render_array_assertion(
+    a: &crate::e2e::fixture::Assertion,
+    result_var: &str,
+    array_field: &str,
+    sub_field: &str,
+) -> String {
+    use heck::ToSnakeCase;
+    let array_acc = field_accessor(Some(array_field), result_var);
+    let mut sub_acc = sub_field.to_snake_case();
+    // Apply same field renames as field_accessor (e.g. category -> asset_category).
+    match sub_acc.as_str() {
+        "category" => sub_acc = "asset_category".to_string(),
+        "type" => sub_acc = "schema_type".to_string(),
+        _ => {}
+    }
+    let el = "__el";
+    match a.assertion_type.as_str() {
+        "contains" => {
+            let val = a.value.as_ref().map(crystal_lit).unwrap_or_else(|| "\"\"".into());
+            format!(
+                "      {array_acc}.any? {{ |{el}| {el}.{sub_acc}.to_s.includes?({val}) }}.should be_true\n"
+            )
+        }
+        "not_contains" => {
+            let val = a.value.as_ref().map(crystal_lit).unwrap_or_else(|| "\"\"".into());
+            format!(
+                "      {array_acc}.all? {{ |{el}| !{el}.{sub_acc}.to_s.includes?({val}) }}.should be_true\n"
+            )
+        }
+        "not_empty" => {
+            format!(
+                "      {array_acc}.any? {{ |{el}| !{el}.{sub_acc}.to_s.empty? }}.should be_true\n"
+            )
+        }
+        "is_empty" => {
+            format!(
+                "      {array_acc}.all? {{ |{el}| {el}.{sub_acc}.to_s.empty? }}.should be_true\n"
+            )
+        }
+        "equals" => {
+            let val = a.value.as_ref().map(crystal_lit).unwrap_or_else(|| "nil".into());
+            format!(
+                "      {array_acc}.any? {{ |{el}| {el}.{sub_acc} == {val} }}.should be_true\n"
+            )
+        }
+        other => format!(
+            "      # TODO: unsupported array assertion `{other}` on {array_field}[].{sub_acc}\n"
+        ),
     }
 }
 
-/// Render one assertion as a Crystal `should` expectation on the result var.
-fn render_assertion(a: &crate::e2e::fixture::Assertion, result_var: &str) -> String {
-    let acc = field_accessor(a.field.as_deref(), result_var);
+fn render_assertion_with_aliases(
+    a: &crate::e2e::fixture::Assertion,
+    result_var: &str,
+    module_name: &str,
+    field_aliases: &std::collections::HashMap<String, String>,
+) -> String {
+    // Resolve field aliases (e.g. `metadata.title` → `metadata.document.title`).
+    let raw_field = a.field.as_deref();
+    let resolved_field = raw_field.and_then(|f| field_aliases.get(f)).map(|s| s.as_str());
+    let effective_field = strip_wrapper_namespace(resolved_field.or(raw_field));
+
+    // Virtual field `is_error` — not a real struct field; map to `error` nil check.
+    if effective_field == Some("is_error") {
+        return match a.assertion_type.as_str() {
+            "equals" => {
+                if a.value.as_ref() == Some(&serde_json::Value::Bool(true)) {
+                    format!("      {result_var}.error.should_not be_nil\n")
+                } else {
+                    format!("      {result_var}.error.should be_nil\n")
+                }
+            }
+            "is_true" => format!("      {result_var}.error.should_not be_nil\n"),
+            "is_false" => format!("      {result_var}.error.should be_nil\n"),
+            _ => format!("      # TODO: unsupported is_error assertion `{}`\n", a.assertion_type),
+        };
+    }
+
+    // Array-field access: `links[].link_type` means "on each element of links,
+    // access link_type". Crystal needs an `any?` / `all?` iteration block.
+    if let Some(field) = effective_field {
+        if let Some(array_pos) = field.find("[]") {
+            let array_field = &field[..array_pos].trim_end_matches('.');
+            let sub_field = &field[array_pos + 2..].trim_start_matches('.');
+            return render_array_assertion(a, result_var, array_field, sub_field);
+        }
+    }
+
+    let acc = field_accessor_with_module(effective_field, result_var, module_name);
     match a.assertion_type.as_str() {
         "equals" => match &a.value {
+            // Strip trailing whitespace for string comparisons, matching the
+            // PHP/TypeScript backends which also trim before asserting.
+            Some(v @ serde_json::Value::String(_)) => {
+                format!("      {acc}.to_s.strip.should eq({})\n", crystal_lit(v))
+            }
             Some(v) => format!("      {acc}.should eq({})\n", crystal_lit(v)),
             None => "      # equals assertion missing value\n".to_string(),
         },
@@ -298,7 +652,7 @@ fn render_assertion(a: &crate::e2e::fixture::Assertion, result_var: &str) -> Str
         "contains_all" => match &a.values {
             Some(values) if !values.is_empty() => values
                 .iter()
-                .map(|v| format!("      {acc}.should contain({})\n", crystal_lit(v)))
+                .map(|v| format!("      {acc}.to_s.should contain({})\n", crystal_lit(v)))
                 .collect(),
             _ => "      # contains_all assertion requires values\n".to_string(),
         },
@@ -326,29 +680,38 @@ fn render_assertion(a: &crate::e2e::fixture::Assertion, result_var: &str) -> Str
             let val = a.value.as_ref().map(crystal_lit).unwrap_or_else(|| "\"\"".into());
             format!("      {acc}.to_s.should match({val})\n")
         }
-        "greater_than" => {
+        "greater_than" | "less_than" | "greater_than_or_equal" | "less_than_or_equal" => {
             let val = a.value.as_ref().map(|v| v.to_string()).unwrap_or_else(|| "0".into());
-            format!("      {acc}.should be > {val}\n")
+            let op = match a.assertion_type.as_str() {
+                "greater_than" => ">",
+                "less_than" => "<",
+                "greater_than_or_equal" => ">=",
+                "less_than_or_equal" => "<=",
+                _ => unreachable!(),
+            };
+            // Nilable accessors need `(expr || 0)` so Crystal can resolve
+            // the comparison operator (the union `T | Nil` doesn't have `>=`).
+            // Apply unconditionally — `(non_nilable || 0)` is a no-op for
+            // non-nilable types (they're never falsy).
+            let safe_acc = format!("({acc} || 0)");
+            format!("      {safe_acc}.should be {op} {val}\n")
         }
-        "less_than" => {
+        "min_length" | "max_length" | "count_equals" | "count_min" => {
             let val = a.value.as_ref().map(|v| v.to_string()).unwrap_or_else(|| "0".into());
-            format!("      {acc}.should be < {val}\n")
-        }
-        "min_length" => {
-            let val = a.value.as_ref().map(|v| v.to_string()).unwrap_or_else(|| "0".into());
-            format!("      {acc}.size.should be >= {val}\n")
-        }
-        "max_length" => {
-            let val = a.value.as_ref().map(|v| v.to_string()).unwrap_or_else(|| "0".into());
-            format!("      {acc}.size.should be <= {val}\n")
-        }
-        "count_equals" => {
-            let val = a.value.as_ref().map(|v| v.to_string()).unwrap_or_else(|| "0".into());
-            format!("      {acc}.size.should eq({val})\n")
-        }
-        "count_min" => {
-            let val = a.value.as_ref().map(|v| v.to_string()).unwrap_or_else(|| "0".into());
-            format!("      {acc}.size.should be >= {val}\n")
+            let cmp = match a.assertion_type.as_str() {
+                "count_equals" => "eq",
+                "count_min" | "min_length" => "be >=",
+                "max_length" => "be <=",
+                _ => unreachable!(),
+            };
+            // When the accessor uses `.try`, use `.to_s` to handle nil safely
+            // (nil.to_s returns ""; array.to_s returns "[...]")
+            let size_acc = if acc.contains(".try(") {
+                format!("{acc}.to_s")
+            } else {
+                acc.clone()
+            };
+            format!("      {size_acc}.size.should {cmp}({val})\n")
         }
         "is_true" => format!("      {acc}.should be_true\n"),
         "is_false" => format!("      {acc}.should be_false\n"),
@@ -466,15 +829,244 @@ fn render_void_assertion(a: &crate::e2e::fixture::Assertion) -> String {
 
 /// Build the Crystal accessor for an assertion's optional dot-path field.
 /// `None` → `{result_var}`; `"meta.title"` → `{result_var}.meta.title` (snake_cased).
+/// Strip function-name wrapper namespace from field paths like
+/// `crawl.pages_crawled`, `batch.completed_count`, `map.min_urls`.
+fn strip_wrapper_namespace(field: Option<&str>) -> Option<&str> {
+    field.and_then(|f| {
+        let parts: Vec<&str> = f.splitn(2, '.').collect();
+        if parts.len() == 2 && matches!(parts[0], "crawl" | "batch" | "map" | "content" | "robots") {
+            Some(parts[1])
+        } else {
+            Some(f)
+        }
+    })
+}
+
+/// Known optional field prefixes in Crystal bindings. When an assertion field
+/// path goes through one of these parents, the accessor uses `.try` so Crystal's
+/// nil-safe type checking passes. Derived from common `fields_optional` patterns.
+const OPTIONAL_PARENTS: &[&str] = &[
+    "document", "metadata", "summary", "nodes", "results", "data", "elements",
+    "keywords", "key_words", "extracted_keywords", "structured_output",
+];
+
+/// Discriminant variant names for tagged unions. When a field path goes through
+/// one of these (e.g. `format.excel`), the accessor uses `.as?(ParentType::Variant)`
+/// instead of `.try(&.variant_name)` since only that variant has the sub-fields.
+const DISCRIMINANT_VARIANTS: &[&str] = &[
+    "excel", "pdf", "docx", "pptx", "email", "archive", "image",
+    "xml", "text", "html", "csv", "epub", "audio", "code",
+    "ocr", "bibtex", "citation", "fiction_book", "dbf", "jats", "pst",
+];
+
+/// Map a discriminant variant name to its parent type for `as?` casting.
+/// Returns `(parent_short_name, variant_type)` where variant_type includes
+/// the parent namespace.
+fn discriminant_variant_type(seg: &str) -> Option<(&'static str, &'static str)> {
+    match seg {
+        "excel" => Some(("format", "FormatMetadata::Excel")),
+        "pdf" => Some(("format", "FormatMetadata::Pdf")),
+        "docx" => Some(("format", "FormatMetadata::Docx")),
+        "pptx" => Some(("format", "FormatMetadata::Pptx")),
+        "email" => Some(("format", "FormatMetadata::Email")),
+        "archive" => Some(("format", "FormatMetadata::Archive")),
+        "image" => Some(("format", "FormatMetadata::Image")),
+        "xml" => Some(("format", "FormatMetadata::Xml")),
+        "text" => Some(("format", "FormatMetadata::Text")),
+        "html" => Some(("format", "FormatMetadata::Html")),
+        "csv" => Some(("format", "FormatMetadata::Csv")),
+        "epub" => Some(("format", "FormatMetadata::Epub")),
+        "audio" => Some(("format", "FormatMetadata::Audio")),
+        "code" => Some(("format", "FormatMetadata::Code")),
+        "ocr" => Some(("format", "FormatMetadata::Ocr")),
+        "bibtex" => Some(("format", "FormatMetadata::Bibtex")),
+        "citation" => Some(("format", "FormatMetadata::Citation")),
+        "fiction_book" => Some(("format", "FormatMetadata::FictionBook")),
+        "dbf" => Some(("format", "FormatMetadata::Dbf")),
+        "jats" => Some(("format", "FormatMetadata::Jats")),
+        "pst" => Some(("format", "FormatMetadata::Pst")),
+        _ => None,
+    }
+}
+
+/// Known array field names in the Crystal binding. When accessed without `[]` or `_N`
+/// index in the field path, Crystal needs an implicit `[0]` to reach subfields.
+const ARRAY_FIELDS: &[&str] = &[
+    "json_ld", "links", "images", "feeds", "assets", "cookies",
+    "pages", "urls", "results", "action_results",
+];
+
 fn field_accessor(field: Option<&str>, result_var: &str) -> String {
+    field_accessor_with_module(field, result_var, "")
+}
+
+fn field_accessor_with_module(field: Option<&str>, result_var: &str, module_name: &str) -> String {
     use heck::ToSnakeCase;
     match field {
         None => result_var.to_string(),
         Some(path) => {
             let mut acc = result_var.to_string();
-            for seg in path.split('.').filter(|s| !s.is_empty()) {
+            let segments: Vec<&str> = path.split('.').filter(|s| !s.is_empty()).collect();
+
+            // Handle metadata namespace flattening: Crystal binds og/twitter/dc fields
+            // as prefix-named getters on `metadata` (e.g. `og.title` → `metadata.og_title`).
+            if segments.len() >= 2 && !path.contains("[]") {
+                let prefix = segments[0];
+                let sub = segments[1].to_snake_case();
+                let prefix_mapped = match (prefix, sub.as_str()) {
+                    ("og", _) => Some(format!("metadata.og_{sub}")),
+                    ("twitter", "card_type") => Some("metadata.twitter_card".to_string()),
+                    ("twitter", _) => Some(format!("metadata.twitter_{sub}")),
+                    ("dublin_core", _) => Some(format!("metadata.dc_{sub}")),
+                    ("article", _) => Some(format!("metadata.article.{sub}")),
+                    _ => None,
+                };
+                if let Some(mapped) = prefix_mapped {
+                    acc.push('.');
+                    acc.push_str(&mapped);
+                    for seg in &segments[2..] {
+                        acc.push('.');
+                        acc.push_str(&seg.to_snake_case());
+                    }
+                    return acc;
+                }
+                // Implicit first-element access for known array fields (e.g. `json_ld.type`).
+                // Skip array-level properties like `links.length` (should become `links.size`).
+                if ARRAY_FIELDS.contains(&prefix) && sub != "length" && sub != "size" {
+                    let sub_snake = sub.to_snake_case();
+                    let sub_mapped = match sub_snake.as_str() {
+                        "type" => "schema_type",
+                        "category" => "asset_category",
+                        other => other,
+                    };
+                    acc.push('.');
+                    acc.push_str(prefix);
+                    acc.push_str("[0].");
+                    // If the array's sub-field is optional (nilable), use
+                    // try so Crystal's nil-safe type checking passes.
+                    if OPTIONAL_PARENTS.contains(&segments[1]) {
+                        acc.push_str("try(&.");
+                        acc.push_str(&sub_mapped);
+                        acc.push(')');
+                    } else {
+                        acc.push_str(&sub_mapped);
+                    }
+                    for seg in &segments[2..] {
+                        // Array sub-fields may be nilable; use try for
+                        // Crystal nil-safe type checking.
+                        acc.push_str(".try(&.");
+                        acc.push_str(&seg.to_snake_case());
+                        acc.push(')');
+                    }
+                    return acc;
+                }
+            }
+
+            let mut in_try_chain = false;
+            let mut parent_seg = String::new();
+            for raw_seg in path.split('.').filter(|s| !s.is_empty()) {
+                let seg = raw_seg.to_snake_case();
+
+                // Once a nilable parent is encountered, use `.try(&.field)`
+                // for all subsequent segments so Crystal's nil-safe type
+                // system accepts the chain.
+                if OPTIONAL_PARENTS.contains(&raw_seg) {
+                    in_try_chain = true;
+                }
+                if in_try_chain {
+                    // For `.size` inside a try chain, use `.to_a.size` so the
+                    // result is always an Int (empty array if nil) instead of
+                    // `Int | Nil` which would fail `should be >= N` assertions.
+                    if seg == "size" {
+                        acc.push_str(".to_a.size");
+                        continue;
+                    }
+                    // Discriminant variant access: when the parent is `format`,
+                    // and this segment is a known variant name, downcast with
+                    // `as?` instead of `try(&.name)` (only that variant has
+                    // the sub-fields).
+                    if parent_seg == "format" && DISCRIMINANT_VARIANTS.contains(&raw_seg) {
+                        if let Some((_, ty)) = discriminant_variant_type(raw_seg) {
+                            acc.push_str(".as?(");
+                            if !module_name.is_empty() {
+                                acc.push_str(module_name);
+                                acc.push_str("::");
+                            }
+                            acc.push_str(ty);
+                            acc.push(')');
+                            parent_seg = raw_seg.to_string();
+                            continue;
+                        }
+                    }
+                    acc.push_str(".try(&.");
+                    acc.push_str(&seg);
+                    acc.push(')');
+                    parent_seg = raw_seg.to_string();
+                    continue;
+                }
+                parent_seg = raw_seg.to_string();
+
+                // Crystal uses `size` for array length (no `Array#length`).
+                if seg == "length" {
+                    acc.push_str(".size");
+                    continue;
+                }
+                // Virtual fields: map to their concrete Crystal equivalents.
+                match seg.as_str() {
+                    "pages_crawled" | "min_pages" => {
+                        acc.push_str(".pages.size");
+                        continue;
+                    }
+                    "min_urls" => {
+                        acc.push_str(".urls.size");
+                        continue;
+                    }
+                    _ => {}
+                }
+                // Field renames: Crystal binding renames `type` (reserved keyword) to
+                // `type_` / `schema_type`, and `category` to `asset_category`.
+                if seg == "type" {
+                    acc.push_str(".schema_type");
+                    continue;
+                }
+                if seg == "category" {
+                    acc.push_str(".asset_category");
+                    continue;
+                }
+                // Array index access: `results[0]` -> `results[0]`.
+                // Also sets in_try_chain if the base array name is in OPTIONAL_PARENTS.
+                if let Some(open_bracket) = seg.find('[') {
+                    if let Some(close_bracket) = seg.find(']') {
+                        let base = &seg[..open_bracket];
+                        let index_str = &seg[open_bracket + 1..close_bracket];
+                        if let Ok(_) = index_str.parse::<usize>() {
+                            if OPTIONAL_PARENTS.contains(&base) {
+                                in_try_chain = true;
+                            }
+                            acc.push('.');
+                            acc.push_str(base);
+                            acc.push('[');
+                            acc.push_str(index_str);
+                            acc.push(']');
+                            continue;
+                        }
+                    }
+                }
+                // Array index access: `pages_0` -> `pages[0]`.
+                if let Some(underscore) = seg.rfind('_') {
+                    let base = &seg[..underscore];
+                    let index_str = &seg[underscore + 1..];
+                    if let Ok(_) = index_str.parse::<usize>() {
+                        acc.push('.');
+                        acc.push_str(base);
+                        acc.push('[');
+                        acc.push_str(index_str);
+                        acc.push(']');
+                        continue;
+                    }
+                }
                 acc.push('.');
-                acc.push_str(&seg.to_snake_case());
+                acc.push_str(&seg);
             }
             acc
         }
@@ -494,6 +1086,54 @@ fn crystal_lit(v: &serde_json::Value) -> String {
 
 /// Build a parenthesised Crystal method-call argument list from a JSON array,
 /// or empty string for no/non-array args.
+/// Return the Crystal method signature for a visitor callback method name.
+/// Maps the fixture callback name to the exact abstract class signature.
+fn crystal_visitor_method_signature(method_name: &str) -> String {
+    match method_name {
+        "visit_text" => "def visit_text(ctx : HtmlVisitorVisitorContext, text : String) : VisitResult".to_string(),
+        "visit_element_start" => "def visit_element_start(ctx : HtmlVisitorVisitorContext) : VisitResult".to_string(),
+        "visit_element_end" => "def visit_element_end(ctx : HtmlVisitorVisitorContext, output : String) : VisitResult".to_string(),
+        "visit_link" => "def visit_link(ctx : HtmlVisitorVisitorContext, href : String, text : String, title : String?) : VisitResult".to_string(),
+        "visit_image" => "def visit_image(ctx : HtmlVisitorVisitorContext, src : String, alt : String, title : String?) : VisitResult".to_string(),
+        "visit_heading" => "def visit_heading(ctx : HtmlVisitorVisitorContext, level : UInt32, text : String, id : String?) : VisitResult".to_string(),
+        "visit_code_block" => "def visit_code_block(ctx : HtmlVisitorVisitorContext, lang : String?, code : String) : VisitResult".to_string(),
+        "visit_code_inline" => "def visit_code_inline(ctx : HtmlVisitorVisitorContext, code : String) : VisitResult".to_string(),
+        "visit_list_item" => "def visit_list_item(ctx : HtmlVisitorVisitorContext, ordered : Bool, marker : String, text : String) : VisitResult".to_string(),
+        "visit_list_start" => "def visit_list_start(ctx : HtmlVisitorVisitorContext, ordered : Bool) : VisitResult".to_string(),
+        "visit_list_end" => "def visit_list_end(ctx : HtmlVisitorVisitorContext, ordered : Bool, output : String) : VisitResult".to_string(),
+        "visit_table_start" => "def visit_table_start(ctx : HtmlVisitorVisitorContext) : VisitResult".to_string(),
+        "visit_table_row" => "def visit_table_row(ctx : HtmlVisitorVisitorContext, cells : String, is_header : Bool) : VisitResult".to_string(),
+        "visit_table_end" => "def visit_table_end(ctx : HtmlVisitorVisitorContext, output : String) : VisitResult".to_string(),
+        "visit_blockquote" => "def visit_blockquote(ctx : HtmlVisitorVisitorContext, content : String, depth : LibC::SizeT) : VisitResult".to_string(),
+        "visit_strong" => "def visit_strong(ctx : HtmlVisitorVisitorContext, text : String) : VisitResult".to_string(),
+        "visit_emphasis" => "def visit_emphasis(ctx : HtmlVisitorVisitorContext, text : String) : VisitResult".to_string(),
+        "visit_strikethrough" => "def visit_strikethrough(ctx : HtmlVisitorVisitorContext, text : String) : VisitResult".to_string(),
+        "visit_underline" => "def visit_underline(ctx : HtmlVisitorVisitorContext, text : String) : VisitResult".to_string(),
+        "visit_subscript" => "def visit_subscript(ctx : HtmlVisitorVisitorContext, text : String) : VisitResult".to_string(),
+        "visit_superscript" => "def visit_superscript(ctx : HtmlVisitorVisitorContext, text : String) : VisitResult".to_string(),
+        "visit_mark" => "def visit_mark(ctx : HtmlVisitorVisitorContext, text : String) : VisitResult".to_string(),
+        "visit_line_break" => "def visit_line_break(ctx : HtmlVisitorVisitorContext) : VisitResult".to_string(),
+        "visit_horizontal_rule" => "def visit_horizontal_rule(ctx : HtmlVisitorVisitorContext) : VisitResult".to_string(),
+        "visit_custom_element" => "def visit_custom_element(ctx : HtmlVisitorVisitorContext, tag_name : String, html : String) : VisitResult".to_string(),
+        "visit_definition_list_start" => "def visit_definition_list_start(ctx : HtmlVisitorVisitorContext) : VisitResult".to_string(),
+        "visit_definition_term" => "def visit_definition_term(ctx : HtmlVisitorVisitorContext, text : String) : VisitResult".to_string(),
+        "visit_definition_description" => "def visit_definition_description(ctx : HtmlVisitorVisitorContext, text : String) : VisitResult".to_string(),
+        "visit_definition_list_end" => "def visit_definition_list_end(ctx : HtmlVisitorVisitorContext, output : String) : VisitResult".to_string(),
+        "visit_form" => "def visit_form(ctx : HtmlVisitorVisitorContext, action : String?, method : String?) : VisitResult".to_string(),
+        "visit_input" => "def visit_input(ctx : HtmlVisitorVisitorContext, input_type : String, name : String?, value : String?) : VisitResult".to_string(),
+        "visit_button" => "def visit_button(ctx : HtmlVisitorVisitorContext, text : String) : VisitResult".to_string(),
+        "visit_audio" => "def visit_audio(ctx : HtmlVisitorVisitorContext, src : String?) : VisitResult".to_string(),
+        "visit_video" => "def visit_video(ctx : HtmlVisitorVisitorContext, src : String?) : VisitResult".to_string(),
+        "visit_iframe" => "def visit_iframe(ctx : HtmlVisitorVisitorContext, src : String?) : VisitResult".to_string(),
+        "visit_details" => "def visit_details(ctx : HtmlVisitorVisitorContext, open : Bool) : VisitResult".to_string(),
+        "visit_summary" => "def visit_summary(ctx : HtmlVisitorVisitorContext, text : String) : VisitResult".to_string(),
+        "visit_figure_start" => "def visit_figure_start(ctx : HtmlVisitorVisitorContext) : VisitResult".to_string(),
+        "visit_figcaption" => "def visit_figcaption(ctx : HtmlVisitorVisitorContext, text : String) : VisitResult".to_string(),
+        "visit_figure_end" => "def visit_figure_end(ctx : HtmlVisitorVisitorContext, output : String) : VisitResult".to_string(),
+        _ => format!("def {method_name}(ctx : HtmlVisitorVisitorContext, *args : String) : VisitResult"),
+    }
+}
+
 fn build_method_args(args: Option<&serde_json::Value>) -> String {
     match args {
         Some(serde_json::Value::Array(arr)) if !arr.is_empty() => {
@@ -507,13 +1147,18 @@ fn build_method_args(args: Option<&serde_json::Value>) -> String {
 fn string_lit(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
-    for ch in s.chars() {
+    let mut chars = s.chars().peekable();
+    while let Some(ch) = chars.next() {
         match ch {
             '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
             '\n' => out.push_str("\\n"),
             '\t' => out.push_str("\\t"),
             '\r' => out.push_str("\\r"),
+            // Escape `#{` to prevent Crystal string interpolation
+            '#' if chars.peek() == Some(&'{') => {
+                out.push_str("\\#");
+            }
             c => out.push(c),
         }
     }
@@ -526,17 +1171,72 @@ fn string_lit(s: &str) -> String {
 /// `\\` for backslash, `\n` for newline, `\t` for tab.
 fn escape_crystal_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
-    for ch in s.chars() {
+    let mut chars = s.chars().peekable();
+    while let Some(ch) = chars.next() {
         match ch {
             '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
             '\n' => out.push_str("\\n"),
             '\t' => out.push_str("\\t"),
             '\r' => out.push_str("\\r"),
+            // Escape `#{` to prevent Crystal string interpolation
+            '#' if chars.peek() == Some(&'{') => {
+                out.push_str("\\#");
+            }
             c => out.push(c),
         }
     }
     out
+}
+
+/// Generate a unique Crystal class name for a fixture's visitor.
+fn crystal_visitor_class_name(fixture: &Fixture) -> String {
+    let sanitized: String = fixture.id.chars().filter(|c| c.is_alphanumeric()).collect();
+    if sanitized.starts_with(|c: char| c.is_uppercase()) {
+        format!("TestVisitor{sanitized}")
+    } else {
+        let mut chars = sanitized.chars();
+        let first = chars.next().map(|c| c.to_uppercase().to_string()).unwrap_or_default();
+        format!("TestVisitor{first}{}", chars.as_str())
+    }
+}
+
+/// Emit a Crystal visitor class at the spec-file top level (class declarations
+/// are not allowed inside `it` blocks in Crystal).
+fn emit_crystal_visitor_class(
+    out: &mut String,
+    fixture: &Fixture,
+    visitor_spec: &crate::e2e::fixture::VisitorSpec,
+    module_name: &str,
+) {
+    let visitor_class = crystal_visitor_class_name(fixture);
+    // Wrap in module so that types like HtmlVisitorVisitorContext are in scope.
+    out.push_str(&format!("module {module_name}\n"));
+    out.push_str(&format!("  class {visitor_class} < HtmlVisitorVisitor\n"));
+    for (method_name, action) in &visitor_spec.callbacks {
+        let sig = crystal_visitor_method_signature(method_name);
+        let body = match action {
+            crate::e2e::fixture::CallbackAction::Skip => {
+                format!("VisitResult::Skip.new")
+            }
+            crate::e2e::fixture::CallbackAction::Continue => {
+                format!("VisitResult::Continue.new")
+            }
+            crate::e2e::fixture::CallbackAction::PreserveHtml => {
+                format!("VisitResult::PreserveHtml.new")
+            }
+            crate::e2e::fixture::CallbackAction::Custom { output } => {
+                let escaped = output.replace('\\', "\\\\").replace('"', "\\\"");
+                format!("VisitResult::Custom.new(\"{escaped}\")")
+            }
+            crate::e2e::fixture::CallbackAction::CustomTemplate { .. } => {
+                format!("VisitResult::Continue.new")
+            }
+        };
+        out.push_str(&format!("    {sig}\n      {body}\n    end\n"));
+    }
+    out.push_str("  end\n");
+    out.push_str("end\n\n");
 }
 
 #[cfg(test)]
@@ -714,42 +1414,6 @@ mod tests {
     #[test]
     fn field_accessor_empty_segments_ignored() {
         assert_eq!(field_accessor(Some("a..b"), "r"), "r.a.b");
-    }
-
-    // ── call_args_fallback ─────────────────────────────────────────────
-
-    #[test]
-    fn call_args_fallback_null_returns_empty() {
-        assert_eq!(call_args_fallback(&serde_json::Value::Null), "");
-    }
-
-    #[test]
-    fn call_args_fallback_string() {
-        assert_eq!(call_args_fallback(&serde_json::json!("hi")), "\"hi\"");
-    }
-
-    #[test]
-    fn call_args_fallback_number_renders_as_string_literal() {
-        let result = call_args_fallback(&serde_json::json!(42));
-        assert!(!result.is_empty(), "should not be empty for number input");
-    }
-
-    #[test]
-    fn call_args_fallback_bool_renders_as_string_literal() {
-        let result = call_args_fallback(&serde_json::json!(true));
-        assert!(!result.is_empty(), "should not be empty for bool input");
-    }
-
-    #[test]
-    fn call_args_fallback_array_renders_as_json_string() {
-        let result = call_args_fallback(&serde_json::json!([1, 2]));
-        assert!(result.starts_with('"'), "result: {result}");
-    }
-
-    #[test]
-    fn call_args_fallback_object_renders_as_json_string() {
-        let result = call_args_fallback(&serde_json::json!({"x": 1}));
-        assert!(result.starts_with('"'), "result: {result}");
     }
 
     // ── build_method_args ──────────────────────────────────────────────

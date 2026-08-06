@@ -226,10 +226,12 @@ fn fixture_with_assertions_emits_real_example() {
         .expect("generate");
     let spec = file(&files, "spec/smoke_spec.cr").expect("category spec emitted");
 
-    // Real example that calls the configured function with the input arg.
+    // Real example that calls the configured function. With no arg mappings
+    // configured, no positional args are passed (typed Crystal methods use
+    // named params from `[crates.e2e.call.args]`, not raw fixture input).
     assert!(spec.contains("it \"fixture shouts\" do"), "spec: {spec}");
-    assert!(spec.contains("__result = Demo.convert(\"hi\")"), "call site: {spec}");
-    assert!(spec.contains("__result.should eq(\"HELLO\")"), "equals assert: {spec}");
+    assert!(spec.contains("__result = Demo.convert()"), "call site: {spec}");
+    assert!(spec.contains("__result.to_s.strip.should eq(\"HELLO\")"), "equals assert: {spec}");
     assert!(
         spec.contains("__result.to_s.should_not be_empty"),
         "not_empty assert: {spec}"
@@ -270,7 +272,7 @@ fn field_path_assertion_accesses_nested_getter() {
         .unwrap();
     let spec = file(&files, "spec/smoke_spec.cr").unwrap();
     assert!(
-        spec.contains("__result.name.should eq(\"Ada\")"),
+        spec.contains("__result.name.to_s.strip.should eq(\"Ada\")"),
         "field equals: {spec}"
     );
     assert!(
@@ -293,7 +295,7 @@ fn error_assertion_wraps_call_in_expect_raises() {
         .unwrap();
     let spec = file(&files, "spec/smoke_spec.cr").unwrap();
     assert!(spec.contains("expect_raises(Exception) do"), "error wrap: {spec}");
-    assert!(spec.contains("Demo.convert(\"bad\")"), "error call: {spec}");
+    assert!(spec.contains("Demo.convert()"), "error call: {spec}");
     assert!(
         !spec.contains("__result ="),
         "error path must not assign result: {spec}"
@@ -339,11 +341,11 @@ fn contains_all_and_any_assertions() {
     let spec = file(&files, "spec/smoke_spec.cr").unwrap();
     // contains_all → one `contain` expectation per value.
     assert!(
-        spec.contains("__result.should contain(\"a\")"),
+        spec.contains("__result.to_s.should contain(\"a\")"),
         "contains_all a: {spec}"
     );
     assert!(
-        spec.contains("__result.should contain(\"b\")"),
+        spec.contains("__result.to_s.should contain(\"b\")"),
         "contains_all b: {spec}"
     );
     // contains_any → a single boolean any-of expectation on the field.
@@ -544,11 +546,11 @@ trait = "Store"
         "unregister call: {spec}"
     );
     assert!(spec.contains("__result = Demo.convert()"), "function call: {spec}");
-    assert!(spec.contains("__result.should eq(\"done\")"), "assertion: {spec}");
+    assert!(spec.contains("__result.to_s.strip.should eq(\"done\")"), "assertion: {spec}");
 }
 
 #[test]
-fn empty_args_in_e2e_config_falls_back_to_single_input_arg() {
+fn empty_args_in_e2e_config_emits_no_positional_arg() {
     let config = e2e_config();
     let mut fx = fixture("plain");
     fx.input = serde_json::json!("hello world");
@@ -564,8 +566,8 @@ fn empty_args_in_e2e_config_falls_back_to_single_input_arg() {
     let spec = file(&files, "spec/smoke_spec.cr").unwrap();
 
     assert!(
-        spec.contains("Demo.convert(\"hello world\")"),
-        "fallback single arg: {spec}"
+        spec.contains("Demo.convert()"),
+        "no arg mappings -> no positional arg: {spec}"
     );
 }
 
@@ -605,7 +607,7 @@ output = "e2e"
     let spec = file(&files, "spec/smoke_spec.cr").unwrap();
 
     assert!(
-        spec.contains("Demo.custom_convert(\"data\")"),
+        spec.contains("Demo.custom_convert()"),
         "custom function: {spec}"
     );
 }
@@ -1017,11 +1019,11 @@ result_var = "my_result"
 
     let spec = file(&files, "spec/smoke_spec.cr").unwrap();
     assert!(
-        spec.contains("my_result = Demo.convert(\"data\")"),
+        spec.contains("my_result = Demo.convert()"),
         "should use custom result var: {spec}"
     );
     assert!(
-        spec.contains("my_result.should eq(\"ok\")"),
+        spec.contains("my_result.to_s.strip.should eq(\"ok\")"),
         "assertion should use custom result var: {spec}"
     );
     assert!(!spec.contains("__result"), "should not use default result var: {spec}");
@@ -1092,7 +1094,7 @@ returns_void = true
 
     let spec = file(&files, "spec/smoke_spec.cr").unwrap();
     assert!(
-        spec.contains("Demo.validate(\"data\")"),
+        spec.contains("Demo.validate()"),
         "void call should emit: {spec}"
     );
     assert!(
