@@ -443,8 +443,8 @@ fn test_sync_function_ffi() {
     );
     assert!(body.contains("CString"), "FFI should use CString for returning strings");
     assert!(
-        body.contains("update_last_error"),
-        "FFI should call update_last_error on error"
+        body.contains("set_last_error"),
+        "FFI should call set_last_error on error"
     );
 }
 

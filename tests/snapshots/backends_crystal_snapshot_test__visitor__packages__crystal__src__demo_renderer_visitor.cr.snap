@@ -1,5 +1,6 @@
 ---
 source: tests/backends_crystal_snapshot_test.rs
+assertion_line: 440
 expression: "&visitor.content"
 ---
 # Visitor trait bridge for `Renderer` — a Crystal object implementing the Rust
@@ -21,7 +22,7 @@ lib LibDemo
 
   fun renderer_visitor_create = demo_visitor_create(callbacks : RendererVisitorCallbacks*) : RendererVisitorHandle
   fun renderer_visitor_free = demo_visitor_free(handle : RendererVisitorHandle) : Void
-  fun renderer_options_set_visitor = demo_options_set_visitor_handle(options : Void*, handle : RendererVisitorHandle) : Void
+  fun renderer_options_set_visitor = demo_options_set_visitor(options : Void*, handle : RendererVisitorHandle) : Void
 end
 
 module Demo
@@ -29,7 +30,7 @@ module Demo
   # Decoded visitor context passed to each callback.
   struct RendererVisitorContext
     getter depth : Int32
-    getter tag_name : String
+    getter tag_name : String?
     def initialize(@depth, @tag_name)
     end
   end
@@ -38,7 +39,7 @@ module Demo
   # `WalkDecision::Continue`.
   abstract class RendererVisitor
     # Visit a text node.
-    def visit_text(ctx : RendererVisitorContext, text : String) : WalkDecision
+    def visit_text(ctx : RendererVisitorContext, text : String?) : WalkDecision
       WalkDecision::Continue
     end
   end
@@ -51,16 +52,24 @@ module Demo
     callbacks = LibDemo::RendererVisitorCallbacks.new
     callbacks.user_data = boxed
     callbacks.visit_text = ->(ctx : LibDemo::RendererContext*, user_data : Void*, text : LibC::Char*, out_custom : LibC::Char**, out_len : LibC::SizeT*) do
-      visitor = Box(RendererVisitor).unbox(user_data)
-      raw = ctx.value
-      context = RendererVisitorContext.new(raw.depth, String.new(raw.tag_name))
-      text_value = String.new(text)
-      decision = visitor.visit_text(context, text_value)
-      case decision
-      when WalkDecision::Continue then 0
-      when WalkDecision::SkipChildren then 1
-      when WalkDecision::Stop then 2
-      else 0
+      begin
+        visitor = Box(RendererVisitor).unbox(user_data)
+        raw = ctx.value
+        context = RendererVisitorContext.new(raw.depth, raw.tag_name.null? ? nil : String.new(raw.tag_name))
+        text_value = text.null? ? nil : String.new(text)
+        decision = visitor.visit_text(context, text_value)
+        case decision
+        when WalkDecision::Continue then 0
+        when WalkDecision::SkipChildren then 1
+        when WalkDecision::Stop then 2
+        else 0
+        end
+      rescue e
+        STDERR.puts "[visitor callback error] #{e}"
+        STDERR.puts "[visitor callback backtrace] #{e.backtrace.first(3).join("\n")}" if e.backtrace
+        out_custom.value = Pointer(LibC::Char).null
+        out_len.value = LibC::SizeT.new(0)
+        0
       end
     end
     LibDemo.renderer_visitor_create(pointerof(callbacks))

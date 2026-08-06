@@ -78,15 +78,19 @@ sources = ["src/lib.rs"]
 }
 
 #[test]
-fn emits_single_source_file_at_expected_path() {
+fn emits_source_file_and_shard_yml() {
     let api = api_with(vec![make_fn("noop", vec![], TypeRef::Unit, None)]);
     let files = CrystalBackend.generate_bindings(&api, &make_config()).unwrap();
-    assert_eq!(files.len(), 1);
-    assert_eq!(files[0].path.display().to_string(), "packages/crystal/src/demo.cr");
-    assert!(
-        files[0].generated_header,
-        "binding file should carry the generated header"
-    );
+    assert_eq!(files.len(), 2, "expected main .cr + shard.yml, got {files:#?}");
+
+    let main = files.iter().find(|f| f.path.display().to_string().ends_with(".cr"))
+        .expect("expected a .cr binding file");
+    assert!(main.generated_header, "binding file should carry the generated header");
+
+    let shard = files.iter().find(|f| f.path.display().to_string().ends_with("shard.yml"))
+        .expect("expected a shard.yml");
+    assert!(!shard.generated_header, "shard.yml should NOT carry the generated header");
+    assert!(shard.content.contains("name: demo"), "shard.yml should contain the package name");
 }
 
 #[test]
@@ -588,8 +592,12 @@ fn duration_with_error_still_returns_c_string() {
     let content = &CrystalBackend.generate_bindings(&api, &make_config()).unwrap()[0].content;
 
     assert!(
-        content.contains("fun risky_delay = demo_risky_delay(ms : UInt64) : LibC::Char*"),
-        "Duration param is scalar, error return is C string: {content}"
+        content.contains("fun risky_delay = demo_risky_delay(ms : UInt64) : UInt64"),
+        "fallible scalar return is by-value + last_error_code, got: {content}"
+    );
+    assert!(
+        content.contains("last_error_code"),
+        "fallible scalar return must check last_error_code: {content}"
     );
 }
 
@@ -639,5 +647,502 @@ fn bytes_fallible_returns_raw_c_string() {
     assert!(
         content.contains("fun fetch_bytes = demo_fetch_bytes(key : LibC::Char*) : LibC::Char*"),
         "fallible Bytes return still uses LibC::Char*: {content}"
+    );
+}
+
+// ── F12: struct-return code path in gen_call_body ────────────────────────
+
+fn make_type(name: &str, fields: Vec<alef::core::ir::FieldDef>, is_opaque: bool) -> alef::core::ir::TypeDef {
+    alef::core::ir::TypeDef {
+        name: name.to_string(),
+        rust_path: format!("demo::{name}"),
+        original_rust_path: String::new(),
+        fields,
+        methods: vec![],
+        is_opaque,
+        is_clone: true,
+        is_copy: false,
+        doc: String::new(),
+        cfg: None,
+        is_trait: false,
+        has_default: false,
+        has_stripped_cfg_fields: false,
+        is_return_type: false,
+        serde_rename_all: None,
+        has_serde: true,
+        super_traits: vec![],
+        binding_excluded: false,
+        binding_exclusion_reason: None,
+        is_variant_wrapper: false,
+        has_lifetime_params: false,
+        has_private_fields: false,
+        version: Default::default(),
+    }
+}
+
+fn make_field(name: &str, ty: TypeRef) -> alef::core::ir::FieldDef {
+    alef::core::ir::FieldDef {
+        name: name.to_string(),
+        ty,
+        optional: false,
+        default: None,
+        doc: String::new(),
+        sanitized: false,
+        is_boxed: false,
+        type_rust_path: None,
+        cfg: None,
+        typed_default: None,
+        core_wrapper: alef::core::ir::CoreWrapper::None,
+        vec_inner_core_wrapper: alef::core::ir::CoreWrapper::None,
+        newtype_wrapper: None,
+        serde_rename: None,
+        serde_flatten: false,
+        binding_excluded: false,
+        binding_exclusion_reason: None,
+        original_type: None,
+    }
+}
+
+fn api_with_types(functions: Vec<FunctionDef>, types: Vec<alef::core::ir::TypeDef>) -> ApiSurface {
+    ApiSurface {
+        crate_name: "demo".into(),
+        version: "0.1.0".into(),
+        types,
+        functions,
+        enums: vec![],
+        errors: vec![],
+        excluded_type_paths: ::std::collections::HashMap::new(),
+        excluded_trait_names: ::std::collections::HashSet::new(),
+        services: vec![],
+        handler_contracts: vec![],
+        unsupported_public_items: Vec::new(),
+    }
+}
+
+#[test]
+fn struct_return_uses_to_json_free_pattern() {
+    let config_ty = make_type("Config", vec![make_field("value", TypeRef::Primitive(PrimitiveType::I32))], false);
+    let api = api_with_types(
+        vec![make_fn(
+            "build",
+            vec![make_param("cfg", TypeRef::Named("Config".to_string()))],
+            TypeRef::Named("Config".to_string()),
+            Some("DemoError"),
+        )],
+        vec![config_ty],
+    );
+    let content = &CrystalBackend.generate_bindings(&api, &make_config()).unwrap()[0].content;
+
+    // The lib fun should use Config* (struct pointer) not LibC::Char*
+    assert!(
+        content.contains("fun build = demo_build(cfg : Config*) : Config*"),
+        "struct param/return should use Config* in lib fun, got: {content}"
+    );
+
+    // The wrapper should contain to_json/free for the return path
+    assert!(
+        content.contains("__json_ptr = LibDemo.config_to_json(__ptr)"),
+        "return should use config_to_json helper: {content}"
+    );
+    assert!(
+        content.contains("LibDemo.config_free(__ptr)"),
+        "return should free the struct pointer: {content}"
+    );
+    assert!(
+        content.contains("LibDemo.free_string(__json_ptr)"),
+        "return should free the JSON string: {content}"
+    );
+    assert!(
+        content.contains("Config.from_json(__json)"),
+        "return should parse JSON into Config: {content}"
+    );
+
+    // The wrapper param setup should use from_json/free
+    assert!(
+        content.contains("__handle_cfg = LibDemo.config_from_json(cfg.to_json)"),
+        "struct param should use from_json helper: {content}"
+    );
+    assert!(
+        content.contains("LibDemo.config_free(__handle_cfg)"),
+        "struct param should free after call: {content}"
+    );
+}
+
+#[test]
+fn struct_return_without_error_still_uses_to_json() {
+    let config_ty = make_type("Config", vec![make_field("value", TypeRef::Primitive(PrimitiveType::I32))], false);
+    let api = api_with_types(
+        vec![make_fn(
+            "build",
+            vec![make_param("cfg", TypeRef::Named("Config".to_string()))],
+            TypeRef::Named("Config".to_string()),
+            None,
+        )],
+        vec![config_ty],
+    );
+    let content = &CrystalBackend.generate_bindings(&api, &make_config()).unwrap()[0].content;
+
+    // Infallible struct return: the lib fun returns Config* directly (no error C string)
+    assert!(
+        content.contains("fun build = demo_build(cfg : Config*) : Config*"),
+        "infallible struct return should use Config* in lib fun: {content}"
+    );
+
+    // Should still use to_json/free pattern
+    assert!(
+        content.contains("__json_ptr = LibDemo.config_to_json"),
+        "infallible return should still use config_to_json: {content}"
+    );
+}
+
+#[test]
+fn struct_param_only_no_struct_return_uses_from_json() {
+    let config_ty = make_type("Config", vec![make_field("value", TypeRef::Primitive(PrimitiveType::I32))], false);
+    let api = api_with_types(
+        vec![make_fn(
+            "apply",
+            vec![make_param("cfg", TypeRef::Named("Config".to_string()))],
+            TypeRef::String,
+            None,
+        )],
+        vec![config_ty],
+    );
+    let content = &CrystalBackend.generate_bindings(&api, &make_config()).unwrap()[0].content;
+
+    // The lib fun: struct param is Config*, return is String (via LibC::Char*)
+    assert!(
+        content.contains("fun apply = demo_apply(cfg : Config*) : LibC::Char*"),
+        "struct param with string return: {content}"
+    );
+
+    // Param setup uses from_json/free
+    assert!(
+        content.contains("__handle_cfg = LibDemo.config_from_json(cfg.to_json)"),
+        "struct param should use from_json: {content}"
+    );
+    assert!(
+        content.contains("LibDemo.config_free(__handle_cfg)"),
+        "struct param should free: {content}"
+    );
+
+    // The lib call should pass the handle, not cfg directly
+    assert!(
+        content.contains("LibDemo.apply(__handle_cfg)"),
+        "call should pass handle variable: {content}"
+    );
+}
+
+// ── F13: struct-param code path in gen_wrapper_body ──────────────────────
+
+#[test]
+fn struct_param_uses_from_json_in_wrapper_body() {
+    let config_ty = make_type("Config", vec![make_field("value", TypeRef::Primitive(PrimitiveType::I32))], false);
+    let api = api_with_types(
+        vec![make_fn(
+            "process",
+            vec![make_param("config", TypeRef::Named("Config".to_string()))],
+            TypeRef::Unit,
+            Some("E"),
+        )],
+        vec![config_ty],
+    );
+    let content = &CrystalBackend.generate_bindings(&api, &make_config()).unwrap()[0].content;
+
+    assert!(
+        content.contains("fun process = demo_process(config : Config*) : Void"),
+        "struct param with fallible unit return (by-value + last_error_code): {content}"
+    );
+
+    // Verify from_json/free setup
+    assert!(
+        content.contains("__handle_config = LibDemo.config_from_json(config.to_json)"),
+        "struct param from_json: {content}"
+    );
+    assert!(
+        content.contains("LibDemo.config_free(__handle_config)"),
+        "struct param free: {content}"
+    );
+}
+
+#[test]
+fn multiple_struct_params_each_get_from_json() {
+    let config_ty = make_type("Config", vec![make_field("value", TypeRef::Primitive(PrimitiveType::I32))], false);
+    let opts_ty = make_type("Options", vec![make_field("verbose", TypeRef::Primitive(PrimitiveType::Bool))], false);
+    let api = api_with_types(
+        vec![make_fn(
+            "run",
+            vec![
+                make_param("cfg", TypeRef::Named("Config".to_string())),
+                make_param("opts", TypeRef::Named("Options".to_string())),
+            ],
+            TypeRef::Unit,
+            None,
+        )],
+        vec![config_ty, opts_ty],
+    );
+    let content = &CrystalBackend.generate_bindings(&api, &make_config()).unwrap()[0].content;
+
+    // lib fun uses both struct pointers
+    assert!(
+        content.contains("fun run = demo_run(cfg : Config*, opts : Options*)"),
+        "multiple struct params: {content}"
+    );
+
+    // Each param gets its own handle
+    assert!(
+        content.contains("__handle_cfg = LibDemo.config_from_json(cfg.to_json)"),
+        "first struct param from_json: {content}"
+    );
+    assert!(
+        content.contains("__handle_opts = LibDemo.options_from_json(opts.to_json)"),
+        "second struct param from_json: {content}"
+    );
+    assert!(
+        content.contains("LibDemo.config_free(__handle_cfg)"),
+        "first struct param free: {content}"
+    );
+    assert!(
+        content.contains("LibDemo.options_free(__handle_opts)"),
+        "second struct param free: {content}"
+    );
+
+    // The lib call passes both handles
+    assert!(
+        content.contains("LibDemo.run(__handle_cfg, __handle_opts)"),
+        "call passes both handles: {content}"
+    );
+}
+
+#[test]
+fn optional_named_param_still_uses_json_string_abi() {
+    let config_ty = make_type("Config", vec![make_field("value", TypeRef::Primitive(PrimitiveType::I32))], false);
+    let api = api_with_types(
+        vec![make_fn(
+            "build",
+            vec![make_param("cfg", TypeRef::Optional(Box::new(TypeRef::Named("Config".to_string()))))],
+            TypeRef::Named("Config".to_string()),
+            Some("E"),
+        )],
+        vec![config_ty],
+    );
+    let content = &CrystalBackend.generate_bindings(&api, &make_config()).unwrap()[0].content;
+
+    // Optional(Named(...)) is NOT matched by the direct TypeRef::Named pattern,
+    // so it should fall through to JSON-string ABI for the param: cfg.to_json
+    // is passed directly, not via a __handle_cfg from_json/free pattern.
+    assert!(
+        !content.contains("__handle_cfg = LibDemo.config_from_json"),
+        "Optional(Config) param should NOT use __handle_cfg from_json (F3): {content}"
+    );
+    assert!(
+        content.contains("LibDemo.build(cfg.to_json)"),
+        "Optional(Config) param should remain JSON-encoded: {content}"
+  );
+}
+
+// ── F3: Optional(Named(...)) struct return ──────────────────────────────
+
+#[test]
+fn fallible_optional_struct_return_uses_json_string_abi() {
+    // Fallible + Optional(Named) cannot use struct-pointer ABI because
+    // null could mean error or None — indistinguishable. Must use JSON-string ABI.
+    let config_ty = make_type("Config", vec![make_field("value", TypeRef::Primitive(PrimitiveType::I32))], false);
+    let api = api_with_types(
+        vec![make_fn(
+            "find",
+            vec![make_param("key", TypeRef::String)],
+            TypeRef::Optional(Box::new(TypeRef::Named("Config".to_string()))),
+            Some("E"),
+        )],
+        vec![config_ty],
+    );
+    let content = &CrystalBackend.generate_bindings(&api, &make_config()).unwrap()[0].content;
+
+    // Fallible optional struct return uses LibC::Char* (JSON-string ABI)
+    assert!(
+        content.contains("fun find = demo_find(key : LibC::Char*) : LibC::Char*"),
+        "fallible optional struct return should use LibC::Char* in lib fun: {content}"
+    );
+    // config_to_json/config_free ARE declared as helper fun in the lib block,
+    // but the wrapper method body must NOT use the struct-pointer ABI pattern.
+    // Verify the method uses JSON-string ABI: free_string, not config_free.
+    assert!(
+        content.contains("LibDemo.free_string(__ptr)"),
+        "fallible optional struct return should use free_string (JSON ABI): {content}"
+    );
+    assert!(
+        !content.contains("LibDemo.find(__handle"),
+        "fallible optional struct return should NOT use __handle pattern: {content}"
+    );
+}
+
+#[test]
+fn infallible_optional_struct_return_uses_struct_pointer_abi() {
+    // Infallible + Optional(Named) CAN use struct-pointer ABI because
+    // null only means None (no error ambiguity).
+    let config_ty = make_type("Config", vec![make_field("value", TypeRef::Primitive(PrimitiveType::I32))], false);
+    let api = api_with_types(
+        vec![make_fn(
+            "find",
+            vec![make_param("key", TypeRef::String)],
+            TypeRef::Optional(Box::new(TypeRef::Named("Config".to_string()))),
+            None,
+        )],
+        vec![config_ty],
+    );
+    let content = &CrystalBackend.generate_bindings(&api, &make_config()).unwrap()[0].content;
+
+    // Infallible optional struct return: lib fun uses Config* (nullable struct pointer)
+    assert!(
+        content.contains("fun find = demo_find(key : LibC::Char*) : Config*"),
+        "infallible optional struct return should use Config*: {content}"
+    );
+
+    // Should return nil on null, to_json/free for non-null
+    assert!(
+        content.contains("return nil if __ptr.null?"),
+        "should return nil on null: {content}"
+    );
+    assert!(
+        content.contains("__json_ptr = LibDemo.config_to_json(__ptr)"),
+        "should use config_to_json: {content}"
+    );
+    assert!(
+        content.contains("LibDemo.config_free(__ptr)"),
+        "should free the struct pointer: {content}"
+    );
+    assert!(
+        content.contains("Config.from_json(__json)"),
+        "should parse Config from JSON: {content}"
+    );
+}
+
+// ── F5: duplicate getter lines ──────────────────────────────────────────
+
+#[test]
+fn struct_getter_appears_once_per_field() {
+    let config_ty = make_type("Config", vec![make_field("value", TypeRef::Primitive(PrimitiveType::I32))], false);
+    let api = api_with_types(
+        vec![make_fn("noop", vec![], TypeRef::Unit, None)],
+        vec![config_ty],
+    );
+    let content = &CrystalBackend.generate_bindings(&api, &make_config()).unwrap()[0].content;
+
+    // Each getter should appear exactly once (no duplicates).
+    let getter_value_count = content.matches("getter value : Int32").count();
+    assert_eq!(
+        getter_value_count, 1,
+        "getter value : Int32 should appear exactly once, not {getter_value_count}: {content}"
+    );
+}
+
+#[test]
+fn struct_multiple_fields_each_getter_appears_once() {
+    let config_ty = make_type(
+        "Config",
+        vec![
+            make_field("value", TypeRef::Primitive(PrimitiveType::I32)),
+            make_field("label", TypeRef::String),
+            make_field("tag", TypeRef::Optional(Box::new(TypeRef::String))),
+        ],
+        false,
+    );
+    let api = api_with_types(
+        vec![make_fn("noop", vec![], TypeRef::Unit, None)],
+        vec![config_ty],
+    );
+    let content = &CrystalBackend.generate_bindings(&api, &make_config()).unwrap()[0].content;
+
+    assert_eq!(
+        content.matches("getter value : Int32").count(),
+        1,
+        "getter value appears once: {content}"
+    );
+    assert_eq!(
+        content.matches("getter label : String").count(),
+        1,
+        "getter label appears once: {content}"
+    );
+    assert_eq!(
+        content.matches("getter tag : String?").count(),
+        1,
+        "getter tag appears once: {content}"
+    );
+}
+
+// ── F4: default values for partial JSON ────────────────────────────────
+
+use alef::core::ir::DefaultValue;
+
+fn make_field_with_default(name: &str, ty: TypeRef, typed_default: Option<DefaultValue>) -> alef::core::ir::FieldDef {
+    let mut f = make_field(name, ty);
+    f.typed_default = typed_default;
+    f
+}
+
+#[test]
+fn struct_fields_with_defaults_emit_json_field_default_annotation() {
+    let config_ty = make_type(
+        "Config",
+        vec![
+            make_field_with_default("retries", TypeRef::Primitive(PrimitiveType::U32), Some(DefaultValue::IntLiteral(3))),
+            make_field_with_default("verbose", TypeRef::Primitive(PrimitiveType::Bool), Some(DefaultValue::BoolLiteral(false))),
+            make_field_with_default("name", TypeRef::String, Some(DefaultValue::StringLiteral("default".into()))),
+            make_field_with_default("rate", TypeRef::Primitive(PrimitiveType::F64), Some(DefaultValue::FloatLiteral(1.5))),
+            make_field("required_field", TypeRef::String), // no default
+        ],
+        false,
+    );
+    let api = api_with_types(
+        vec![make_fn("test", vec![], TypeRef::Unit, None)],
+        vec![config_ty],
+    );
+    let content = &CrystalBackend.generate_bindings(&api, &make_config()).unwrap()[0].content;
+
+    // Getter-initializer defaults (the working mechanism for partial JSON in
+    // Crystal 1.19 — `@[JSON::Field(default:)]` does not work with from_json).
+    assert!(content.contains("getter retries : UInt32 = 3"), "int default: {content}");
+    assert!(content.contains("getter verbose : Bool = false"), "bool default: {content}");
+    assert!(content.contains(r#"getter name : String = "default""#), "string default: {content}");
+    assert!(content.contains("getter rate : Float64 = 1.5"), "float default: {content}");
+    // Field without an explicit default still gets a type-based fallback
+    // (`String` → `""`) so partial JSON never leaves a non-nilable field unset.
+    assert!(content.contains("getter required_field : String = \"\""), "no-default field: {content}");
+}
+
+#[test]
+fn struct_field_without_default_does_not_emit_annotation() {
+    let config_ty = make_type(
+        "Config",
+        vec![make_field("value", TypeRef::Primitive(PrimitiveType::I32))],
+        false,
+    );
+    let api = api_with_types(
+        vec![make_fn("test", vec![], TypeRef::Unit, None)],
+        vec![config_ty],
+    );
+    let content = &CrystalBackend.generate_bindings(&api, &make_config()).unwrap()[0].content;
+
+    assert!(
+        !content.contains("@[JSON::Field(default:"),
+        "field without default should not emit annotation: {content}"
+    );
+}
+
+#[test]
+fn optional_field_with_default_does_not_emit_annotation() {
+    // Optional fields are already nilable (nil means absent), so no default needed.
+    let mut f = make_field("tag", TypeRef::Optional(Box::new(TypeRef::String)));
+    f.typed_default = Some(DefaultValue::None);
+    let config_ty = make_type("Config", vec![f], false);
+    let api = api_with_types(
+        vec![make_fn("test", vec![], TypeRef::Unit, None)],
+        vec![config_ty],
+    );
+    let content = &CrystalBackend.generate_bindings(&api, &make_config()).unwrap()[0].content;
+
+    assert!(
+        !content.contains("@[JSON::Field(default:"),
+        "optional field with None default should not emit annotation: {content}"
     );
 }

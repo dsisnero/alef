@@ -246,8 +246,9 @@ fn rich_api() -> ApiSurface {
 #[test]
 fn crystal_bindings_emit_lib_and_module() {
     let files = CrystalBackend.generate_bindings(&rich_api(), &make_config()).unwrap();
-    assert_eq!(files.len(), 1, "expected a single .cr source file");
-    let content = &files[0].content;
+    let cr = files.iter().find(|f| f.path.extension().map_or(false, |e| e == "cr"))
+        .expect("expected a .cr binding file");
+    let content = &cr.content;
 
     // Low-level C-ABI binding.
     assert!(content.contains("lib LibDemo"), "missing lib block: {content}");
@@ -519,8 +520,8 @@ fn visitor_bridge_emits_callback_layer() {
         "missing visitor_create symbol: {c}"
     );
     assert!(
-        c.contains("= demo_options_set_visitor_handle"),
-        "missing options_set_visitor_handle symbol: {c}"
+        c.contains("= demo_options_set_visitor"),
+        "missing options_set_visitor symbol: {c}"
     );
     // high-level: abstract visitor with the overridable method + result mapping.
     assert!(
@@ -528,7 +529,7 @@ fn visitor_bridge_emits_callback_layer() {
         "missing abstract visitor: {c}"
     );
     assert!(
-        c.contains("def visit_text(ctx : RendererVisitorContext, text : String) : WalkDecision"),
+        c.contains("def visit_text(ctx : RendererVisitorContext, text : String?) : WalkDecision"),
         "missing visitor method: {c}"
     );
     assert!(
@@ -547,15 +548,22 @@ fn visitor_bridge_typechecks_with_compiler() {
     let files = CrystalBackend
         .generate_bindings(&visitor_bridge_api(), &visitor_bridge_config())
         .unwrap();
-    // Concatenate the main binding + the visitor bridge (both reopen `lib LibDemo`),
-    // then define a concrete visitor and register it — forcing the compiler to
-    // type-check the trampolines, Box round-trip, context decode, and result map.
-    let mut src = String::new();
+    let dir = std::env::temp_dir().join(format!("alef_crystal_visitor_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let mut main_path = None;
     for f in &files {
-        src.push_str(&f.content);
-        src.push_str("\n\n");
+        if f.path.extension().map_or(false, |e| e == "cr") {
+            let name = f.path.file_name().expect("file name");
+            let out = dir.join(name);
+            std::fs::write(&out, &f.content).expect("write generated source");
+            if main_path.is_none() {
+                main_path = Some(out);
+            }
+        }
     }
-    src.push_str(
+    let main_path = main_path.expect("expected at least one .cr file");
+    let mut driver = String::new();
+    driver.push_str(
         "class MyRenderer < Demo::RendererVisitor\n\
          \x20 def visit_text(ctx : Demo::RendererVisitorContext, text : String) : Demo::WalkDecision\n\
          \x20   ctx.depth > 3 ? Demo::WalkDecision::Stop : Demo::WalkDecision::Continue\n\
@@ -564,23 +572,24 @@ fn visitor_bridge_typechecks_with_compiler() {
          handle = Demo.register_renderer_visitor(MyRenderer.new)\n\
          Demo.free_renderer_visitor(handle)\n",
     );
-
-    let dir = std::env::temp_dir().join(format!("alef_crystal_visitor_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("create temp dir");
-    let path = dir.join("demo.cr");
-    std::fs::write(&path, &src).expect("write source");
+    std::fs::write(&main_path, {
+        let mut content = std::fs::read_to_string(&main_path).expect("read back");
+        content.push_str("\n\n");
+        content.push_str(&driver);
+        content
+    }).expect("write combined source");
 
     let output = Command::new("crystal")
         .arg("build")
         .arg("--no-codegen")
-        .arg(&path)
+        .arg(&main_path)
         .output()
         .expect("run crystal build");
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success(),
-        "generated visitor bridge failed to type-check:\n--- source ---\n{src}\n--- crystal stderr ---\n{stderr}"
+        "generated visitor bridge failed to type-check:\n--- crystal stderr ---\n{stderr}"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -1282,12 +1291,22 @@ fn visitor_string_payload_result_typechecks() {
     if Command::new("crystal").arg("--version").output().is_err() {
         return;
     }
-    let mut src = String::new();
+    let dir = std::env::temp_dir().join(format!("alef_crystal_vpayload_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let mut main_path = None;
     for f in &files {
-        src.push_str(&f.content);
-        src.push_str("\n\n");
+        if f.path.extension().map_or(false, |e| e == "cr") {
+            let name = f.path.file_name().expect("file name");
+            let out = dir.join(name);
+            std::fs::write(&out, &f.content).expect("write generated source");
+            if main_path.is_none() {
+                main_path = Some(out);
+            }
+        }
     }
-    src.push_str(
+    let main_path = main_path.expect("expected at least one .cr file");
+    let mut driver = String::new();
+    driver.push_str(
         "class MyRenderer < Demo::RendererVisitor\n\
          \x20 def visit_text(ctx : Demo::RendererVisitorContext, text : String) : Demo::WalkDecision\n\
          \x20   Demo::WalkDecision::Custom.new(\"replacement\")\n\
@@ -1296,20 +1315,22 @@ fn visitor_string_payload_result_typechecks() {
          h = Demo.register_renderer_visitor(MyRenderer.new)\n\
          Demo.free_renderer_visitor(h)\n",
     );
-    let dir = std::env::temp_dir().join(format!("alef_crystal_vpayload_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("create temp dir");
-    let path = dir.join("demo.cr");
-    std::fs::write(&path, &src).expect("write source");
+    std::fs::write(&main_path, {
+        let mut content = std::fs::read_to_string(&main_path).expect("read back");
+        content.push_str("\n\n");
+        content.push_str(&driver);
+        content
+    }).expect("write combined source");
     let output = Command::new("crystal")
         .arg("build")
         .arg("--no-codegen")
-        .arg(&path)
+        .arg(&main_path)
         .output()
         .expect("run crystal build");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success(),
-        "string-payload visitor failed to type-check:\n--- source ---\n{src}\n--- crystal stderr ---\n{stderr}"
+        "string-payload visitor failed to type-check:\n--- crystal stderr ---\n{stderr}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -2278,12 +2299,23 @@ fn plugin_bridge_typechecks() {
     let files = CrystalBackend
         .generate_bindings(&plugin_bridge_api(), &plugin_bridge_config())
         .unwrap();
-    let mut src = String::new();
+    let dir = std::env::temp_dir().join(format!("alef_crystal_plugin_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let mut main_path = None;
     for f in &files {
-        src.push_str(&f.content);
-        src.push_str("\n\n");
+        if f.path.extension().map_or(false, |e| e == "cr") {
+            let name = f.path.file_name().expect("file name");
+            let out = dir.join(name);
+            std::fs::write(&out, &f.content).expect("write generated source");
+            if main_path.is_none() {
+                main_path = Some(out);
+            }
+        }
     }
-    src.push_str(
+    let main_path = main_path.expect("expected at least one .cr file");
+    // Append the test driver code to the main file (not the plugin file).
+    let mut driver = String::new();
+    driver.push_str(
         "class MyStore < Demo::Store\n\
          \x20 def fetch(key : String) : String\n\
          \x20   \"value-for-\" + key\n\
@@ -2292,20 +2324,22 @@ fn plugin_bridge_typechecks() {
          Demo.register_store(\"test\", MyStore.new)\n\
          Demo.unregister_store(\"test\")\n",
     );
-    let dir = std::env::temp_dir().join(format!("alef_crystal_plugin_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("create temp dir");
-    let path = dir.join("demo.cr");
-    std::fs::write(&path, &src).expect("write source");
+    std::fs::write(&main_path, {
+        let mut src = std::fs::read_to_string(&main_path).expect("read back");
+        src.push_str("\n\n");
+        src.push_str(&driver);
+        src
+    }).expect("write combined source");
     let output = Command::new("crystal")
         .arg("build")
         .arg("--no-codegen")
-        .arg(&path)
+        .arg(&main_path)
         .output()
         .expect("run crystal build");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success(),
-        "plugin bridge failed to type-check:\n{src}\n---\n{stderr}"
+        "plugin bridge failed to type-check:\n---\n{stderr}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -2319,18 +2353,18 @@ fn plugin_bridge_link_and_run_against_c_oracle() {
         return;
     }
 
-    // Generate all binding files (main + plugin bridge) and concatenate them.
     let files = CrystalBackend
         .generate_bindings(&plugin_bridge_api(), &plugin_bridge_config())
         .unwrap();
-    let mut binding = String::new();
-    for f in &files {
-        binding.push_str(&f.content);
-        binding.push_str("\n\n");
-    }
-
     let dir = std::env::temp_dir().join(format!("alef_crystal_plink_{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create temp dir");
+    for f in &files {
+        if f.path.extension().map_or(false, |e| e == "cr") {
+            let name = f.path.file_name().expect("file name");
+            let out = dir.join(name);
+            std::fs::write(&out, &f.content).expect("write generated source");
+        }
+    }
 
     // C oracle: a registry that stores the vtable + user_data, plus probes that
     // invoke the registered plugin's callbacks (simulating Rust calling in).
@@ -2401,8 +2435,10 @@ int32_t demo_probe_name(char* out, size_t cap) {
     );
 
     // Program: register a Crystal Store impl, then probe it through the vtable.
+    // Use `require "./demo"` instead of inlining so Crystal resolves `require`
+    // and merges reopened `lib LibDemo` blocks without duplicate items.
     let program = format!(
-        "{binding}\n\n\
+        "require \"./demo\"\n\n\
          lib LibDemo\n\
          \x20 fun probe_fetch = demo_probe_fetch(key : LibC::Char*, out : LibC::Char*, cap : LibC::SizeT) : Int32\n\
          \x20 fun probe_name = demo_probe_name(out : LibC::Char*, cap : LibC::SizeT) : Int32\n\
@@ -2427,13 +2463,13 @@ int32_t demo_probe_name(char* out, size_t cap) {
          raise \"unregister failed\" unless Demo.unregister_store(\"test\")\n\
          puts \"OK\"\n"
     );
-    std::fs::write(dir.join("demo.cr"), &program).expect("write demo.cr");
+    std::fs::write(dir.join("main.cr"), &program).expect("write main.cr");
 
     let dir_str = dir.to_string_lossy().to_string();
     let exe = dir.join("plugin_prog");
     let build = Command::new("crystal")
         .current_dir(&dir)
-        .args(["build", "demo.cr", "-o"])
+        .args(["build", "main.cr", "-o"])
         .arg(&exe)
         .arg("--link-flags")
         .arg(format!("-L{dir_str} -Wl,-rpath,{dir_str}"))
@@ -2484,14 +2520,15 @@ fn full_e2e_against_real_rust_cdylib() {
         None,
     )];
     let files = CrystalBackend.generate_bindings(&api, &plugin_bridge_config()).unwrap();
-    let mut binding = String::new();
-    for f in &files {
-        binding.push_str(&f.content);
-        binding.push_str("\n\n");
-    }
-
     let dir = std::env::temp_dir().join(format!("alef_crystal_rustffi_{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create temp dir");
+    for f in &files {
+        if f.path.extension().map_or(false, |e| e == "cr") {
+            let name = f.path.file_name().expect("file name");
+            let out = dir.join(name);
+            std::fs::write(&out, &f.content).expect("write generated source");
+        }
+    }
 
     // Real Rust FFI cdylib: greet returns a CString (Rust allocator); the plugin
     // registry stores the vtable and a probe invokes fetch through it.
@@ -2571,7 +2608,7 @@ pub unsafe extern "C" fn demo_probe_fetch(key: *const c_char) -> *mut c_char {
     );
 
     let program = format!(
-        "{binding}\n\n\
+        "require \"./demo\"\n\n\
          lib LibDemo\n\
          \x20 fun probe_fetch = demo_probe_fetch(key : LibC::Char*) : LibC::Char*\n\
          end\n\n\
@@ -2590,13 +2627,13 @@ pub unsafe extern "C" fn demo_probe_fetch(key: *const c_char) -> *mut c_char {
          Demo.unregister_store(\"test\")\n\
          puts \"OK\"\n"
     );
-    std::fs::write(dir.join("demo.cr"), &program).expect("write demo.cr");
+    std::fs::write(dir.join("main.cr"), &program).expect("write main.cr");
 
     let dir_str = dir.to_string_lossy().to_string();
     let exe = dir.join("e2e_prog");
     let build = Command::new("crystal")
         .current_dir(&dir)
-        .args(["build", "demo.cr", "-o"])
+        .args(["build", "main.cr", "-o"])
         .arg(&exe)
         .arg("--link-flags")
         .arg(format!("-L{dir_str} -Wl,-rpath,{dir_str}"))

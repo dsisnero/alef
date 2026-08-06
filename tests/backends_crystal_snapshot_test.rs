@@ -442,3 +442,232 @@ fn snapshot_visitor_bridge() {
         &visitor.content
     );
 }
+
+// ── F14: snapshot with struct-pointer ABI exercise ──────────────────────
+
+/// Build a rich API surface exercising the struct-pointer FFI ABI with multiple
+/// struct types, opaque handles, struct-heavy function signatures, and type
+/// methods — catching regressions in the struct-pointer codegen paths.
+fn make_rich_struct_api() -> ApiSurface {
+    ApiSurface {
+        crate_name: "demo".into(),
+        version: "0.1.0".into(),
+        types: vec![
+            TypeDef {
+                name: "Config".to_string(),
+                rust_path: "demo::Config".to_string(),
+                original_rust_path: String::new(),
+                fields: vec![
+                    make_field("value", TypeRef::Primitive(PrimitiveType::I32), false),
+                    make_field("label", TypeRef::String, false),
+                    make_field("tag", TypeRef::Optional(Box::new(TypeRef::String)), true),
+                ],
+                methods: vec![MethodDef {
+                    name: "merge".into(),
+                    params: vec![make_param("other", TypeRef::Named("Config".into()))],
+                    return_type: TypeRef::Named("Config".into()),
+                    is_async: false,
+                    is_static: false,
+                    error_type: None,
+                    doc: "Merge another config into this one.".into(),
+                    receiver: Some(ReceiverKind::RefMut),
+                    sanitized: false,
+                    trait_source: None,
+                    returns_ref: false,
+                    returns_cow: false,
+                    return_newtype_wrapper: None,
+                    has_default_impl: false,
+                    binding_excluded: false,
+                    binding_exclusion_reason: None,
+                    version: Default::default(),
+                }],
+                is_opaque: false,
+                is_clone: true,
+                is_copy: false,
+                doc: "Configuration parameters.".to_string(),
+                cfg: None,
+                is_trait: false,
+                has_default: false,
+                has_stripped_cfg_fields: false,
+                is_return_type: false,
+                serde_rename_all: None,
+                has_serde: true,
+                super_traits: vec![],
+                binding_excluded: false,
+                binding_exclusion_reason: None,
+                is_variant_wrapper: false,
+                has_lifetime_params: false,
+                has_private_fields: false,
+                version: Default::default(),
+            },
+            TypeDef {
+                name: "Options".to_string(),
+                rust_path: "demo::Options".to_string(),
+                original_rust_path: String::new(),
+                fields: vec![
+                    make_field("verbose", TypeRef::Primitive(PrimitiveType::Bool), false),
+                    make_field("max_retries", TypeRef::Primitive(PrimitiveType::U32), false),
+                ],
+                methods: vec![],
+                is_opaque: false,
+                is_clone: true,
+                is_copy: false,
+                doc: "Execution options.".to_string(),
+                cfg: None,
+                is_trait: false,
+                has_default: false,
+                has_stripped_cfg_fields: false,
+                is_return_type: false,
+                serde_rename_all: None,
+                has_serde: true,
+                super_traits: vec![],
+                binding_excluded: false,
+                binding_exclusion_reason: None,
+                is_variant_wrapper: false,
+                has_lifetime_params: false,
+                has_private_fields: false,
+                version: Default::default(),
+            },
+            TypeDef {
+                name: "Widget".to_string(),
+                rust_path: "demo::Widget".to_string(),
+                original_rust_path: String::new(),
+                fields: vec![
+                    make_field("id", TypeRef::Primitive(PrimitiveType::I64), false),
+                    make_field("kind", TypeRef::String, false),
+                ],
+                methods: vec![MethodDef {
+                    name: "render".into(),
+                    params: vec![
+                        make_param("cfg", TypeRef::Named("Config".into())),
+                        make_param("opts", TypeRef::Named("Options".into())),
+                    ],
+                    return_type: TypeRef::String,
+                    is_async: false,
+                    is_static: false,
+                    error_type: Some("RenderError".into()),
+                    doc: "Render the widget with given config and options.".into(),
+                    receiver: Some(ReceiverKind::Ref),
+                    sanitized: false,
+                    trait_source: None,
+                    returns_ref: false,
+                    returns_cow: false,
+                    return_newtype_wrapper: None,
+                    has_default_impl: false,
+                    binding_excluded: false,
+                    binding_exclusion_reason: None,
+                    version: Default::default(),
+                }],
+                is_opaque: true,
+                is_clone: false,
+                is_copy: false,
+                doc: "An opaque widget handle.".to_string(),
+                cfg: None,
+                is_trait: false,
+                has_default: false,
+                has_stripped_cfg_fields: false,
+                is_return_type: false,
+                serde_rename_all: None,
+                has_serde: false,
+                super_traits: vec![],
+                binding_excluded: false,
+                binding_exclusion_reason: None,
+                is_variant_wrapper: false,
+                has_lifetime_params: false,
+                has_private_fields: false,
+                version: Default::default(),
+            },
+        ],
+        functions: vec![
+            make_fn(
+                "create_widget",
+                vec![make_param("label", TypeRef::String)],
+                TypeRef::Named("Widget".to_string()),
+                None,
+                "Create a new widget.",
+            ),
+            make_fn(
+                "configure",
+                vec![
+                    make_param("cfg", TypeRef::Named("Config".into())),
+                    make_param("opts", TypeRef::Named("Options".into())),
+                ],
+                TypeRef::Unit,
+                Some("ConfigError"),
+                "Apply configuration.",
+            ),
+            make_fn(
+                "describe",
+                vec![make_param("cfg", TypeRef::Named("Config".into()))],
+                TypeRef::Named("Config".into()),
+                None,
+                "Describe the config.",
+            ),
+        ],
+        enums: vec![],
+        errors: vec![
+            ErrorDef {
+                name: "ConfigError".to_string(),
+                rust_path: "demo::ConfigError".to_string(),
+                original_rust_path: String::new(),
+                variants: vec![
+                    ErrorVariant {
+                        name: "Invalid".to_string(),
+                        message_template: Some("config is invalid".to_string()),
+                        fields: vec![],
+                        has_source: false,
+                        has_from: false,
+                        is_unit: true,
+                        is_tuple: false,
+                        doc: "The config is invalid.".to_string(),
+                    },
+                ],
+                doc: "Configuration errors.".to_string(),
+                methods: vec![],
+                binding_excluded: false,
+                binding_exclusion_reason: None,
+                version: Default::default(),
+            },
+            ErrorDef {
+                name: "RenderError".to_string(),
+                rust_path: "demo::RenderError".to_string(),
+                original_rust_path: String::new(),
+                variants: vec![
+                    ErrorVariant {
+                        name: "WidgetNotFound".to_string(),
+                        message_template: Some("widget not found".to_string()),
+                        fields: vec![],
+                        has_source: false,
+                        has_from: false,
+                        is_unit: true,
+                        is_tuple: false,
+                        doc: "The widget does not exist.".to_string(),
+                    },
+                ],
+                doc: "Rendering errors.".to_string(),
+                methods: vec![],
+                binding_excluded: false,
+                binding_exclusion_reason: None,
+                version: Default::default(),
+            },
+        ],
+        excluded_type_paths: ::std::collections::HashMap::new(),
+        excluded_trait_names: ::std::collections::HashSet::new(),
+        services: vec![],
+        handler_contracts: vec![],
+        unsupported_public_items: Vec::new(),
+    }
+}
+
+#[test]
+fn snapshot_rich_struct_api() {
+    let api = make_rich_struct_api();
+    let config = make_basic_config();
+    let files = CrystalBackend.generate_bindings(&api, &config).unwrap();
+    let main = files.iter().find(|f| f.path.display().to_string().ends_with(".cr"))
+        .expect("expected a .cr binding file");
+    insta::assert_snapshot!(
+        format!("rich_struct__{}", main.path.display().to_string().replace('/', "__")),
+        &main.content
+    );
+}
