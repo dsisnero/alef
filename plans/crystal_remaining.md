@@ -1,11 +1,9 @@
 # Plan: Crystal backend — remaining work
 
-Status: **25/26 compile tests**, **26/29 gen-bindings tests**, **1/4 snapshot tests**, **182/192
-crystal lib tests** pass. F0–F5 fixed in earlier session; F6, F7, F9–F19 landed this session.
+Status: **26/26 compile tests**, **29/29 gen-bindings tests**, **4/4 snapshot tests**, **192/192
+crystal lib tests**, **4417/4417 total lib tests** pass. F0–F5 fixed in earlier session;
+F6, F7, F9–F19 landed this session, and the stale test assertions + snapshot accepts are fixed.
 **Only F8 remains** (run e2e Crystal specs — blocked on mock server / PHP toolchain).
-Remaining cleanup: **14 stale test assertions + 3 pending snapshot accepts** from the new ABI
-(nullable `String?` params, `last_error_code` for fallible scalar/unit returns, getter-based
-JSON defaults, e2e arg-mapping model) — see §G.
 
 ---
 
@@ -132,19 +130,27 @@ JSON defaults, e2e arg-mapping model) — see §G.
   xberg takes config directly — no engine handle pattern. The `json_object`
   args work via `from_json` deserialization. No ABI issue to fix.
 
-## G. Remaining cleanup — stale test assertions + snapshot accepts
+## G. Stale test assertions + snapshot accepts (fixed this session)
 
-The working tree's codegen changes (nullable `String?` params, `last_error_code`
+The working-tree codegen changes (nullable `String?` params, `last_error_code`
 ABI for fallible scalar/unit returns, getter-based JSON defaults, e2e arg-mapping
-model) are ahead of the tests. 17 tests/snapshots assert the OLD ABI and need
-updating. All failures are stale expectations, not codegen bugs:
+model) were ahead of the tests, which asserted the OLD ABI. All 17
+tests/snapshots were updated to the new ABI in the same session:
 
-| Suite | Failures | Fix |
-|-------|----------|-----|
-| `backends_crystal_compile_test` | 1: `visitor_bridge_emits_callback_layer` | expects `text : String`; codegen now emits `String?` (null-checked C strings). Update assertion + driver to `String?`. |
-| `backends_crystal_gen_bindings_test` | 3: `duration_with_error_still_returns_c_string`, `struct_param_uses_from_json_in_wrapper_body`, `struct_fields_with_defaults_emit_json_field_default_annotation` | fallible scalar/unit returns now return by value + `last_error_code` (not `LibC::Char*`); defaults are getter initializers (not `@[JSON::Field(default:)]`). Update assertions. |
-| `backends_crystal_snapshot_test` | 3: `snapshot_basic_bindings`, `snapshot_rich_struct_api`, `snapshot_visitor_bridge` | `.snap.new` files present; run `cargo insta accept`. |
-| `cargo test --lib` (crystal) | 10: `trait_bridge::callback_with_string_param_resolves` + 9 `e2e::codegen::crystal::*` | trait_bridge expects `String` → `String?`; e2e tests assert removed raw single-arg fallback (`Demo.convert("hi")` → now arg-mapping based `Demo.convert()`). Update expectations. |
+| Suite | Before | After |
+|-------|--------|-------|
+| `backends_crystal_compile_test` | 25/26 | 26/26 |
+| `backends_crystal_gen_bindings_test` | 26/29 | 29/29 |
+| `backends_crystal_snapshot_test` | 1/4 | 4/4 (3 accepts) |
+| `cargo test --lib` (crystal) | 182/192 | 192/192 |
+| `cargo test --lib` (all) | — | 4417/4417 |
 
-After accepting snapshots and updating the 14 stale assertions above, re-run the
-four suites and confirm green before F8.
+Notable expectation changes:
+- visitor callbacks use `String?` params (null-checked C strings)
+- fallible scalar/unit returns are by-value + `last_error_code`, not `LibC::Char*`
+- struct-field defaults are getter initializers, not `@[JSON::Field(default:)]`
+- e2e calls pass no positional arg when no `args` mappings are configured;
+  string comparisons render as `.to_s.strip`
+- adapters signal errors via `set_last_error`
+
+After re-running the four suites green, the only remaining work is **F8**.
