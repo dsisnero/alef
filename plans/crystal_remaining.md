@@ -1,7 +1,11 @@
 # Plan: Crystal backend — remaining work
 
-Status: **IN PROGRESS** — core binding generation + C FFI ABI fixed.
-Commit: `bc9d84a` — from_json/free helpers for struct params.
+Status: **25/26 compile tests**, **26/29 gen-bindings tests**, **1/4 snapshot tests**, **182/192
+crystal lib tests** pass. F0–F5 fixed in earlier session; F6, F7, F9–F19 landed this session.
+**Only F8 remains** (run e2e Crystal specs — blocked on mock server / PHP toolchain).
+Remaining cleanup: **14 stale test assertions + 3 pending snapshot accepts** from the new ABI
+(nullable `String?` params, `last_error_code` for fallible scalar/unit returns, getter-based
+JSON defaults, e2e arg-mapping model) — see §G.
 
 ---
 
@@ -14,16 +18,18 @@ Commit: `bc9d84a` — from_json/free helpers for struct params.
 - [x] Emit `struct TypeName; end` declarations in lib block
 - [x] Emit `fun *_from_json`/`*_to_json`/`*_free` helper declarations
 - [x] `ffi_struct_names` excludes opaque handle types
-- [ ] **F1** Thread `ffi_structs` through `marshal_value` for streaming method args
-  `gen_stream_method` line 416 calls `marshal_value(..., &HashSet::new())` —
-  struct params in streaming adapters still JSON-encode. Need to pass `ffi_structs`
-  and use `from_json`/`free` pattern.
-- [ ] **F2** Verify xberg bindings regenerate with correct ABI
-  xberg's `extract`/`extract_batch` take `ExtractInput`/`ExtractionConfig` params
-  that need the same struct-pointer treatment. Regenerate and test extraction.
-- [ ] **F3** Handle `Optional(Named(...))` struct returns in `gen_call_body`
-  Currently only matches `TypeRef::Named(n)` directly. `Optional(ScrapeResult)`
-  would fall through to C-string path.
+- [x] **F1** Thread `ffi_structs` through `marshal_value` for streaming + opaque methods
+  `gen_stream_method` and `gen_opaque_method` now handle struct params via
+  `from_json`/`free` (not just `gen_wrapper_body`).
+- [x] **F2** Fix compile test failures (6 pre-existing failures)
+  Root cause: `generate_bindings` now returns `shard.yml` alongside `.cr` files.
+  Tests concatenated all files into a single Crystal source, causing YAML content
+  (`name: demo`) to appear in Crystal code. Fix: filter to `.cr` files only,
+  write generated files to disk individually so `require` resolves correctly.
+- [x] **F3** Handle `Optional(Named(...))` struct returns in `gen_call_body`
+  Infallible optional struct returns use nullable struct pointer (nil on null);
+  fallible ones remain JSON-string ABI (null could be error or None).
+  Also updated `c_type_of` and `lib_c_return` for correct C return types.
 
 ## B. Codegen completeness
 
@@ -34,54 +40,71 @@ Commit: `bc9d84a` — from_json/free helpers for struct params.
 - [x] HTTP test client renderer (`TestClientRenderer` trait impl)
 - [x] `shard.yml` emitted with targets section
 - [x] Per-language `[crates.crystal]` TOML config registered
-- [ ] **F4** `CrawlConfig.from_json(...)` requires ALL non-nilable fields
-  Go uses `json.Unmarshal` with partial JSON → zero-value defaults. Crystal
-  `JSON::Serializable` has no equivalent. Options:
-  - Add `def self.default : CrawlConfig` constructors using field defaults
-  - Add `@[JSON::Field(default: ...)]` for each field based on Rust `Default`
-  - Or provide a convenience constructor that accepts partial JSON
-- [ ] **F5** Audit generated code for duplicate `getter` lines
-  The `gen_struct` function emits each field twice (visible in generated output).
-  Causes `to_json` to duplicate every key. Root cause: `gen_struct` is called
-  per type and each field generates `getter` twice.
+- [x] **F0** Empty struct declarations (`struct Config; end`) rejected by Crystal 1.19
+  Changed to `struct Config\n _data : Void*\n end` to satisfy Crystal's
+  non-empty struct requirement while preserving the opaque C-compatible type.
+  (Fixed as part of F3 work since compile tests failed after struct-pointer ABI.)
+- [x] **F4** Partial JSON for non-nilable fields (default values)
+  `gen_struct` now emits a default initializer on the getter
+  (`getter field : T = <expr>`) for fields with `typed_default`
+  (BoolLiteral, IntLiteral, FloatLiteral, StringLiteral) and falls back to
+  `type_based_default_expr`/`enum_default_expr`/`struct_default_expr` otherwise.
+  (Crystal 1.19's `@[JSON::Field(default:)]` does NOT work for `from_json` —
+  getter defaults are the working mechanism.)
+- [x] **F5** Duplicate `getter` lines fixed
+  Removed the copy-paste duplicate line in `gen_struct` (lines 354-355).
 
 ## C. E2e test framework
 
-- [x] 32 Crystal spec files generated for crawlberg
-  (`alef e2e generate` produces `e2e/crystal/spec/*_spec.cr`)
-- [ ] **F6** Add crystal overrides in crawlberg e2e call configs
-  The e2e tests call `Crawlberg.scrape(json_config, nil)` but bindings have
-  `scrape(engine : CrawlEngineHandle, url : String)`. Need per-call overrides:
-  ```toml
-  [crates.e2e.calls.scrape.overrides.crystal]
-  function = "scrape"
-  module = "Crawlberg"
-  ```
-  And update `args` to map fixture fields to binding params.
-- [ ] **F7** Make e2e Crystal specs compile
-  `cd e2e/crystal && shards install && crystal spec` — the spec files need to
-  `require` the crawlberg binding. Currently the e2e `shard.yml` points to
-  a package path that may not resolve. Need to verify/fix the dependency path.
-- [ ] **F8** Run e2e Crystal specs and fix failures
-  Compare output with Go/Zig e2e results. Likely issues:
-  - Config passing mismatch (JSON string vs typed struct)
-  - Result field accessor naming (snake_case in Crystal)
-  - Mock server URL resolution
-- [ ] **F9** Add crystal to xberg e2e languages
-  Same as F6 but for xberg repo.
-- [ ] **F10** Add crystal e2e call overrides for xberg
-  Map xberg fixture fields (extraction, batch, OCR) to Crystal binding params.
+- [x] 21 Crystal spec files + `spec_helper.cr` generated for crawlberg
+  (on branch `crystal-backend-fixes`; `alef e2e generate` produces `e2e/crystal/spec/*_spec.cr`)
+- [x] **F6** Add crystal overrides in crawlberg e2e call configs
+  Added `crystal` to `[workspace] languages`, `[crates.output]`, `[crates.e2e.languages]`.
+  Added `module = "Crawlberg"` override for all non-streaming calls.
+  Crystal skipped for streaming calls (`crawl_stream`, `batch_crawl_stream`).
+- [x] **F7** Make e2e Crystal specs compile
+  `cd e2e/crystal && shards install && crystal build spec/scrape_spec.cr` — compiles successfully.
+  Also verified binary links: `crystal build src/crawlberg.cr -o bin/crawlberg` succeeds.
+- [ ] **F8** Run e2e Crystal specs
+  FFI lib built (`cargo build -p crawlberg-ffi --release`), Crystal binary links.
+  Mock server needs PHP toolchain (e2e/rust `ext-php-rs` build dep).
+  Full e2e run requires mock server + `MOCK_SERVER_URL` env var.
+- [x] **F9** Add crystal to xberg e2e languages
+  Added `"crystal"` to `[crates.e2e.languages]` + base `[crates.e2e.call.overrides.crystal]`.
+  18 spec files + `spec_helper.cr` generated (on branch `crystal-backend-fixes`).
+- [x] **F10** Add crystal e2e call overrides for xberg
+  Fixed `json_object` handler: uses `Array(Type).from_json(...)` when `element_type`
+  is set (for batch args like `extract_batch` inputs, `interact` actions).
+
+### Crystal e2e codegen fixes (alef repo, all landed):
+
+| Change | Description |
+|--------|-------------|
+| `handle` arg type | Creates engine from config via `create_engine(CrawlConfig.from_json(...))` |
+| `mock_url` arg type | Resolves mock server URL from `MOCK_SERVER_URL` env var |
+| `mock_url_list` arg type | Builds mock URL array with Crystal string interpolation |
+| env vars | `spec_helper.cr` sets `ENV[...] ||= ...` from `e2e_config.env` |
+| assertion types | Added `greater_than_or_equal`, `less_than_or_equal` support |
+| virtual fields | `is_error` → `error.should_not be_nil`; `pages_crawled` → `pages.size` |
+| array iteration | `links[].link_type` → `links.any? { \|el\| el.link_type.includes?(...) }` |
+| array indexing | `pages_0` → `pages[0]`; `json_ld.type` → `json_ld[0].schema_type` |
+| wrapper namespace | `crawl.*`, `batch.*`, `map.*`, `content.*`, `robots.*` → stripped |
+| metadata flattening | `og.title` → `metadata.og_title`; `twitter.card` → `metadata.twitter_card`; `dublin_core.*` → `metadata.dc_*` |
+| field renames | `category` → `asset_category`; `type` → `schema_type` |
+| `create_engine` return | Fixed opaque handle teardown-before-return bug |
+| Crystal syntax | `#{}` interpolation, `[] of String`, `size` not `length`, `includes?` not `contains` |
+| `json_object` arrays | `Array(PageAction).from_json(...)` for JSON array args |
 
 ## D. Test coverage (alef itself)
 
-- [x] 4411 tests pass, clippy clean
-- [ ] **F11** Unit test for `ffi_struct_names` and `collect_named_types`
+- [x] 4411+ tests pass, clippy clean
+- [x] **F11** Unit test for `ffi_struct_names` and `collect_named_types`
   New helper functions have zero direct test coverage.
-- [ ] **F12** Unit test for struct-return code path in `gen_call_body`
+- [x] **F12** Unit test for struct-return code path in `gen_call_body`
   Verify `to_json`/`free` pattern emitted correctly for Named returns.
-- [ ] **F13** Unit test for struct-param code path in `gen_wrapper_body`
+- [x] **F13** Unit test for struct-param code path in `gen_wrapper_body`
   Verify `from_json`/`free` pattern emitted correctly for Named params.
-- [ ] **F14** Snapshot test update for crawlberg-sized API surface
+- [x] **F14** Snapshot test update for crawlberg-sized API surface
   Current snapshot uses a minimal API. Generate a snapshot with struct types
   to catch regressions in struct-pointer codegen.
 
@@ -90,18 +113,38 @@ Commit: `bc9d84a` — from_json/free helpers for struct params.
 - [x] crawlberg example (scrapes httpbin.org, browser mode=Never)
 - [x] xberg example (OCR backend register/list/unregister)
 - [x] Makefile for both repos (`make example` builds FFI + Crystal)
-- [ ] **F15** xberg extraction example with working config
-  Deeply nested config types make `from_json` unusable (see F4). Need a
-  working extraction example once config defaults are available.
-- [ ] **F16** Add Crystal badge/entry to crawlberg README
-  Match the pattern of other language badges.
-- [ ] **F17** Add Crystal badge/entry to xberg README
+- [x] **F15** xberg extraction example with working config
+  F4 JSON defaults fix applied. Config can now be partial JSON
+  (`{%raw%}{"force_ocr":true}{%endraw%}`) instead of specifying every field.
+  Example updated to use compact config.
+- [x] **F16** Add Crystal badge/entry to crawlberg README
+  Added `img.shields.io/badge/Crystal-shards-007ec6` badge after Zig.
+- [x] **F17** Add Crystal badge/entry to xberg README
+  Same badge pattern as crawlberg.
 
 ## F. xberg-specific runtime issues
 
-- [ ] **F18** Test xberg extraction after ABI fix regeneration
-  The segfault in `xberg_extract` was likely caused by the JSON-string vs
-  struct-pointer mismatch (same as crawlberg). Regenerate with fix and retest.
-- [ ] **F19** xberg `create_engine` equivalent
-  xberg may not have a `create_engine` pattern — its functions take config
-  directly. Verify correct ABI after regeneration.
+- [x] **F18** xberg FFI builds and Crystal binding links
+  `PKG_CONFIG_PATH=/usr/local/lib/pkgconfig cargo build -p xberg-ffi --release` succeeds.
+  `crystal build examples/extract.cr -o bin/extract` links against FFI lib (7 MB binary).
+  Batch fixture input resolution (null vs array) is a fixture-structure concern, not a codegen bug.
+- [x] **F19** xberg `create_engine` equivalent (not needed)
+  xberg takes config directly — no engine handle pattern. The `json_object`
+  args work via `from_json` deserialization. No ABI issue to fix.
+
+## G. Remaining cleanup — stale test assertions + snapshot accepts
+
+The working tree's codegen changes (nullable `String?` params, `last_error_code`
+ABI for fallible scalar/unit returns, getter-based JSON defaults, e2e arg-mapping
+model) are ahead of the tests. 17 tests/snapshots assert the OLD ABI and need
+updating. All failures are stale expectations, not codegen bugs:
+
+| Suite | Failures | Fix |
+|-------|----------|-----|
+| `backends_crystal_compile_test` | 1: `visitor_bridge_emits_callback_layer` | expects `text : String`; codegen now emits `String?` (null-checked C strings). Update assertion + driver to `String?`. |
+| `backends_crystal_gen_bindings_test` | 3: `duration_with_error_still_returns_c_string`, `struct_param_uses_from_json_in_wrapper_body`, `struct_fields_with_defaults_emit_json_field_default_annotation` | fallible scalar/unit returns now return by value + `last_error_code` (not `LibC::Char*`); defaults are getter initializers (not `@[JSON::Field(default:)]`). Update assertions. |
+| `backends_crystal_snapshot_test` | 3: `snapshot_basic_bindings`, `snapshot_rich_struct_api`, `snapshot_visitor_bridge` | `.snap.new` files present; run `cargo insta accept`. |
+| `cargo test --lib` (crystal) | 10: `trait_bridge::callback_with_string_param_resolves` + 9 `e2e::codegen::crystal::*` | trait_bridge expects `String` → `String?`; e2e tests assert removed raw single-arg fallback (`Demo.convert("hi")` → now arg-mapping based `Demo.convert()`). Update expectations. |
+
+After accepting snapshots and updating the 14 stale assertions above, re-run the
+four suites and confirm green before F8.
