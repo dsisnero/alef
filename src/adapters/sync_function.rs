@@ -197,8 +197,24 @@ fn gen_ffi_body(adapter: &AdapterConfig, config: &ResolvedCrateConfig) -> String
         })
         .collect();
 
-    let call_args_list: Vec<String> = adapter.params.iter().map(|p| p.name.clone()).collect();
-    let call_str = call_args_list.join(", ");
+    let call_str: String = adapter
+        .params
+        .iter()
+        .map(|p| {
+            if p.ty == "String" || p.ty == "&str" {
+                if p.optional {
+                    format!("{}.as_deref()", p.name)
+                } else {
+                    format!("{}.as_str()", p.name)
+                }
+            } else if p.optional {
+                format!("{}.map(Into::into)", p.name)
+            } else {
+                format!("{}.into()", p.name)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
     let conversion_block = if conversions.is_empty() {
         String::new()
     } else {
@@ -212,10 +228,10 @@ fn gen_ffi_body(adapter: &AdapterConfig, config: &ResolvedCrateConfig) -> String
                  let json = serde_json::to_string(&result).unwrap_or_default();\n            \
                  std::ffi::CString::new(json).unwrap_or_default().into_raw()\n        \
              }}\n        \
-             Err(e) => {{\n            \
-                 update_last_error(e);\n            \
-                 std::ptr::null_mut()\n        \
-             }}\n    \
+              Err(e) => {{\n            \
+                  set_last_error(2, &e.to_string());\n            \
+                  std::ptr::null_mut()\n        \
+              }}\n    \
          }}"
     )
 }

@@ -20,7 +20,7 @@ use crate::codegen::builder::RustFileBuilder;
 use crate::codegen::generators;
 use crate::core::config::{AdapterPattern, Language, ResolvedCrateConfig};
 use crate::core::ir::ApiSurface;
-use heck::ToPascalCase;
+use heck::{ToPascalCase, ToSnakeCase};
 
 pub(super) fn gen_lib_rs(api: &ApiSurface, prefix: &str, config: &ResolvedCrateConfig) -> String {
     let mut builder = RustFileBuilder::new().with_generated_header();
@@ -160,6 +160,50 @@ pub(super) fn gen_lib_rs(api: &ApiSurface, prefix: &str, config: &ResolvedCrateC
                 &core_import,
             ));
         }
+    }
+
+    // Async method adapters — generate `extern "C"` wrappers that call into the
+    // Rust core over the C ABI using JSON-string arg/return marshalling. These
+    // are used by language backends that call C functions (e.g. Crystal, Zig).
+    for adapter in config
+        .adapters
+        .iter()
+        .filter(|a| matches!(a.pattern, AdapterPattern::AsyncMethod))
+        .filter(|a| a.owner_type.is_some())
+    {
+        let owner_type = adapter.owner_type.as_deref().unwrap();
+        let adapter_key = format!("{}.{}", owner_type, adapter.name);
+        let Some(body) = adapter_bodies.get(&adapter_key) else {
+            continue;
+        };
+        let type_snake = owner_type.to_snake_case();
+        // Suffix with `_json` to distinguish from the native Rust-pointer
+        // wrapper that `gen_method_wrapper` may emit for the same method.
+        let fn_name = format!("{prefix}_{type_snake}_{}_json", adapter.name);
+        let doc_comment = String::new();
+        let qualified = format!("{core_import}::{owner_type}");
+        // Build params: first param is the opaque client pointer, then each
+        // adapter param becomes a C string pointer (JSON for struct types).
+        let mut c_params = vec![format!("client: *mut {qualified}")];
+        for p in &adapter.params {
+            let param_name = if p.ty == "String" || p.ty == "&str" {
+                p.name.clone()
+            } else {
+                format!("{}_json", p.name)
+            };
+            c_params.push(format!("{param_name}: *const std::ffi::c_char"));
+        }
+        let c_params_str = c_params.join(",\n    ");
+        let body_indented = body.replace('\n', "\n ");
+        builder.add_item(&format!(
+            "{doc_comment}\n\
+             #[unsafe(no_mangle)]\n\
+             pub unsafe extern \"C\" fn {fn_name}(\n    \
+                 {c_params_str}\n\
+             ) -> *mut std::ffi::c_char {{\n \
+             {body_indented}\n\
+             }}"
+        ));
     }
 
     // Private Rust helpers: for every enum that may be passed as an `i32` discriminant param,

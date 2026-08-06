@@ -62,7 +62,7 @@ pub(in crate::backends::ffi::gen_bindings) fn should_skip_method_wrapper(
     false
 }
 
-pub(super) fn c_symbol_component(name: &str) -> String {
+pub(crate) fn c_symbol_component(name: &str) -> String {
     pascal_to_snake(name)
 }
 

@@ -356,11 +356,18 @@ fn gen_wasm_body(adapter: &AdapterConfig, _config: &ResolvedCrateConfig) -> Stri
 
 fn gen_ffi_body(adapter: &AdapterConfig, config: &ResolvedCrateConfig) -> String {
     let core_path = &adapter.core_path;
+    let core_import = config.core_import_name();
     let prefix = config.ffi_prefix();
     let owner_type = adapter.owner_type.as_deref().unwrap_or("Self");
     let owner_snake = to_snake_case(owner_type);
     let _ = prefix;
     let _ = owner_snake;
+
+    let call_str = if adapter.params.is_empty() {
+        String::new()
+    } else {
+        call_args(adapter).join(", ")
+    };
 
     let conversions: Vec<String> = adapter
         .params
@@ -375,26 +382,50 @@ fn gen_ffi_body(adapter: &AdapterConfig, config: &ResolvedCrateConfig) -> String
                     name = p.name,
                 )
             } else {
-                format!(
-                    "let {name}_str = unsafe {{ std::ffi::CStr::from_ptr({name}_json) }}\n        \
-                     .to_str()\n        \
-                     .unwrap_or_default();\n    \
-                     let {name}: {ty} = match serde_json::from_str({name}_str) {{\n        \
-                         Ok(v) => v,\n        \
-                         Err(e) => {{\n            \
-                             update_last_error(e);\n            \
-                             return std::ptr::null_mut();\n        \
-                         }}\n    \
-                     }};",
-                    name = p.name,
-                    ty = p.ty,
-                )
+                let qualified_ty = if is_builtin_type(&p.ty) {
+                    p.ty.clone()
+                } else {
+                    format!("{core_import}::{ty}", ty = p.ty)
+                };
+                if p.optional {
+                    format!(
+                        "let {name}: Option<{qualified_ty}> = if {name}_json.is_null() {{\n        \
+                             None\n        \
+                         }} else {{\n        \
+                             let {name}_str = unsafe {{ std::ffi::CStr::from_ptr({name}_json) }}\n                \
+                                 .to_str()\n                \
+                                 .unwrap_or_default();\n            \
+                             match serde_json::from_str({name}_str) {{\n                \
+                                 Ok(v) => Some(v),\n                \
+                                 Err(e) => {{\n                    \
+                                     set_last_error(1, &e.to_string());\n                    \
+                                     return std::ptr::null_mut();\n                \
+                                 }}\n            \
+                             }}\n        \
+                         }};",
+                        name = p.name,
+                        qualified_ty = qualified_ty,
+                    )
+                } else {
+                    format!(
+                        "let {name}_str = unsafe {{ std::ffi::CStr::from_ptr({name}_json) }}\n        \
+                         .to_str()\n        \
+                         .unwrap_or_default();\n    \
+                         let {name}: {qualified_ty} = match serde_json::from_str({name}_str) {{\n        \
+                             Ok(v) => v,\n        \
+                             Err(e) => {{\n            \
+                                 set_last_error(1, &e.to_string());\n            \
+                                 return std::ptr::null_mut();\n        \
+                             }}\n    \
+                         }};",
+                        name = p.name,
+                        qualified_ty = qualified_ty,
+                    )
+                }
             }
         })
         .collect();
 
-    let call_args_list: Vec<String> = adapter.params.iter().map(|p| p.name.clone()).collect();
-    let call_str = call_args_list.join(", ");
     let conversion_block = if conversions.is_empty() {
         String::new()
     } else {
@@ -405,22 +436,22 @@ fn gen_ffi_body(adapter: &AdapterConfig, config: &ResolvedCrateConfig) -> String
         "let client = unsafe {{ &*client }};\n    \
          {conversion_block}\
          let rt = match tokio::runtime::Runtime::new() {{\n        \
-             Ok(rt) => rt,\n        \
-             Err(e) => {{\n            \
-                 update_last_error(e);\n            \
-                 return std::ptr::null_mut();\n        \
-             }}\n    \
-         }};\n    \
-         match rt.block_on(async {{ client.inner.{core_path}({call_str}).await }}) {{\n        \
-             Ok(result) => {{\n            \
-                 let json = serde_json::to_string(&result).unwrap_or_default();\n            \
-                 std::ffi::CString::new(json).unwrap_or_default().into_raw()\n        \
-             }}\n        \
-             Err(e) => {{\n            \
-                 update_last_error(e);\n            \
-                 std::ptr::null_mut()\n        \
-             }}\n    \
-         }}"
+         Ok(rt) => rt,\n        \
+              Err(e) => {{\n            \
+                  set_last_error(2, &e.to_string());\n            \
+                  return std::ptr::null_mut();\n        \
+              }}\n    \
+          }};\n    \
+          match rt.block_on(async {{ client.{core_path}({call_str}).await }}) {{\n        \
+              Ok(result) => {{\n            \
+                  let json = serde_json::to_string(&result).unwrap_or_default();\n            \
+                  std::ffi::CString::new(json).unwrap_or_default().into_raw()\n        \
+              }}\n        \
+              Err(e) => {{\n            \
+                  set_last_error(2, &e.to_string());\n            \
+                  std::ptr::null_mut()\n        \
+              }}\n    \
+          }}"
     )
 }
 
