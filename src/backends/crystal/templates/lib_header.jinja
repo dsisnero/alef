@@ -5,6 +5,10 @@ require "json"
 # Every non-scalar value crosses the C ABI as a NUL-terminated JSON string
 # (`LibC::Char*`); scalars pass by value. Strings returned by the library are
 # owned by Rust and must be released with `{{ ffi_prefix }}_free_string`.
+#
+# Link against the FFI shared library. The library must be installed to a
+# standard path, or you can pass --link-flags at build time:
+#   crystal build ... --link-flags="-L/path/to/lib -Wl,-rpath,/path/to/lib"
 @[Link(ldflags: "-l{{ ffi_lib_name }}")]
 lib {{ lib_name }}
   fun free_string = {{ ffi_prefix }}_free_string(ptr : LibC::Char*) : Void
