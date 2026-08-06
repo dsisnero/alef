@@ -67,9 +67,18 @@ struct Callback {
 
 /// Map a context field's `TypeRef` to (lib C type, high-level type, decode-expr),
 /// replicating `backends::ffi::gen_visitor::context::context_c_type`.
+/// Return the first non-excluded variant name for an enum type, if any.
+fn enums_first_variant_name<'a>(api: &'a ApiSurface, name: &str) -> Option<&'a str> {
+    api.enums
+        .iter()
+        .find(|e| e.name == name)
+        .and_then(|e| e.variants.iter().find(|v| !v.binding_excluded))
+        .map(|v| v.name.as_str())
+}
+
 fn context_field(field_ty: &TypeRef, raw_field: &str, api: &ApiSurface) -> Option<(&'static str, String, String)> {
     Some(match field_ty {
-        TypeRef::String => ("LibC::Char*", "String".into(), format!("String.new(raw.{raw_field})")),
+        TypeRef::String => ("LibC::Char*", "String?".into(), format!("raw.{raw_field}.null? ? nil : String.new(raw.{raw_field})")),
         TypeRef::Primitive(PrimitiveType::Bool) => ("Int32", "Bool".into(), format!("raw.{raw_field} != 0")),
         TypeRef::Primitive(p) => {
             let (c, hi) = crystal_scalar(p);
@@ -77,7 +86,11 @@ fn context_field(field_ty: &TypeRef, raw_field: &str, api: &ApiSurface) -> Optio
         }
         TypeRef::Named(name) if api.enums.iter().any(|e| e.name == *name) => {
             let en = crystal_type_name(name);
-            ("Int32", en.clone(), format!("{en}.from_value(raw.{raw_field})"))
+            // Use safe `from_value?` to avoid exceptions when the Rust side
+            // sends an enum discriminant that falls outside Crystal's variant
+            // range (e.g. due to C ABI nesting or version skew).
+            let first = enums_first_variant_name(api, name).unwrap_or("Text");
+            ("Int32", format!("{en}?"), format!("{en}.from_value?(raw.{raw_field}) || {en}::{first}"))
         }
         _ => return None,
     })
@@ -126,8 +139,10 @@ fn resolve_callback(m: &MethodDef, context_type: &str, result_type: &str) -> Opt
         }
         let raw = p.name.trim_start_matches('_').to_string();
         let (c_type, hi_type, decode): (&'static str, String, String) = match (&p.ty, p.optional) {
-            (TypeRef::String, false) => ("LibC::Char*", "String".into(), format!("String.new({raw})")),
-            (TypeRef::String, true) => (
+            // Always null-check C string pointers, even for non-optional params,
+            // to prevent segfaults from null C pointers (C ABI doesn't guarantee
+            // non-null even when Rust declares non-optional).
+            (TypeRef::String, _) => (
                 "LibC::Char*",
                 "String?".into(),
                 format!("{raw}.null? ? nil : String.new({raw})"),
@@ -259,7 +274,7 @@ pub(crate) fn gen_visitor_file(
         "  fun {trait_snake}_visitor_free = {ffi_prefix}_visitor_free(handle : {trait_name}VisitorHandle) : Void\n"
     ));
     out.push_str(&format!(
-        "  fun {trait_snake}_options_set_visitor = {ffi_prefix}_options_set_visitor_handle(options : Void*, handle : {trait_name}VisitorHandle) : Void\n"
+        "  fun {trait_snake}_options_set_visitor = {ffi_prefix}_options_set_visitor(options : Void*, handle : {trait_name}VisitorHandle) : Void\n"
     ));
     out.push_str("end\n\n");
 
@@ -315,44 +330,56 @@ pub(crate) fn gen_visitor_file(
         }
         lam_params.push_str(", out_custom : LibC::Char**, out_len : LibC::SizeT*");
         out.push_str(&format!("    callbacks.{} = ->({lam_params}) do\n", cb.method));
-        out.push_str(&format!("      visitor = Box({trait_name}Visitor).unbox(user_data)\n"));
-        out.push_str("      raw = ctx.value\n");
+        out.push_str("      begin\n");
+        out.push_str(&format!("        visitor = Box({trait_name}Visitor).unbox(user_data)\n"));
+        out.push_str("        raw = ctx.value\n");
         // Build high-level context.
         let ctx_args = ctx_fields
             .iter()
             .map(|f| f.decode.clone())
             .collect::<Vec<_>>()
             .join(", ");
-        out.push_str(&format!("      context = {ctx_hi}.new({ctx_args})\n"));
+        out.push_str(&format!("        context = {ctx_hi}.new({ctx_args})\n"));
         // Decode extras.
         let mut call_args = String::from("context");
         for p in &cb.params {
-            out.push_str(&format!("      {}_value = {}\n", p.name, p.decode));
+            out.push_str(&format!("        {}_value = {}\n", p.name, p.decode));
             call_args.push_str(&format!(", {}_value", p.name));
         }
-        out.push_str(&format!("      decision = visitor.{}({call_args})\n", cb.method));
+        out.push_str(&format!("        decision = visitor.{}({call_args})\n", cb.method));
         // Map the decision to its FFI result code; string-payload variants also
         // write a malloc'd copy of the payload into `out_custom` (Rust takes
         // ownership via `CString::from_raw`, so the allocator must be libc malloc).
-        out.push_str("      case decision\n");
+        out.push_str("        case decision\n");
         for v in &result_meta.unit_variants {
             out.push_str(&format!(
-                "      when {result_hi}::{} then {}\n",
+                "        when {result_hi}::{} then {}\n",
                 crystal_type_name(&v.name),
                 v.code
             ));
         }
         for v in &result_meta.string_payload_variants {
-            out.push_str(&format!("      when {result_hi}::{}\n", crystal_type_name(&v.name)));
-            out.push_str("        __payload = decision.value.to_slice\n");
-            out.push_str("        __buf = LibC.malloc(__payload.size + 1).as(UInt8*)\n");
-            out.push_str("        __buf.copy_from(__payload.to_unsafe, __payload.size)\n");
-            out.push_str("        __buf[__payload.size] = 0_u8\n");
-            out.push_str("        out_custom.value = __buf\n");
-            out.push_str("        out_len.value = LibC::SizeT.new(__payload.size)\n");
-            out.push_str(&format!("        {}\n", v.code));
+            out.push_str(&format!("        when {result_hi}::{}\n", crystal_type_name(&v.name)));
+            out.push_str("          __payload = decision.value.to_slice\n");
+            out.push_str("          __buf = LibC.malloc(__payload.size + 1).as(UInt8*)\n");
+            out.push_str("          __buf.copy_from(__payload.to_unsafe, __payload.size)\n");
+            out.push_str("          __buf[__payload.size] = 0_u8\n");
+            out.push_str("          out_custom.value = __buf\n");
+            out.push_str("          out_len.value = LibC::SizeT.new(__payload.size)\n");
+            out.push_str(&format!("          {}\n", v.code));
         }
-        out.push_str(&format!("      else {default_code}\n"));
+        out.push_str(&format!("        else {default_code}\n"));
+        out.push_str("        end\n");
+        // Wrap in rescue to prevent Crystal exceptions from unwinding through
+        // Rust's `extern "C"` FFI (which would abort the process).
+        // Print the exception to stderr for debugging, then return the default code.
+        out.push_str("      rescue e\n");
+        out.push_str("        STDERR.puts \"[visitor callback error] #{e}\"\n");
+        out.push_str("        STDERR.puts \"[visitor callback backtrace] #{e.backtrace.first(3).join(\"\\n\")}\" if e.backtrace\n");
+        out.push_str("        out_custom.value = Pointer(LibC::Char).null\n");
+        out.push_str("        out_len.value = LibC::SizeT.new(0)\n");
+        // Return error code (typically 4 for most visitors).
+        out.push_str(&format!("        {}\n", result_meta.default_variant.code));
         out.push_str("      end\n");
         out.push_str("    end\n");
     }
@@ -1334,8 +1361,8 @@ mod tests {
         assert_eq!(cb.params.len(), 1);
         assert_eq!(cb.params[0].name, "text");
         assert_eq!(cb.params[0].c_type, "LibC::Char*");
-        assert_eq!(cb.params[0].hi_type, "String");
-        assert!(cb.params[0].decode.contains("String.new(text)"));
+        assert_eq!(cb.params[0].hi_type, "String?");
+        assert!(cb.params[0].decode.contains("text.null? ? nil : String.new(text)"));
     }
 
     #[test]
