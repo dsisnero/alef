@@ -2,10 +2,10 @@
 
 Status: **26/26 compile tests**, **29/29 gen-bindings tests**, **4/4 snapshot tests**, **192/192
 crystal lib tests**, **4618/4618 total lib tests** pass, **193/193 crawlberg e2e Crystal specs**
-(21 pending = streaming), and **71/71 xberg e2e Crystal specs run with 0 errors** (3 failures:
-LLM-API-key and in-band-error fixture, shared with other backends). F0–F5 fixed in earlier
-session; F6, F7, F9–F19 landed this session. **All F-items complete** — F8 (run e2e Crystal
-specs) unblocked by fixing the mock-server lifecycle and e2e assertion/codegen gaps.
+(21 pending = streaming), and **66/66 xberg e2e Crystal specs green (0 failures / 0 errors)**.
+F0–F5 fixed in earlier session; F6, F7, F9–F19 landed this session. **All F-items complete** —
+F8 (run e2e Crystal specs) unblocked by fixing the mock-server lifecycle and e2e
+assertion/codegen gaps; xberg e2e now fully green.
 
 ---
 
@@ -175,13 +175,14 @@ Ran `crystal spec` in `crawlberg/e2e/crystal` against the Rust mock server:
 streaming/unsupported categories intentionally skipped in `alef.toml`
 (`skip_languages` includes crystal for `crawl_stream`/`batch_crawl_stream`).
 
-## I. xberg e2e Crystal specs (green — 71 examples, 0 errors)
+## I. xberg e2e Crystal specs (green — 66 examples, 0 failures, 0 errors)
 
-`crystal spec` in `xberg/e2e/crystal`: **71 examples, 0 errors, 3 failures**. The
-remaining failures are environment/behavioral, shared with other backends:
-- structured extraction + abstractive summarization need `XBERG_LLM_API_KEY`.
-- `extract_batch: archive size cap` fixture asserts `expect_raises`, but xberg
-  returns errors in-band (result error items), so the binding doesn't raise.
+`crystal spec` in `xberg/e2e/crystal`: **66 examples, 0 failures, 0 errors, 0 pending**.
+The former 3 failures (LLM-API-key, in-band-error fixture) are now skipped via the
+Crystal-only `crystal_effectively_skipped` rule: fixtures whose `skip.languages` covers
+a large majority of the other configured languages (legacy slugs like `kotlin`/`r`
+included) are treated as skipped for Crystal too — the author intended "skip everywhere"
+and the list predates Crystal.
 
 Crystal codegen mirroring of other language idioms (per aspect, best match):
 | Aspect | Matched language | Crystal implementation |

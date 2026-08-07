@@ -99,6 +99,11 @@ impl E2eCodegen for CrystalE2eCodegen {
                 .fixtures
                 .iter()
                 .filter(|f| super::should_include_fixture(f, lang, e2e_config))
+                // Crystal-only: when a fixture lists `skip.languages` covering every
+                // other configured language (e.g. "SecurityLimits... not easily
+                // testable via byte fixtures"), the intent is "skip everywhere"; the
+                // list predates Crystal, so include Crystal too.
+                .filter(|f| !crystal_effectively_skipped(f, lang, &config.languages))
                 .collect();
             if active.is_empty() {
                 continue;
@@ -131,4 +136,32 @@ impl E2eCodegen for CrystalE2eCodegen {
     fn language_name(&self) -> &'static str {
         "crystal"
     }
+}
+
+/// Crystal-only skip rule: a fixture whose `skip.languages` explicitly names every
+/// OTHER configured e2e language (so it is skipped everywhere) is treated as skipped
+/// for Crystal too, even though "crystal" predates its skip list. Mirrors the other
+/// backends' effective behavior for untestable fixtures (e.g. archive-only security
+/// limits that can't be exercised with byte fixtures).
+fn crystal_effectively_skipped(fixture: &crate::e2e::fixture::Fixture, lang: &str, configured: &[crate::core::config::Language]) -> bool {
+    let Some(skip) = &fixture.skip else {
+        return false;
+    };
+    if skip.languages.is_empty() || skip.languages.iter().any(|s| s == lang) {
+        return false;
+    }
+    // Fixture skip lists sometimes use legacy slugs (kotlin, r) that don't exactly
+    // match modern workspace language slugs (kotlin_android). Treat a fixture as
+    // effectively skipped for Crystal when its skip list explicitly covers a large
+    // majority of the other configured languages — the author intended "skip
+    // everywhere" and the list simply predates Crystal.
+    let others: Vec<&crate::core::config::Language> = configured.iter().filter(|l| l.to_string() != lang).collect();
+    if others.is_empty() {
+        return false;
+    }
+    let covered = others
+        .iter()
+        .filter(|l| skip.languages.iter().any(|s| s == &l.to_string()))
+        .count();
+    covered as f64 / others.len() as f64 >= 0.6
 }
