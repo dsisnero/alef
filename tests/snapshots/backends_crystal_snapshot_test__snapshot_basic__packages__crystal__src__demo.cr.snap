@@ -49,6 +49,8 @@ module Demo
     getter value : Int32 = 0
     getter label : String = ""
     getter tag : String?
+    def initialize
+    end
   end
 
   # Processing status.
@@ -74,7 +76,11 @@ module Demo
   def self.build(config : Config) : Config
     __handle_config = LibDemo.config_from_json(config.to_json)
     __ptr = LibDemo.build(__handle_config)
-    raise "LibDemo.build returned a null pointer" if __ptr.null?
+    if __ptr.null?
+      __ctx_ptr = LibDemo.last_error_context
+      raise String.new(__ctx_ptr) unless __ctx_ptr.null?
+      raise "LibDemo.build returned a null pointer"
+    end
     __json_ptr = LibDemo.config_to_json(__ptr)
     LibDemo.config_free(__ptr)
     __json = String.new(__json_ptr)

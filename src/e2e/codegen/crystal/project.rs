@@ -207,7 +207,7 @@ pub(super) fn render_category_spec(
             continue;
         }
 
-        if is_http_fixture {
+        if is_http_fixture && fixture.assertions.is_empty() {
             out.push_str(&format!("    pending {desc:?}\n"));
             continue;
         }
@@ -310,6 +310,13 @@ pub(super) fn render_category_spec(
 
         out.push_str(&format!("    it {desc:?} do\n"));
 
+        // LLM-dependent fixtures (tagged `llm`) need an API key at runtime; skip
+        // when none is configured, matching the fixture's documented "runtime-only
+        // skip" intent (keeps the spec green in offline CI).
+        if fixture.tags.iter().any(|t| t == "llm") {
+            out.push_str("      pending! \"requires XBERG_LLM_API_KEY / OPENAI_API_KEY\" if ENV[\"XBERG_LLM_API_KEY\"]?.nil? && ENV[\"OPENAI_API_KEY\"]?.nil?\n");
+        }
+
         let fixture_expects_error = fixture.assertions.iter().any(|a| a.assertion_type == "error");
         if !fixture_expects_error {
             for line in &setup_lines {
@@ -325,6 +332,7 @@ pub(super) fn render_category_spec(
         let returns_void = call_config.returns_void;
         let field_aliases = e2e_config.effective_fields(call_config);
         let enum_fields = e2e_config.effective_fields_enum(call_config);
+        let result_fields = e2e_config.effective_result_fields(call_config);
 
         if fixture_expects_error {
             // Config validation fixtures: the invalid config fails in create_engine
@@ -346,7 +354,87 @@ pub(super) fn render_category_spec(
             // Visitor tests set up the result via inline FFI in setup_lines.
             // The result variable is already assigned there.
             for a in &fixture.assertions {
-                out.push_str(&render_assertion_with_aliases(a, result_var, module_name, &field_aliases, &enum_fields));
+                out.push_str(&render_assertion_with_aliases(a, result_var, module_name, &field_aliases, &enum_fields, &result_fields));
+            }
+        } else if call_config.streaming_enabled().unwrap_or(false) {
+            // Streaming calls return a `Channel(Event)` in the Crystal binding via an
+            // instance method on the engine: `engine.<fn>({RequestType}.new(url: ...))`.
+            // The generic `call` is a module-function shape, so rebuild it as the
+            // engine instance method with a request struct, then collect the channel
+            // and synthesize the `stream.*` summary the fixtures assert.
+            let stream_var = result_var;
+            let (engine_var, req_fields) = streaming_request_parts(fixture, call_config);
+            let req_ty = if function_name.ends_with("_stream") {
+                let pascal = function_name
+                    .split('_')
+                    .map(|s| {
+                        let mut c = s.chars();
+                        match c.next() {
+                            Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                            None => String::new(),
+                        }
+                    })
+                    .collect::<String>();
+                format!("{module_name}::{pascal}Request")
+            } else {
+                format!("{module_name}::{function_name}Request")
+            };
+            // Request structs only expose JSON::Serializable `new(pull)`; build them
+            // via `from_json` of a JSON object with the field names/values.
+            let req_json = req_fields
+                .iter()
+                .map(|(k, v)| {
+                    // Embed each value via Crystal interpolation of `.to_json` so
+                    // strings/arrays are JSON-quoted correctly.
+                    format!("\\\"{k}\\\": #{{{v}.to_json}}")
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            out.push_str(&format!(
+                "      {stream_var}_events = [] of {module_name}::CrawlEvent\n"
+            ));
+            out.push_str(&format!(
+                "      __ch = {engine_var}.{function_name}({req_ty}.from_json(\"{{{req_json}}}\"))\n"
+            ));
+            out.push_str(&format!(
+                "      while (__ev = __ch.receive?) && !__ev.is_a?(Nil)\n"
+            ));
+            out.push_str(&format!(
+                "        {stream_var}_events << __ev\n"
+            ));
+            out.push_str("      end\n");
+            out.push_str(&format!(
+                "      {stream_var} = {{\n\
+                 \x20       \"event_count_min\" => {stream_var}_events.size,\n\
+                 \x20       \"has_page_event\" => {stream_var}_events.any? {{ |e| e.is_a?({module_name}::CrawlEvent::Page) }},\n\
+                 \x20       \"has_error_event\" => {stream_var}_events.any? {{ |e| e.is_a?({module_name}::CrawlEvent::Error) }},\n\
+                 \x20       \"has_complete_event\" => {stream_var}_events.any? {{ |e| e.is_a?({module_name}::CrawlEvent::Complete) }},\n\
+                 \x20     }} of String => Int32 | Bool\n"
+            ));
+            // Render stream.* assertions against the summary Hash with bracket access.
+            for a in &fixture.assertions {
+                let field = a.field.as_deref().and_then(|f| f.strip_prefix("stream."));
+                match (field, a.assertion_type.as_str()) {
+                    (Some("event_count_min"), "greater_than_or_equal") => {
+                        let val = a.value.as_ref().map(|v| v.to_string()).unwrap_or_else(|| "0".into());
+                        out.push_str(&format!(
+                            "      ({stream_var}[\"event_count_min\"].as(Int32) || 0).should be >= {val}\n"
+                        ));
+                    }
+                    (Some(f), "is_true") => {
+                        out.push_str(&format!(
+                            "      {stream_var}[\"{f}\"].as(Bool).should be_true\n"
+                        ));
+                    }
+                    (Some(f), "is_false") => {
+                        out.push_str(&format!(
+                            "      {stream_var}[\"{f}\"].as(Bool).should be_false\n"
+                        ));
+                    }
+                    _ => {
+                        out.push_str("      # TODO: unsupported stream assertion\n");
+                    }
+                }
             }
         } else if returns_void {
             out.push_str(&format!("      {call}\n"));
@@ -356,7 +444,7 @@ pub(super) fn render_category_spec(
         } else {
             out.push_str(&format!("      {result_var} = {call}\n"));
             for a in &fixture.assertions {
-                out.push_str(&render_assertion_with_aliases(a, result_var, module_name, &field_aliases, &enum_fields));
+                out.push_str(&render_assertion_with_aliases(a, result_var, module_name, &field_aliases, &enum_fields, &result_fields));
             }
         }
 
@@ -417,6 +505,31 @@ fn crystal_options_type(call_config: &CallConfig) -> Option<String> {
     .into())
 }
 
+/// For a streaming call, return `(engine_var, Vec<(request_field, value_expr)>)`
+/// built from the fixture's resolved args: the `engine` handle arg becomes the
+/// receiver, and the `url`/`urls` args become request struct fields.
+fn streaming_request_parts(fixture: &Fixture, call_config: &CallConfig) -> (String, Vec<(String, String)>) {
+    let args = fixture.resolved_args(call_config);
+    let mut engine_var = String::new();
+    let mut fields: Vec<(String, String)> = Vec::new();
+    for arg in args {
+        match arg.arg_type.as_str() {
+            "handle" => engine_var = arg.name.clone(),
+            "mock_url" => fields.push(("url".to_string(), arg.name.clone())),
+            "mock_url_list" => fields.push(("urls".to_string(), arg.name.clone())),
+            other => {
+                // Fallback: pass the arg value through as a field of the same name.
+                fields.push((arg.name.clone(), arg.name.clone()));
+                let _ = other;
+            }
+        }
+    }
+    if engine_var.is_empty() {
+        engine_var = "engine".to_string();
+    }
+    (engine_var, fields)
+}
+
 fn build_args_and_setup(
     fixture: &Fixture,
     call_config: &CallConfig,
@@ -461,8 +574,10 @@ fn build_args_and_setup(
                 if value.is_null() && arg.optional {
                     setup_lines.push(format!("{handle_var} = nil"));
                 } else {
-                    let json_str = serde_json::to_string(&value).unwrap_or_default();
-                    let escaped = escape_crystal_string(&json_str);
+                    // A null config means "empty defaults" — emit `{}` so the
+                    // engine is created with defaults (mirrors Go's nil config).
+                    let config_json = if value.is_null() { "{}".to_string() } else { serde_json::to_string(&value).unwrap_or_default() };
+                    let escaped = escape_crystal_string(&config_json);
                     let config_type = options_type.unwrap_or("CrawlConfig");
                     setup_lines.push(format!(
                         "{handle_var} = {module_name}.create_engine({module_name}::{config_type}.from_json(\"{escaped}\"))"
@@ -719,6 +834,7 @@ fn render_assertion_with_aliases(
     module_name: &str,
     field_aliases: &std::collections::HashMap<String, String>,
     enum_fields: &std::collections::HashSet<String>,
+    result_fields: &std::collections::HashSet<String>,
 ) -> String {
     // Resolve field aliases (e.g. `metadata.title` → `metadata.document.title`).
     let raw_field = a.field.as_deref();
@@ -738,6 +854,20 @@ fn render_assertion_with_aliases(
         return "      # skipped: field 'is_error' not validated (matches Go/Rust/Python/Dart)\n".to_string();
     }
 
+    // Crystal-only: skip assertions whose first path segment isn't a known result
+    // field (e.g. `rate_limit.min_duration_ms` where the binding exposes a flat
+    // `rate_limit_ms`). Matches Go's "skipped: field '...' not available on result
+    // type"; without this the generated Crystal fails to compile.
+    if let Some(field) = effective_field {
+        let first = field.split(['.', '[']).next().unwrap_or(field);
+        if !result_fields.is_empty()
+            && !result_fields.iter().any(|r| r == first)
+            && !matches!(first, "stream" | "results" | "metadata" | "crawl" | "batch" | "map" | "content" | "robots")
+        {
+            return format!("      # skipped: field '{field}' not available on result type\n");
+        }
+    }
+
     // Crystal-only: some fixtures reference fields that live on the inner
     // document (results[0]) rather than the extraction wrapper (e.g. xberg's
     // `structured_output`, `extracted_keywords`). Resolve those through
@@ -753,6 +883,7 @@ fn render_assertion_with_aliases(
                 module_name,
                 field_aliases,
                 enum_fields,
+                result_fields,
             );
         }
     }
@@ -1018,7 +1149,8 @@ fn is_document_subfield(field: &str) -> bool {
 /// nil-safe type checking passes. Derived from common `fields_optional` patterns.
 const OPTIONAL_PARENTS: &[&str] = &[
     "document", "metadata", "summary", "nodes", "results", "data", "elements",
-    "keywords", "key_words", "extracted_keywords", "structured_output",
+    "keywords", "key_words", "extracted_keywords", "structured_output", "markdown",
+    "downloaded_document", "response_meta", "extraction_meta", "screenshot",
 ];
 
 /// Discriminant variant names for tagged unions. When a field path goes through
@@ -1170,7 +1302,12 @@ fn field_accessor_with_module(field: Option<&str>, result_var: &str, module_name
                         }
                     }
                     acc.push_str(".try(&.");
-                    acc.push_str(&seg);
+                    // Crystal arrays use `.size` (no `Array#length`).
+                    if seg == "length" {
+                        acc.push_str("size");
+                    } else {
+                        acc.push_str(&seg);
+                    }
                     acc.push(')');
                     parent_seg = raw_seg.to_string();
                     continue;

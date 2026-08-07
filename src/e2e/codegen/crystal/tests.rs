@@ -924,16 +924,16 @@ fn http_fixtures_emit_pending() {
 
     let spec = file(&files, "spec/http_tests_spec.cr").unwrap();
     assert!(
-        spec.contains("pending \"fixture http_test\""),
-        "HTTP fixture should be pending: {spec}"
+        !spec.contains("pending \"fixture http_test\""),
+        "HTTP fixture with assertions should generate a real test, not pending: {spec}"
     );
     assert!(
-        !spec.contains("Demo.convert"),
-        "HTTP fixture should not call function: {spec}"
+        spec.contains("Demo.convert"),
+        "HTTP fixture with assertions should call the function: {spec}"
     );
     assert!(
-        !spec.contains("__result ="),
-        "HTTP fixture should not have result: {spec}"
+        spec.contains("__result ="),
+        "HTTP fixture with assertions should assign result: {spec}"
     );
 }
 
