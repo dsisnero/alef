@@ -84,6 +84,12 @@ pub(super) fn render_spec_helper(
         let _ = writeln!(out, "    # MOCK_SERVER_NO_STDIN_WATCH makes the server block on SIGTERM (not stdin");
         let _ = writeln!(out, "    # EOF), so the Crystal spec process can reap it cleanly in after_suite.");
         out.push_str("    pid = Process.new(mock_server_path, [fixtures_path], output: writer, env: {\"MOCK_SERVER_NO_STDIN_WATCH\" => \"1\"})\n");
+        let _ = writeln!(out, "    # chdir to the test_documents directory so fixture file paths like");
+        let _ = writeln!(out, "    # \"pdf/fake_memo.pdf\" resolve correctly — mirrors Go's os.Chdir in TestMain.");
+        let _ = writeln!(out, "    test_docs = File.join(__DIR__, \"..\", \"..\", \"..\", \"test_documents\")");
+        let _ = writeln!(out, "    if Dir.exists?(test_docs)");
+        let _ = writeln!(out, "      Dir.cd(test_docs)");
+        let _ = writeln!(out, "    end");
         let _ = writeln!(out, "    writer.close");
         let _ = writeln!(out, "    line = reader.gets");
         let _ = writeln!(out, "    if line && line.starts_with?(\"MOCK_SERVER_URL=\")");
@@ -432,7 +438,17 @@ fn build_args_and_setup(
     }
 
     for arg in args {
-        let value = resolve_json_field(&fixture.input, &arg.field);
+        // Mirror Go's json_object resolution: `field = "input"` means the whole
+        // fixture input (or its `extract_input` sub-field when present).
+        let value = if arg.arg_type == "json_object" && arg.field == "input" {
+            fixture
+                .input
+                .get("extract_input")
+                .filter(|v| !v.is_null())
+                .unwrap_or(&fixture.input)
+        } else {
+            resolve_json_field(&fixture.input, &arg.field)
+        };
 
         match arg.arg_type.as_str() {
             "handle" => {
@@ -550,14 +566,16 @@ fn build_args_and_setup(
                 }
             }
             "json_object" => {
-                if value.is_null() && arg.optional {
+                if value.is_null() && arg.optional && arg.name != "config" {
                     // Pass nil directly — the Crystal wrapper handles null as
                     // "use defaults" (passes a null pointer to the Rust FFI).
                     call_parts.push("nil".to_string());
                 } else if value.is_null() {
-                    // Non-optional json_object with no value → pass empty
-                    // defaults; the Rust side deserializes {} as Default::default()
-                    // for all #[serde(default)] fields.
+                    // Non-optional json_object (or an omitted `config`) with no value
+                    // → pass empty defaults; the Rust side deserializes {} as
+                    // Default::default() for all #[serde(default)] fields. An
+                    // optional `config` still maps to a typed from_json("{}") because
+                    // most bindings' config params are non-nilable.
                     let escaped = escape_crystal_string("{}");
                     let ctor_type = if arg.name == "config" {
                         options_type.or(arg.element_type.as_deref())
@@ -579,16 +597,38 @@ fn build_args_and_setup(
                     } else {
                         arg.element_type.as_deref().or(options_type)
                     };
+                    // Substitute `$mock_url` placeholders (e.g. fixture URIs served by
+                    // the e2e mock server) with the resolved base URL, mirroring Go.
+                    let needs_mock_sub = crate::e2e::codegen::value_contains_mock_url_placeholder(&value);
+                    if needs_mock_sub {
+                        let env_key = crate::e2e::codegen::mock_url_env_key(&fixture.id);
+                        let var = format!("__mock_base_{}", arg.name);
+                        setup_lines.push(format!(
+                            "{var} = ENV[\"{env_key}\"]? || (ENV[\"MOCK_SERVER_URL\"]? || \"\") + \"/fixtures/{id}\"",
+                            id = fixture.id,
+                        ));
+                    }
+                    let json_expr = if needs_mock_sub {
+                        let var = format!("__mock_base_{}", arg.name);
+                        format!(
+                            "(__mock_input_{n} = \"{escaped}\"; __mock_input_{n}.gsub(\"$mock_url\", {var}))",
+                            n = arg.name,
+                        )
+                    } else {
+                        format!("\"{escaped}\"")
+                    };
                     if let Some(type_name) = ctor_type {
                         if value.is_array() {
-                            call_parts.push(format!("Array({module_name}::{type_name}).from_json(\"{escaped}\")"));
+                            call_parts.push(format!(
+                                "Array({module_name}::{type_name}).from_json(({json_expr}))"
+                            ));
                         } else {
-                            call_parts.push(format!("{module_name}::{type_name}.from_json(\"{escaped}\")"));
+                            call_parts.push(format!("{module_name}::{type_name}.from_json({json_expr})"));
                         }
                     } else if let Some(fallback_type) = crystal_options_type(call_config) {
-                        call_parts.push(format!("{module_name}::{fallback_type}.from_json(\"{escaped}\")"));
+                        call_parts.push(format!("{module_name}::{fallback_type}.from_json({json_expr})"));
                     } else {
-                        call_parts.push(format!("\"{escaped}\""));
+                        call_parts.push(json_expr);
                     }
                 }
             }
@@ -693,6 +733,24 @@ fn render_assertion_with_aliases(
         return "      # skipped: field 'is_error' not validated (matches Go/Rust/Python/Dart)\n".to_string();
     }
 
+    // Crystal-only: some fixtures reference fields that live on the inner
+    // document (results[0]) rather than the extraction wrapper (e.g. xberg's
+    // `structured_output`, `extracted_keywords`). Resolve those through
+    // `results[0].` so the assertion compiles against the Crystal binding.
+    if let Some(field) = effective_field {
+        if !field.contains('.') && !field.contains('[') && is_document_subfield(field) {
+            return render_assertion_with_aliases(
+                &crate::e2e::fixture::Assertion {
+                    field: Some(format!("results[0].{field}")),
+                    ..a.clone()
+                },
+                result_var,
+                module_name,
+                field_aliases,
+            );
+        }
+    }
+
     // Array-field access: `links[].link_type` means "on each element of links,
     // access link_type". Crystal needs an `any?` / `all?` iteration block.
     if let Some(field) = effective_field {
@@ -775,14 +833,14 @@ fn render_assertion_with_aliases(
                 "max_length" => "be <=",
                 _ => unreachable!(),
             };
-            // When the accessor uses `.try`, use `.to_s` to handle nil safely
-            // (nil.to_s returns ""; array.to_s returns "[...]")
-            let size_acc = if acc.contains(".try(") {
-                format!("{acc}.to_s")
+            // For count assertions the field is an array (possibly nilable through
+            // a `.try` chain). Call `.size` on the array and default to 0 when the
+            // chain is nil — never `.to_s.size` (measures string length).
+            if acc.contains(".try(") {
+                format!("      ({acc}.try(&.size) || 0).should {cmp}({val})\n")
             } else {
-                acc.clone()
-            };
-            format!("      {size_acc}.size.should {cmp}({val})\n")
+                format!("      {acc}.size.should {cmp}({val})\n")
+            }
         }
         "is_true" => format!("      {acc}.should be_true\n"),
         "is_false" => format!("      {acc}.should be_false\n"),
@@ -911,6 +969,35 @@ fn strip_wrapper_namespace(field: Option<&str>) -> Option<&str> {
             Some(f)
         }
     })
+}
+
+/// Fields that live on the inner extracted document (`results[0]`) of a wrapper
+/// result (e.g. xberg's `ExtractionResult` → `ExtractedDocument`), referenced by
+/// some fixtures without the `results[0].` prefix. Crystal-only resolution so the
+/// fixture file stays shared across backends.
+fn is_document_subfield(field: &str) -> bool {
+    matches!(
+        field,
+        "structured_output"
+            | "extracted_keywords"
+            | "mime_type"
+            | "content"
+            | "document"
+            | "elements"
+            | "summary"
+            | "metadata"
+            | "quality_score"
+            | "format"
+            | "pages"
+            | "images"
+            | "chunks"
+            | "tables"
+            | "ocr"
+            | "audio"
+            | "video"
+            | "searchable"
+            | "attachments"
+    )
 }
 
 /// Known optional field prefixes in Crystal bindings. When an assertion field

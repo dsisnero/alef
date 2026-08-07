@@ -346,6 +346,47 @@ impl CrystalBackend {
             .filter(|en| en.serde_tag.is_some() && !en.binding_excluded)
             .map(|en| en.name.clone())
             .collect();
+        // For internally-tagged enums, map the enum name → the wire value of its
+        // `#[default]` variant (falling back to the first variant). Used to emit a
+        // valid default for the abstract-class type: `from_json("{\"<tag>\":\"<wire>\"}")`.
+        let serde_tagged_defaults: HashMap<String, String> = api
+            .enums
+            .iter()
+            .filter(|en| en.serde_tag.is_some() && !en.binding_excluded)
+            .filter_map(|en| {
+                let tag = en.serde_tag.as_deref()?;
+                let default_var = en
+                    .variants
+                    .iter()
+                    .find(|v| !v.binding_excluded && v.is_default)
+                    .or_else(|| en.variants.iter().find(|v| !v.binding_excluded))?;
+                let wire = wire_variant_value(&default_var.name, default_var.serde_rename.as_deref(), en.serde_rename_all.as_deref());
+                Some((en.name.clone(), format!("{tag:?}: {wire:?}")))
+            })
+            .collect();
+        // For externally-tagged enums (unit + data variants, custom `new(pull)`),
+        // map the enum name → the Crystal subclass constructor of its `#[default]`
+        // unit variant, e.g. `OutputFormat::Plain`. Only when a default unit variant
+        // exists. Used by struct_default_expr to default such fields.
+        let external_defaults: HashMap<String, String> = api
+            .enums
+            .iter()
+            .filter(|en| en.serde_tag.is_none() && !en.serde_untagged && !en.binding_excluded)
+            .filter_map(|en| {
+                let unit_variants: Vec<&crate::core::ir::EnumVariant> = en
+                    .variants
+                    .iter()
+                    .filter(|v| !v.binding_excluded && v.fields.is_empty() && !v.is_tuple && !v.originally_had_data_fields)
+                    .collect();
+                let default_var = unit_variants
+                    .iter()
+                    .find(|v| v.is_default)
+                    .or_else(|| unit_variants.first())?;
+                let tn = crystal_type_name(&en.name);
+                let class = crystal_type_name(&default_var.name);
+                Some((en.name.clone(), format!("{tn}::{class}.new")))
+            })
+            .collect();
         // Unit enums whose wire (serde) value differs from the Crystal variant name
         // need a JSON converter module so `JSON::Serializable` can map wire strings
         // (e.g. "og:image") to variants (OgImage). See gen_enum_converter.
@@ -382,7 +423,7 @@ impl CrystalBackend {
                 ));
                 continue;
             }
-            out.push_str(&Self::gen_struct(ty, opaque, &enum_first_variant, &serde_tagged_enums, &enum_converters));
+            out.push_str(&Self::gen_struct(ty, opaque, &enum_first_variant, &serde_tagged_enums, &enum_converters, &serde_tagged_defaults, &external_defaults));
         }
         for en in &api.enums {
             if en.binding_excluded {
@@ -404,7 +445,7 @@ impl CrystalBackend {
 
     /// Emit a Crystal `class` (reference type, so self-referential DTOs are legal)
     /// with `JSON::Serializable` and one getter per field.
-    fn gen_struct(ty: &TypeDef, opaque: &HashSet<String>, enum_first_variant: &HashMap<String, String>, serde_tagged_enums: &HashSet<String>, enum_converters: &HashSet<String>) -> String {
+    fn gen_struct(ty: &TypeDef, opaque: &HashSet<String>, enum_first_variant: &HashMap<String, String>, serde_tagged_enums: &HashSet<String>, enum_converters: &HashSet<String>, serde_tagged_defaults: &HashMap<String, String>, external_defaults: &HashMap<String, String>) -> String {
         let name = crystal_type_name(&ty.name);
         let mut out = String::new();
         out.push('\n');
@@ -444,16 +485,16 @@ impl CrystalBackend {
                 out.push_str(&format!("    getter {field_name} : {field_ty}\n"));
                 continue;
             }
-            // Bytes (Slice) does not implement JSON::Serializable in Crystal stdlib.
-            // Nilable Bytes? → ignore (struct can still use from_json for other fields).
-            // Non-nilable Bytes → emit a default `Bytes.empty` so the constructor is satisfied.
-            if field.optional && field_type_contains_bytes(&field.ty) {
-                out.push_str("    @[JSON::Field(ignore: true)]\n");
-                out.push_str(&format!("    getter {field_name} : {field_ty}\n"));
-                continue;
-            } else if !field.optional && field_type_contains_bytes(&field.ty) {
-                out.push_str("    @[JSON::Field(ignore: true)]\n");
-                out.push_str(&format!("    getter {field_name} : Bytes = Bytes.empty\n"));
+            // Bytes fields: represent as `Array(UInt8)` so the value object
+            // round-trips through JSON (Rust serializes `Vec<u8>` as a JSON array
+            // of ints, matching Go's `[]byte`). `Bytes` (Slice) has no stdlib
+            // JSON::Serializable, so we use Array(UInt8) instead.
+            if field_type_contains_bytes(&field.ty) {
+                if field.optional {
+                    out.push_str(&format!("    getter {field_name} : Array(UInt8)?\n"));
+                } else {
+                    out.push_str(&format!("    getter {field_name} : Array(UInt8) = [] of UInt8\n"));
+                }
                 continue;
             }
             // Emit a default value in the getter declaration so partial JSON input
@@ -464,13 +505,32 @@ impl CrystalBackend {
                 let default_expr = crystal_default_expr(&field.typed_default, &field.default)
                     .or_else(|| type_based_default_expr(&field.ty))
                     .or_else(|| enum_default_expr(&field.ty, enum_first_variant))
-                    .or_else(|| struct_default_expr(&field.ty, serde_tagged_enums));
+                    .or_else(|| external_enum_default_expr(&field.ty, external_defaults))
+                    .or_else(|| struct_default_expr(&field.ty, serde_tagged_enums, serde_tagged_defaults));
                 if let Some(crystal_default) = default_expr {
                     out.push_str(&format!("    getter {field_name} : {field_ty} = {crystal_default}\n"));
                     continue;
                 }
             }
             out.push_str(&format!("    getter {field_name} : {field_ty}\n"));
+        }
+        // Zero-arg constructor: `Config.new` yields all getter-defaults and
+        // serializes to Rust's default shape (mirrors Go's `Config{}`, Python's
+        // `.default()`, Ruby's `Default::default()`). `from_json` still handles
+        // partial/full input. Only emitted when every non-nilable field has a
+        // safe getter default (see F4 + enum default fixes).
+        if !ty.is_opaque {
+            let all_defaultable = ty.fields.iter().filter(|f| !f.binding_excluded).all(|f| {
+                f.optional
+                    || crystal_default_expr(&f.typed_default, &f.default).is_some()
+                    || type_based_default_expr(&f.ty).is_some()
+                    || enum_default_expr(&f.ty, enum_first_variant).is_some()
+                    || external_enum_default_expr(&f.ty, external_defaults).is_some()
+                    || struct_default_expr(&f.ty, serde_tagged_enums, serde_tagged_defaults).is_some()
+            });
+            if all_defaultable {
+                out.push_str("    def initialize\n    end\n");
+            }
         }
         out.push_str("  end\n");
         out
@@ -962,6 +1022,14 @@ impl CrystalBackend {
                                 if key != getter {
                                     out.push_str(&format!("    @[JSON::Field(key: {key:?})]\n"));
                                 }
+                                if !f.optional {
+                                    if let Some(def) = type_based_default_expr(&f.ty)
+                                        .or_else(|| crystal_default_expr(&f.typed_default, &f.default))
+                                    {
+                                        out.push_str(&format!("    getter {getter} : {ty} = {def}\n"));
+                                        continue;
+                                    }
+                                }
                                 out.push_str(&format!("    getter {getter} : {ty}\n"));
                             }
                         }
@@ -983,6 +1051,16 @@ impl CrystalBackend {
                         }
                         if key != getter {
                             out.push_str(&format!("    @[JSON::Field(key: {key:?})]\n"));
+                        }
+                        // Non-nilable variant fields get a type-based getter default so
+                        // partial JSON (and the enum's default constructor) round-trip.
+                        if !f.optional {
+                            if let Some(def) = type_based_default_expr(&f.ty)
+                                .or_else(|| crystal_default_expr(&f.typed_default, &f.default))
+                            {
+                                out.push_str(&format!("    getter {getter} : {ty} = {def}\n"));
+                                continue;
+                            }
                         }
                         out.push_str(&format!("    getter {getter} : {ty}\n"));
                     }
@@ -1498,9 +1576,17 @@ impl CrystalBackend {
             let type_snake = public_host_identifier(Language::Crystal, PublicIdentifierKind::Function, type_name);
             let mut b = String::new();
             b.push_str(&format!("    __ptr = {call}\n"));
+            // On a null pointer, surface the FFI's last-error context (the Rust
+            // side records a message via set_last_error) instead of a bare raise.
+            b.push_str("    if __ptr.null?\n");
             b.push_str(&format!(
-                "    raise \"{lib_name}.{label} returned a null pointer\" if __ptr.null?\n"
+                "      __ctx_ptr = {lib_name}.last_error_context\n"
             ));
+            b.push_str("      raise String.new(__ctx_ptr) unless __ctx_ptr.null?\n");
+            b.push_str(&format!(
+                "      raise \"{lib_name}.{label} returned a null pointer\"\n"
+            ));
+            b.push_str("    end\n");
             b.push_str(&format!("    __json_ptr = {lib_name}.{type_snake}_to_json(__ptr)\n"));
             b.push_str(&format!("    {lib_name}.{type_snake}_free(__ptr)\n"));
             b.push_str("    __json = String.new(__json_ptr)\n");
@@ -1673,9 +1759,24 @@ fn crystal_default_expr(typed_default: &Option<DefaultValue>, default: &Option<S
 /// For a named type that is a Crystal struct with all-defaultable fields,
 /// default to `Type.from_json("{}")`. This mirrors Rust's `Default` trait
 /// for struct types that have `#[serde(default)]` on all their fields.
-fn struct_default_expr(ty: &TypeRef, serde_tagged_enums: &HashSet<String>) -> Option<String> {
+fn struct_default_expr(
+    ty: &TypeRef,
+    serde_tagged_enums: &HashSet<String>,
+    serde_tagged_defaults: &HashMap<String, String>,
+) -> Option<String> {
     match ty {
-        TypeRef::Named(n) if !serde_tagged_enums.contains(n) => {
+        TypeRef::Named(n) if serde_tagged_enums.contains(n) => {
+            // Internally-tagged enums are abstract classes keyed on a discriminator,
+            // so `from_json("{}")` fails (missing tag). Default to the `#[default]`
+            // variant's wire value: `from_json("{\"<tag>\":\"<wire>\"}")`.
+            let tn = crystal_type_name(n);
+            let tag_default = serde_tagged_defaults.get(n)?;
+            // tag_default is `"mode": "auto"`; embed it in a Crystal string literal
+            // with escaped quotes so `from_json` sees `{"mode": "auto"}`.
+            let escaped = tag_default.replace('"', "\\\"");
+            Some(format!("{tn}.from_json(\"{{{escaped}}}\")"))
+        }
+        TypeRef::Named(n) => {
             let tn = crystal_type_name(n);
             Some(format!("{tn}.from_json(\"{{}}\")"))
         }
@@ -1690,6 +1791,15 @@ fn enum_default_expr(ty: &TypeRef, enum_first_variant: &HashMap<String, String>)
         TypeRef::Named(n) => enum_first_variant
             .get(n)
             .map(|first_var| format!("{n}::{}", first_var)),
+        _ => None,
+    }
+}
+
+/// For an externally-tagged enum (custom `new(pull)`) with a default unit
+/// variant, emit its subclass constructor (e.g. `OutputFormat::Plain.new`).
+fn external_enum_default_expr(ty: &TypeRef, external_defaults: &HashMap<String, String>) -> Option<String> {
+    match ty {
+        TypeRef::Named(n) => external_defaults.get(n).cloned(),
         _ => None,
     }
 }
