@@ -324,6 +324,7 @@ pub(super) fn render_category_spec(
         }
         let returns_void = call_config.returns_void;
         let field_aliases = e2e_config.effective_fields(call_config);
+        let enum_fields = e2e_config.effective_fields_enum(call_config);
 
         if fixture_expects_error {
             // Config validation fixtures: the invalid config fails in create_engine
@@ -345,7 +346,7 @@ pub(super) fn render_category_spec(
             // Visitor tests set up the result via inline FFI in setup_lines.
             // The result variable is already assigned there.
             for a in &fixture.assertions {
-                out.push_str(&render_assertion_with_aliases(a, result_var, module_name, &field_aliases));
+                out.push_str(&render_assertion_with_aliases(a, result_var, module_name, &field_aliases, &enum_fields));
             }
         } else if returns_void {
             out.push_str(&format!("      {call}\n"));
@@ -355,7 +356,7 @@ pub(super) fn render_category_spec(
         } else {
             out.push_str(&format!("      {result_var} = {call}\n"));
             for a in &fixture.assertions {
-                out.push_str(&render_assertion_with_aliases(a, result_var, module_name, &field_aliases));
+                out.push_str(&render_assertion_with_aliases(a, result_var, module_name, &field_aliases, &enum_fields));
             }
         }
 
@@ -717,11 +718,15 @@ fn render_assertion_with_aliases(
     result_var: &str,
     module_name: &str,
     field_aliases: &std::collections::HashMap<String, String>,
+    enum_fields: &std::collections::HashSet<String>,
 ) -> String {
     // Resolve field aliases (e.g. `metadata.title` → `metadata.document.title`).
     let raw_field = a.field.as_deref();
     let resolved_field = raw_field.and_then(|f| field_aliases.get(f)).map(|s| s.as_str());
     let effective_field = strip_wrapper_namespace(resolved_field.or(raw_field));
+    // Enum-typed fields (from `fields_enum` config) compare by wire string value,
+    // which is lowercase; Crystal's `.to_s` is PascalCase, so downcase the accessor.
+    let is_enum_field = effective_field.is_some_and(|f| enum_fields.contains(f));
 
     // Virtual field `is_error` — not a real struct field. Other backends (Go,
     // Rust, Python, Dart, Zig) skip this assertion entirely ("field 'is_error'
@@ -747,6 +752,7 @@ fn render_assertion_with_aliases(
                 result_var,
                 module_name,
                 field_aliases,
+                enum_fields,
             );
         }
     }
@@ -765,9 +771,16 @@ fn render_assertion_with_aliases(
     match a.assertion_type.as_str() {
         "equals" => match &a.value {
             // Strip trailing whitespace for string comparisons, matching the
-            // PHP/TypeScript backends which also trim before asserting.
+            // PHP/TypeScript backends which also trim before asserting. Enum
+            // fields compare by their lowercase wire value, so downcase the
+            // PascalCase `.to_s`.
             Some(v @ serde_json::Value::String(_)) => {
-                format!("      {acc}.to_s.strip.should eq({})\n", crystal_lit(v))
+                let val = crystal_lit(v);
+                if is_enum_field {
+                    format!("      {acc}.to_s.downcase.strip.should eq({val})\n")
+                } else {
+                    format!("      {acc}.to_s.strip.should eq({val})\n")
+                }
             }
             Some(v) => format!("      {acc}.should eq({})\n", crystal_lit(v)),
             None => "      # equals assertion missing value\n".to_string(),
