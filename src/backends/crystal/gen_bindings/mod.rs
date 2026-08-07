@@ -346,6 +346,25 @@ impl CrystalBackend {
             .filter(|en| en.serde_tag.is_some() && !en.binding_excluded)
             .map(|en| en.name.clone())
             .collect();
+        // Unit enums whose wire (serde) value differs from the Crystal variant name
+        // need a JSON converter module so `JSON::Serializable` can map wire strings
+        // (e.g. "og:image") to variants (OgImage). See gen_enum_converter.
+        let enum_converters: HashSet<String> = api
+            .enums
+            .iter()
+            .filter(|en| !en.binding_excluded && is_unit_enum(en))
+            .filter(|en| {
+                en.variants.iter().filter(|v| !v.binding_excluded).any(|v| {
+                    let vname = public_host_identifier(Language::Crystal, PublicIdentifierKind::EnumVariant, &v.name);
+                    let wire = wire_variant_value(&v.name, v.serde_rename.as_deref(), en.serde_rename_all.as_deref());
+                    // Crystal's default Enum.parse accepts the PascalCase name and its
+                    // snake/underscore normalization, so only emit a converter when the
+                    // wire value can't round-trip to the variant name.
+                    wire != vname && !crystal_enum_parse_matches(&wire, &vname)
+                })
+            })
+            .map(|en| en.name.clone())
+            .collect();
         let mut out = String::new();
         for ty in &api.types {
             if ty.binding_excluded || ty.is_trait {
@@ -363,13 +382,16 @@ impl CrystalBackend {
                 ));
                 continue;
             }
-            out.push_str(&Self::gen_struct(ty, opaque, &enum_first_variant, &serde_tagged_enums));
+            out.push_str(&Self::gen_struct(ty, opaque, &enum_first_variant, &serde_tagged_enums, &enum_converters));
         }
         for en in &api.enums {
             if en.binding_excluded {
                 continue;
             }
             out.push_str(&Self::gen_enum(en, api));
+            if enum_converters.contains(&en.name) {
+                out.push_str(&Self::gen_enum_converter(en));
+            }
         }
         for err in &api.errors {
             if err.binding_excluded {
@@ -382,7 +404,7 @@ impl CrystalBackend {
 
     /// Emit a Crystal `class` (reference type, so self-referential DTOs are legal)
     /// with `JSON::Serializable` and one getter per field.
-    fn gen_struct(ty: &TypeDef, opaque: &HashSet<String>, enum_first_variant: &HashMap<String, String>, serde_tagged_enums: &HashSet<String>) -> String {
+    fn gen_struct(ty: &TypeDef, opaque: &HashSet<String>, enum_first_variant: &HashMap<String, String>, serde_tagged_enums: &HashSet<String>, enum_converters: &HashSet<String>) -> String {
         let name = crystal_type_name(&ty.name);
         let mut out = String::new();
         out.push('\n');
@@ -408,6 +430,11 @@ impl CrystalBackend {
             emit_crystal_doc(&mut out, &field.doc, "    ");
             if wire != field_name {
                 out.push_str(&format!("    @[JSON::Field(key: {wire:?})]\n"));
+            }
+            // Enum fields with custom wire values need a converter annotation so
+            // JSON::Serializable maps wire strings (e.g. "og:image") to variants.
+            if let Some(enum_name) = enum_converter_for_type(&field.ty, enum_converters) {
+                out.push_str(&format!("    @[JSON::Field(converter: {enum_name}Converter)]\n"));
             }
             // Opaque handle types cannot be round-tripped through JSON; they are
             // constructed from FFI pointers and must be set programmatically.
@@ -847,6 +874,37 @@ impl CrystalBackend {
     /// (`#[serde(tag = "...")]` → `{"<tag>":"Variant", ...fields}`), using Crystal's
     /// native `use_json_discriminator` for dispatch. Each subclass re-emits the tag
     /// field (with a default) so `to_json` round-trips.
+    /// Emit a `JSON::Serializable` converter for a unit enum whose wire (serde)
+    /// values differ from the Crystal variant names (e.g. `"og:image"` → OgImage).
+    /// Crystal's default `Enum.parse` only accepts the variant name and its
+    /// underscore/camel normalizations, so these need explicit mapping.
+    fn gen_enum_converter(en: &EnumDef) -> String {
+        let name = crystal_type_name(&en.name);
+        let mut out = String::new();
+        out.push_str(&format!("  module {name}Converter\n"));
+        out.push_str(&format!("    def self.from_json(pull : JSON::PullParser) : {name}\n"));
+        out.push_str(&format!("      case pull.read_string\n"));
+        for v in en.variants.iter().filter(|v| !v.binding_excluded) {
+            let vname = public_host_identifier(Language::Crystal, PublicIdentifierKind::EnumVariant, &v.name);
+            let wire = wire_variant_value(&v.name, v.serde_rename.as_deref(), en.serde_rename_all.as_deref());
+            out.push_str(&format!("      when {wire:?} then {name}::{vname}\n"));
+        }
+        out.push_str(&format!("      else pull.raise \"Unknown {name} value\"\n"));
+        out.push_str("      end\n");
+        out.push_str("    end\n");
+        out.push_str(&format!("    def self.to_json(value : {name}, json : JSON::Builder)\n"));
+        out.push_str("      json.string(case value\n");
+        for v in en.variants.iter().filter(|v| !v.binding_excluded) {
+            let vname = public_host_identifier(Language::Crystal, PublicIdentifierKind::EnumVariant, &v.name);
+            let wire = wire_variant_value(&v.name, v.serde_rename.as_deref(), en.serde_rename_all.as_deref());
+            out.push_str(&format!("      when {name}::{vname} then {wire:?}\n"));
+        }
+        out.push_str("      end)\n");
+        out.push_str("    end\n");
+        out.push_str("  end\n");
+        out
+    }
+
     fn gen_internally_tagged(
         en: &EnumDef,
         name: &str,
@@ -1634,6 +1692,28 @@ fn enum_default_expr(ty: &TypeRef, enum_first_variant: &HashMap<String, String>)
             .map(|first_var| format!("{n}::{}", first_var)),
         _ => None,
     }
+}
+
+/// If a type (including its Option/Vec/Map wrappers) references a unit enum that
+/// needs a JSON converter, return the enum's Crystal type name.
+fn enum_converter_for_type(ty: &TypeRef, enum_converters: &HashSet<String>) -> Option<String> {
+    match ty {
+        TypeRef::Named(n) if enum_converters.contains(n) => Some(crystal_type_name(n)),
+        TypeRef::Optional(inner) | TypeRef::Vec(inner) | TypeRef::Map(_, inner) => {
+            enum_converter_for_type(inner, enum_converters)
+        }
+        _ => None,
+    }
+}
+
+/// Whether Crystal's default `Enum.parse` would accept `wire` for a variant whose
+/// Crystal name is `vname`. Crystal normalizes the input to snake/camel/downcase
+/// and matches against the variant name, so `"img"` matches `Img` but `"og:image"`
+/// does not match `OgImage` (the colon is not a valid separator).
+fn crystal_enum_parse_matches(wire: &str, vname: &str) -> bool {
+    use heck::ToSnakeCase;
+    let snake = vname.to_snake_case();
+    wire == vname || wire.eq_ignore_ascii_case(vname) || wire == snake || wire == snake.to_ascii_lowercase()
 }
 
 /// Infer a Crystal default expression from the type when no explicit default
