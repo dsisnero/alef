@@ -23,4 +23,9 @@ pub struct CrystalConfig {
     /// desired Crystal field name (snake_case).
     #[serde(default)]
     pub rename_fields: HashMap<String, String>,
+    /// Opaque handle types whose FFI handle is BORROWED (owned by the host /
+    /// shared static) — these classes get NO freeing `finalize`, preventing
+    /// double-free when the same handle is wrapped multiple times.
+    #[serde(default)]
+    pub borrowed_handles: Vec<String>,
 }

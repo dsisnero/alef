@@ -557,6 +557,14 @@ pub(super) fn render_category_spec(
 /// If `client_factory` is Some, `mock_url` and `handle` args are skipped
 /// from the method-call arguments (they are used for client construction instead).
 /// Map a call function name to the Crystal request type for typed e2e args.
+/// Whether a type name is a Crystal builtin that must not be module-qualified.
+fn is_crystal_builtin_type(name: &str) -> bool {
+    matches!(
+        name,
+        "String" | "Int32" | "Int64" | "UInt32" | "UInt64" | "Float32" | "Float64" | "Bool" | "Nil"
+    )
+}
+
 fn crystal_options_type(call_config: &CallConfig) -> Option<String> {
     let function = &call_config.function;
     // First check the per-call Crystal overrides for an explicit options_type.
@@ -837,12 +845,16 @@ fn build_args_and_setup(
                         format!("\"{escaped}\"")
                     };
                     if let Some(type_name) = ctor_type {
-                        if value.is_array() {
-                            call_parts.push(format!(
-                                "Array({module_name}::{type_name}).from_json(({json_expr}))"
-                            ));
+                        // Builtin Crystal types (String, Int32, …) are NOT module-qualified.
+                        let qualified = if is_crystal_builtin_type(type_name) {
+                            type_name.to_string()
                         } else {
-                            call_parts.push(format!("{module_name}::{type_name}.from_json({json_expr})"));
+                            format!("{module_name}::{type_name}")
+                        };
+                        if value.is_array() {
+                            call_parts.push(format!("Array({qualified}).from_json(({json_expr}))"));
+                        } else {
+                            call_parts.push(format!("{qualified}.from_json({json_expr})"));
                         }
                     } else if let Some(fallback_type) = crystal_options_type(call_config) {
                         call_parts.push(format!("{module_name}::{fallback_type}.from_json({json_expr})"));

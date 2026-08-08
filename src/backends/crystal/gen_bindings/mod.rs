@@ -262,6 +262,7 @@ impl CrystalBackend {
         async_methods: &[AsyncMethodSpec],
         ffi_structs: &HashSet<String>,
         module_name: &str,
+        borrowed_handles: &HashSet<String>,
     ) -> String {
         let module_name = module_name.to_string();
         let lib_name = Self::lib_name(ffi_prefix);
@@ -285,6 +286,7 @@ impl CrystalBackend {
             async_methods,
             ffi_structs,
             &module_name,
+            borrowed_handles,
         ));
 
         for func in &api.functions {
@@ -317,6 +319,7 @@ impl CrystalBackend {
         async_methods: &[AsyncMethodSpec],
         ffi_structs: &HashSet<String>,
         module_name: &str,
+        borrowed_handles: &HashSet<String>,
     ) -> String {
         // Build a map of unit-enum type name → first variant name so gen_struct
         // can default non-optional enum fields (matching Rust's Default impl which
@@ -445,7 +448,8 @@ impl CrystalBackend {
                     streaming,
                     async_methods,
                     ffi_structs,
-                ));
+            &borrowed_handles,
+        ));
                 continue;
             }
             out.push_str(&Self::gen_struct(ty, opaque, &enum_first_variant, &serde_tagged_enums, &enum_converters, &serde_tagged_defaults, &external_defaults, module_name, &untagged_unions));
@@ -584,6 +588,7 @@ impl CrystalBackend {
         streaming: &[StreamSpec],
         async_methods: &[AsyncMethodSpec],
         ffi_structs: &HashSet<String>,
+        borrowed_handles: &HashSet<String>,
     ) -> String {
         let name = crystal_type_name(&ty.name);
         let type_snake = public_host_identifier(Language::Crystal, PublicIdentifierKind::Function, &ty.name);
@@ -591,13 +596,15 @@ impl CrystalBackend {
         let _ = ffi_prefix;
         let mut out = Self::doc_or_blank(&ty.doc);
         out.push_str(&format!("  class {name}\n"));
-        out.push_str("    # Wraps the owned FFI handle; do not construct directly.\n");
+        out.push_str("    # Wraps the FFI handle; do not construct directly.\n");
         out.push_str("    def initialize(@handle : Void*)\n    end\n");
         out.push_str("    # Raw handle for passing back across the C ABI.\n");
         out.push_str("    def to_unsafe : Void*\n      @handle\n    end\n");
-        out.push_str("    def finalize\n");
-        out.push_str(&format!("      {lib_name}.{free}(@handle) unless @handle.null?\n"));
-        out.push_str("    end\n");
+        if !borrowed_handles.contains(&ty.name) {
+            out.push_str("    def finalize\n");
+            out.push_str(&format!("      {lib_name}.{free}(@handle) unless @handle.null?\n"));
+            out.push_str("    end\n");
+        }
 
         for m in &ty.methods {
             if m.binding_excluded {
@@ -1729,7 +1736,23 @@ impl CrystalBackend {
 
         // For fallible scalar returns (e.g. `Result<usize, Error>`), the C ABI
         // returns the value directly and signals errors via `last_error_code`.
+        // A Unit return (status-only, e.g. `Result<(), Error>` → `-> i32`) has a
+        // Void FFI fun — call it without assigning the result.
         if error_type.is_some() && is_scalar(return_type) {
+            if matches!(return_type, TypeRef::Unit) {
+                let mut b = String::new();
+                b.push_str(&format!("    {call}\n"));
+                b.push_str(&format!("    __code = {lib_name}.last_error_code\n"));
+                b.push_str("    if __code != 0\n");
+                b.push_str(&format!(
+                    "      __ctx_ptr = {lib_name}.last_error_context\n"
+                ));
+                b.push_str("      raise String.new(__ctx_ptr) unless __ctx_ptr.null?\n");
+                b.push_str("      raise \"unknown error\"\n");
+                b.push_str("    end\n");
+                b.push_str("    nil\n");
+                return b;
+            }
             let mut b = String::new();
             b.push_str(&format!("    __result = {call}\n"));
             b.push_str(&format!(
@@ -2346,6 +2369,11 @@ impl Backend for CrystalBackend {
             .as_ref()
             .and_then(|c| c.module_name.clone())
             .unwrap_or_else(|| Self::module_name(&api.crate_name));
+        let borrowed_handles: HashSet<String> = config
+            .crystal
+            .as_ref()
+            .map(|c| c.borrowed_handles.iter().cloned().collect())
+            .unwrap_or_default();
         content.push_str(&Self::gen_module(
             api,
             &ffi_prefix,
@@ -2355,6 +2383,7 @@ impl Backend for CrystalBackend {
             &async_methods,
             &ffi_structs,
             &module_name,
+            &borrowed_handles,
         ));
 
         // Append `require` statements for auxiliary bridge files before finalising content.

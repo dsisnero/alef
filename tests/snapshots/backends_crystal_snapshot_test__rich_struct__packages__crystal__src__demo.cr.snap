@@ -72,7 +72,7 @@ module Demo
 
   # An opaque widget handle.
   class Widget
-    # Wraps the owned FFI handle; do not construct directly.
+    # Wraps the FFI handle; do not construct directly.
     def initialize(@handle : Void*)
     end
     # Raw handle for passing back across the C ABI.
@@ -118,14 +118,14 @@ module Demo
   def self.configure(cfg : Config, opts : Options) : Nil
     __handle_cfg = LibDemo.config_from_json(cfg.to_json)
     __handle_opts = LibDemo.options_from_json(opts.to_json)
-    __result = LibDemo.configure(__handle_cfg, __handle_opts)
+    LibDemo.configure(__handle_cfg, __handle_opts)
     __code = LibDemo.last_error_code
     if __code != 0
       __ctx_ptr = LibDemo.last_error_context
       raise String.new(__ctx_ptr) unless __ctx_ptr.null?
       raise "unknown error"
     end
-    __result
+    nil
     LibDemo.config_free(__handle_cfg)
     LibDemo.options_free(__handle_opts)
   end
