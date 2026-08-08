@@ -46,6 +46,10 @@ struct CbParam {
     hi_type: String,
     /// Expression converting the raw C arg (named `<name>`) to the high-level value.
     decode: String,
+    /// When `true`, this param is a length twin (e.g. `cell_count` for a
+    /// `*const *const c_char` string array) — present in the C signature but
+    /// NOT forwarded to the high-level visitor method.
+    is_count: bool,
 }
 
 /// One resolved context field.
@@ -150,14 +154,36 @@ fn resolve_callback(m: &MethodDef, context_type: &str, result_type: &str) -> Opt
             (TypeRef::Primitive(PrimitiveType::Bool), false) => ("Int32", "Bool".into(), format!("{raw} != 0")),
             (TypeRef::Primitive(PrimitiveType::U32), false) => ("UInt32", "UInt32".into(), raw.clone()),
             (TypeRef::Primitive(PrimitiveType::Usize), false) => ("LibC::SizeT", "LibC::SizeT".into(), raw.clone()),
+            // `&[String]` (e.g. `visit_table_row(cells)`) crosses as a NUL-terminated
+            // C-string array pointer + count. The count is a separate C arg that the
+            // decode references but which is NOT forwarded to the visitor method.
+            (TypeRef::Vec(inner), _) if matches!(&**inner, TypeRef::String) => (
+                "LibC::Char**",
+                "Array(String)".into(),
+                format!(
+                    "(0...{raw}_count).compact_map {{ |i| ptr = {raw}[i]; ptr.null? ? nil : String.new(ptr) }}"
+                ),
+            ),
             _ => return None, // unsupported param shape → skip whole method
         };
+        // For a string-array param the FFI passes a trailing `cell_count` usize arg.
+        let count_twin = matches!(&p.ty, TypeRef::Vec(inner) if matches!(&**inner, TypeRef::String));
         params.push(CbParam {
-            name: raw,
+            name: raw.clone(),
             c_type,
             hi_type,
             decode,
+            is_count: false,
         });
+        if count_twin {
+            params.push(CbParam {
+                name: format!("{raw}_count"),
+                c_type: "LibC::SizeT",
+                hi_type: "LibC::SizeT".into(),
+                decode: String::new(),
+                is_count: true,
+            });
+        }
     }
     Some(Callback {
         method: public_host_identifier(
@@ -303,6 +329,9 @@ pub(crate) fn gen_visitor_file(
     for cb in &callbacks {
         let mut params = format!("ctx : {ctx_hi}");
         for p in &cb.params {
+            if p.is_count {
+                continue; // length twin not exposed to the visitor method
+            }
             params.push_str(&format!(", {} : {}", p.name, p.hi_type));
         }
         if !cb.doc.is_empty() {
@@ -343,6 +372,9 @@ pub(crate) fn gen_visitor_file(
         // Decode extras.
         let mut call_args = String::from("context");
         for p in &cb.params {
+            if p.is_count {
+                continue; // length twin — only referenced by its array's decode
+            }
             out.push_str(&format!("        {}_value = {}\n", p.name, p.decode));
             call_args.push_str(&format!(", {}_value", p.name));
         }

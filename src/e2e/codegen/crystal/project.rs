@@ -1243,18 +1243,11 @@ fn strip_wrapper_namespace(field: Option<&str>) -> Option<&str> {
 /// some fixtures without the `results[0].` prefix. Crystal-only resolution so the
 /// fixture file stays shared across backends.
 fn is_document_subfield(field: &str) -> bool {
-    matches!(
-        field,
-        "structured_output"
-            | "extracted_keywords"
-            | "content"
-            | "elements"
-            | "summary"
-            | "quality_score"
-            | "chunks"
-            | "tables"
-            | "searchable"
-    )
+    // Fields that live on the inner extracted document of a wrapper result
+    // (xberg extraction: `results[0].structured_output`). Bare names map through
+    // `results[0].` so assertions compile against the Crystal binding. Fields
+    // that are flat on their result (content, tables, etc.) must NOT be listed.
+    matches!(field, "structured_output" | "extracted_keywords")
 }
 
 /// Known optional field prefixes in Crystal bindings. When an assertion field
@@ -1331,13 +1324,6 @@ fn field_accessor_with_module(
     match field {
         None => result_var.to_string(),
         Some(path) => {
-            // Binary-content methods (speech, file_content) return raw `Bytes`;
-            // fixture assertions reference the payload field (`audio`/`content`)
-            // which is the result itself, not a struct field.
-            let root = path.split(['.', '[']).next().unwrap_or(path);
-            if BINARY_RESULT_FIELDS.contains(&root) {
-                return result_var.to_string();
-            }
             let mut acc = result_var.to_string();
             let segments: Vec<&str> = path.split('.').filter(|s| !s.is_empty()).collect();
 
@@ -1398,6 +1384,25 @@ fn field_accessor_with_module(
             let mut in_try_chain = false;
             let mut parent_seg = String::new();
             for raw_seg in path.split('.').filter(|s| !s.is_empty()) {
+                // Hash-bracket form from field aliases: `open_graph[title]` →
+                // `.open_graph["title"]`. Handled before snake_casing (which would
+                // mangle the bracket into `open_graph_title`).
+                if let Some(open_bracket) = raw_seg.find('[') {
+                    if let Some(close_bracket) = raw_seg.find(']') {
+                        let base = &raw_seg[..open_bracket];
+                        let key = &raw_seg[open_bracket + 1..close_bracket];
+                        if !key.parse::<usize>().is_ok() {
+                            let base_snake = base.to_snake_case();
+                            acc.push('.');
+                            acc.push_str(&base_snake);
+                            acc.push_str("[\"");
+                            acc.push_str(key);
+                            acc.push_str("\"]");
+                            parent_seg = base.to_string();
+                            continue;
+                        }
+                    }
+                }
                 let seg = raw_seg.to_snake_case();
 
                 // Once a nilable parent is encountered, use `.try(&.field)`
@@ -1443,6 +1448,15 @@ fn field_accessor_with_module(
                     continue;
                 }
                 parent_seg = raw_seg.to_string();
+
+                // Hash fields: `metadata.open_graph.title` → `metadata.open_graph["title"]`
+                // (and the twitter_card equivalent). The parent is a `Hash(String, String)`.
+                if (parent_seg == "open_graph" || parent_seg == "twitter_card") && seg != "size" {
+                    acc.push_str("[\"");
+                    acc.push_str(&seg);
+                    acc.push_str("\"]");
+                    continue;
+                }
 
                 // Crystal uses `size` for array length (no `Array#length`).
                 if seg == "length" {
@@ -1699,8 +1713,14 @@ fn emit_crystal_visitor_class(
                 let escaped = output.replace('\\', "\\\\").replace('"', "\\\"");
                 format!("VisitResult::Custom.new(\"{escaped}\")")
             }
-            crate::e2e::fixture::CallbackAction::CustomTemplate { .. } => {
-                format!("VisitResult::Continue.new")
+            crate::e2e::fixture::CallbackAction::CustomTemplate { template, .. } => {
+                // Expand `{param}` placeholders to Crystal interpolation `#{param}`.
+                // E.g. `[BTN:{text}]` → `"[BTN:#{text}]"`.
+                let crystal_tpl = template
+                    .replace('\\', "\\\\")
+                    .replace('"', "\\\"")
+                    .replace('{', "#{");
+                format!("VisitResult::Custom.new(\"{crystal_tpl}\")")
             }
         };
         out.push_str(&format!("    {sig}\n      {body}\n    end\n"));
