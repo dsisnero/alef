@@ -235,3 +235,17 @@ Crystal codegen mirroring of other language idioms (per aspect, best match):
 | Unit-return + `error_type` wrappers call the Void FFI fun without assigning | Status-only functions like `clean_cache` (`-> i32` with `set_last_error`). |
 | Builtin types not module-qualified in array args | `Array(String)` (not `Array(Module::String)`). |
 | Local-provider / LLM fixtures runtime-skip when their service/key is absent | Keeps offline CI green; documented in fixtures. |
+
+## K. CI verification (crystal e2e jobs)
+
+Dispatched the fork CI E2E workflows and observed the crystal jobs end-to-end:
+
+- **Wiring verified**: repo guard removed (fork-local), build-ffi + artifact staging +
+  Setup Crystal + Install alef all succeed; the `alef test --e2e --lang crystal` step runs.
+- **Blocker (not wiring)**: the `install-alef@v1` action installs the **pinned alef
+  version** from `alef.toml` (`alef_version = "0.55.6"` in every fork), which predates the
+  Crystal backend. It fails with `unknown field 'crystal'` when parsing `[crates.crystal]`.
+- **Required to unblock**: merge + release the Crystal backend upstream (xberg-io/alef),
+  then bump `alef_version` in all five companion forks. The local branch binary works
+  (`alef test --e2e --lang crystal` green on all five repos); CI is purely waiting on a
+  release that ships the crystal config keyword and `Language::Crystal`.
