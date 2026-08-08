@@ -6,7 +6,10 @@ use heck::ToPascalCase;
 
 /// Convert an IR type name to a Crystal type identifier (PascalCase, Ruby-style).
 pub fn crystal_type_name(name: &str) -> String {
-    name.to_pascal_case()
+    // A path-qualified Rust type (e.g. `bytes::Bytes`) maps to just the final
+    // segment in Crystal; full-path pascal-casing would produce `BytesBytes`.
+    let last = name.rsplit("::").next().unwrap_or(name);
+    last.to_pascal_case()
 }
 
 /// TypeMapper for high-level Crystal wrapper types.

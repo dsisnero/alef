@@ -218,6 +218,13 @@ pub(super) fn render_category_spec(
             .cloned()
             .unwrap_or_else(|| call_config.function.clone());
 
+        // Binary-content calls (speech, file_content) return raw `Bytes`; fixture
+        // assertions on the payload field target the result itself.
+        let binary_result = matches!(
+            function_name.as_str(),
+            "speech" | "file_content" | "download_file_content" | "embed_bytes" | "transcribe" | "ocr"
+        );
+
         let base_options_type = call_config.options_type.as_deref();
         let options_type = crystal_overrides
             .and_then(|o| o.options_type.as_deref())
@@ -294,13 +301,24 @@ pub(super) fn render_category_spec(
             let fixture_args = fixture.resolved_args(call_config);
             let has_mock_url = fixture_args.iter().any(|a| a.arg_type == "mock_url");
             let client_setup = if has_mock_url {
-                let mock_url_var = fixture_args.iter()
+                 let mock_url_var = fixture_args.iter()
                     .find(|a| a.arg_type == "mock_url")
                     .map(|a| a.name.clone())
                     .unwrap_or_else(|| "mock_url".to_string());
-                format!("      __client = {module_name}.{cf}(\"test-key\", {mock_url_var}, 0_u64, 0_u32, \"\")\n")
+                // A non-zero timeout avoids the 0-second default which breaks the
+                // underlying HTTP client; retries 0 disables retry storms locally.
+                format!("      __client = {module_name}.{cf}(\"test-key\", {mock_url_var}, 60_u64, 0_u32, \"\")\n")
             } else {
-                format!("      __client = {module_name}.{cf}(\"test-key\", \"\", 0_u64, 0_u32, \"\")\n")
+                // No per-fixture mock URL: point the client at the shared mock
+                // server (spawned by the spec helper) so `mock_response`
+                // fixtures hit the local server, not the real API. The server
+                // namespaces routes under `/fixtures/{id}`, so the base URL
+                // must include the fixture id.
+                let base_url = format!(
+                    r##""#{{ENV["MOCK_SERVER_URL"]? || ""}}/fixtures/{fixture_id}""##,
+                    fixture_id = fixture.id
+                );
+                format!("      __client = {module_name}.{cf}(\"test-key\", {base_url}, 60_u64, 0_u32, \"\")\n")
             };
             setup_lines.push(client_setup);
             format!("__client.{function_name}({call_args_str})")
@@ -317,6 +335,28 @@ pub(super) fn render_category_spec(
             out.push_str("      pending! \"requires XBERG_LLM_API_KEY / OPENAI_API_KEY\" if ENV[\"XBERG_LLM_API_KEY\"]?.nil? && ENV[\"OPENAI_API_KEY\"]?.nil?\n");
         }
 
+        // Local-provider fixtures (ollama/llamacpp/vllm model prefixes) without a
+        // mock_response hit a live local server; skip when it's not reachable.
+        if fixture.mock_response.is_none() {
+            if let Some(model) = fixture.input.get("model").and_then(|v| v.as_str()) {
+                let port = if model.starts_with("ollama/") {
+                    Some("11434")
+                } else if model.starts_with("llamacpp/") {
+                    Some("8080")
+                } else if model.starts_with("vllm/") {
+                    Some("8000")
+                } else {
+                    None
+                };
+                if let Some(port) = port {
+                    out.push_str(&format!(
+                        "      pending! \"requires local {} at 127.0.0.1:{port}\" unless alef_mock_ready?(\"http://127.0.0.1:{port}\")\n",
+                        model.split('/').next().unwrap_or("provider")
+                    ));
+                }
+            }
+        }
+
         let fixture_expects_error = fixture.assertions.iter().any(|a| a.assertion_type == "error");
         if !fixture_expects_error {
             for line in &setup_lines {
@@ -331,7 +371,16 @@ pub(super) fn render_category_spec(
         }
         let returns_void = call_config.returns_void;
         let field_aliases = e2e_config.effective_fields(call_config);
-        let enum_fields = e2e_config.effective_fields_enum(call_config);
+        let mut enum_fields = e2e_config.effective_fields_enum(call_config).clone();
+        // Per-call `assert_enum_fields` (e.g. `{"status" = "BatchStatus"}`) name the
+        // enum-typed result fields; their `.to_s` must be downcased to the wire value.
+        // Merged from every language override (the mapping is language-agnostic).
+        for ov in call_config.overrides.values() {
+            for k in ov.assert_enum_fields.keys() {
+                enum_fields.insert(k.clone());
+            }
+        }
+        let display_as_text = e2e_config.effective_fields_display_as_text(call_config);
         let result_fields = e2e_config.effective_result_fields(call_config);
 
         if fixture_expects_error {
@@ -354,17 +403,25 @@ pub(super) fn render_category_spec(
             // Visitor tests set up the result via inline FFI in setup_lines.
             // The result variable is already assigned there.
             for a in &fixture.assertions {
-                out.push_str(&render_assertion_with_aliases(a, result_var, module_name, &field_aliases, &enum_fields, &result_fields));
+                out.push_str(&render_assertion_with_aliases(a, result_var, module_name, &field_aliases, &enum_fields, &result_fields, binary_result, display_as_text));
             }
-        } else if call_config.streaming_enabled().unwrap_or(false) {
-            // Streaming calls return a `Channel(Event)` in the Crystal binding via an
-            // instance method on the engine: `engine.<fn>({RequestType}.new(url: ...))`.
-            // The generic `call` is a module-function shape, so rebuild it as the
-            // engine instance method with a request struct, then collect the channel
-            // and synthesize the `stream.*` summary the fixtures assert.
+        } else if call_config.streaming_enabled().unwrap_or(false)
+            || call_config.streaming_item_type().is_some() {
+            // Streaming calls return a `Channel(Item)` in the Crystal binding via an
+            // instance method on the engine/client. Collect the channel, then build a
+            // summary exposing both crawlberg-style `stream.*` event flags and generic
+            // `chunks` / `stream_content` (concatenated delta content for chat streams).
             let stream_var = result_var;
-            let (engine_var, req_fields) = streaming_request_parts(fixture, call_config);
-            let req_ty = if function_name.ends_with("_stream") {
+            let (recv_var, req_fields, uses_request_struct) = streaming_request_parts(fixture, call_config, client_factory);
+            let item_ty = call_config
+                .streaming_item_type()
+                .map(|s| format!("{module_name}::{s}"))
+                .unwrap_or_else(|| format!("{module_name}::CrawlEvent"));
+            out.push_str(&format!(
+                "      {stream_var}_chunks = [] of {item_ty}\n"
+            ));
+            let stream_call = if uses_request_struct {
+                // Field-based request (crawlberg: handle + url/urls args → request struct).
                 let pascal = function_name
                     .split('_')
                     .map(|s| {
@@ -375,41 +432,47 @@ pub(super) fn render_category_spec(
                         }
                     })
                     .collect::<String>();
-                format!("{module_name}::{pascal}Request")
+                let req_ty = format!("{module_name}::{pascal}Request");
+                let req_json = req_fields
+                    .iter()
+                    .map(|(k, v)| format!("\\\"{k}\\\": #{{{v}.to_json}}"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!("{recv_var}.{function_name}({req_ty}.from_json(\"{{{req_json}}}\"))")
             } else {
-                format!("{module_name}::{function_name}Request")
+                format!("{recv_var}.{function_name}({call_args_str})")
             };
-            // Request structs only expose JSON::Serializable `new(pull)`; build them
-            // via `from_json` of a JSON object with the field names/values.
-            let req_json = req_fields
-                .iter()
-                .map(|(k, v)| {
-                    // Embed each value via Crystal interpolation of `.to_json` so
-                    // strings/arrays are JSON-quoted correctly.
-                    format!("\\\"{k}\\\": #{{{v}.to_json}}")
-                })
-                .collect::<Vec<_>>()
-                .join(",");
-            out.push_str(&format!(
-                "      {stream_var}_events = [] of {module_name}::CrawlEvent\n"
-            ));
-            out.push_str(&format!(
-                "      __ch = {engine_var}.{function_name}({req_ty}.from_json(\"{{{req_json}}}\"))\n"
-            ));
+            out.push_str(&format!("      __ch = {stream_call}\n"));
             out.push_str(&format!(
                 "      while (__ev = __ch.receive?) && !__ev.is_a?(Nil)\n"
             ));
             out.push_str(&format!(
-                "        {stream_var}_events << __ev\n"
+                "        {stream_var}_chunks << __ev\n"
             ));
             out.push_str("      end\n");
+            // stream_content: concatenate chat-stream delta content (only for
+            // chat-chunk item types, not crawlberg CrawlEvent).
+            let is_crawl_event = item_ty.ends_with("CrawlEvent");
+            let mut summary_entries = vec![
+                format!("\"chunks\" => {stream_var}_chunks"),
+                format!("\"event_count_min\" => {stream_var}_chunks.size"),
+            ];
+            if is_crawl_event {
+                summary_entries.extend([
+                    format!("\"has_page_event\" => {stream_var}_chunks.any? {{ |e| e.is_a?({module_name}::CrawlEvent::Page) }}"),
+                    format!("\"has_error_event\" => {stream_var}_chunks.any? {{ |e| e.is_a?({module_name}::CrawlEvent::Error) }}"),
+                    format!("\"has_complete_event\" => {stream_var}_chunks.any? {{ |e| e.is_a?({module_name}::CrawlEvent::Complete) }}"),
+                ]);
+            } else {
+                summary_entries.push(format!(
+                    "\"stream_content\" => {stream_var}_chunks.compact_map {{ |c| c.choices[0]?.try(&.delta).try(&.content) }}.join(\"\")"
+                ));
+            }
             out.push_str(&format!(
                 "      {stream_var} = {{\n\
-                 \x20       \"event_count_min\" => {stream_var}_events.size,\n\
-                 \x20       \"has_page_event\" => {stream_var}_events.any? {{ |e| e.is_a?({module_name}::CrawlEvent::Page) }},\n\
-                 \x20       \"has_error_event\" => {stream_var}_events.any? {{ |e| e.is_a?({module_name}::CrawlEvent::Error) }},\n\
-                 \x20       \"has_complete_event\" => {stream_var}_events.any? {{ |e| e.is_a?({module_name}::CrawlEvent::Complete) }},\n\
-                 \x20     }} of String => Int32 | Bool\n"
+                 \x20       {}\n\
+                 \x20     }} of String => Array({item_ty}) | String | Int32 | Bool\n",
+                summary_entries.join(",\n\x20       ")
             ));
             // Render stream.* assertions against the summary Hash with bracket access.
             for a in &fixture.assertions {
@@ -421,6 +484,12 @@ pub(super) fn render_category_spec(
                             "      ({stream_var}[\"event_count_min\"].as(Int32) || 0).should be >= {val}\n"
                         ));
                     }
+                    (Some("event_count_min"), _) => {
+                        let val = a.value.as_ref().map(|v| v.to_string()).unwrap_or_else(|| "0".into());
+                        out.push_str(&format!(
+                            "      ({stream_var}[\"event_count_min\"].as(Int32) || 0).should eq({val})\n"
+                        ));
+                    }
                     (Some(f), "is_true") => {
                         out.push_str(&format!(
                             "      {stream_var}[\"{f}\"].as(Bool).should be_true\n"
@@ -429,6 +498,24 @@ pub(super) fn render_category_spec(
                     (Some(f), "is_false") => {
                         out.push_str(&format!(
                             "      {stream_var}[\"{f}\"].as(Bool).should be_false\n"
+                        ));
+                    }
+                    (None, "count_min") => {
+                        let val = a.value.as_ref().map(|v| v.to_string()).unwrap_or_else(|| "0".into());
+                        out.push_str(&format!(
+                            "      {stream_var}[\"chunks\"].as(Array({item_ty})).size.should be >= {val}\n"
+                        ));
+                    }
+                    (None, "count_equals") => {
+                        let val = a.value.as_ref().map(|v| v.to_string()).unwrap_or_else(|| "0".into());
+                        out.push_str(&format!(
+                            "      {stream_var}[\"chunks\"].as(Array({item_ty})).size.should eq({val})\n"
+                        ));
+                    }
+                    (None, "equals") if a.field.as_deref() == Some("stream_content") => {
+                        let val = a.value.as_ref().map(crystal_lit).unwrap_or_else(|| "\"\"".into());
+                        out.push_str(&format!(
+                            "      {stream_var}[\"stream_content\"].as(String).should eq({val})\n"
                         ));
                     }
                     _ => {
@@ -444,7 +531,7 @@ pub(super) fn render_category_spec(
         } else {
             out.push_str(&format!("      {result_var} = {call}\n"));
             for a in &fixture.assertions {
-                out.push_str(&render_assertion_with_aliases(a, result_var, module_name, &field_aliases, &enum_fields, &result_fields));
+                out.push_str(&render_assertion_with_aliases(a, result_var, module_name, &field_aliases, &enum_fields, &result_fields, binary_result, display_as_text));
             }
         }
 
@@ -505,18 +592,30 @@ fn crystal_options_type(call_config: &CallConfig) -> Option<String> {
     .into())
 }
 
-/// For a streaming call, return `(engine_var, Vec<(request_field, value_expr)>)`
-/// built from the fixture's resolved args: the `engine` handle arg becomes the
-/// receiver, and the `url`/`urls` args become request struct fields.
-fn streaming_request_parts(fixture: &Fixture, call_config: &CallConfig) -> (String, Vec<(String, String)>) {
+/// For a streaming call, return `(receiver_var, Vec<(request_field, value_expr)>, uses_request_struct)`.
+/// `uses_request_struct` is true when the call has field-based args (handle + url/urls
+/// → build a request struct), false when the request is a single json_object passed
+/// as-is (e.g. liter-llm chat_stream).
+fn streaming_request_parts(
+    fixture: &Fixture,
+    call_config: &CallConfig,
+    client_factory: Option<&str>,
+) -> (String, Vec<(String, String)>, bool) {
     let args = fixture.resolved_args(call_config);
-    let mut engine_var = String::new();
+    let mut recv_var = String::new();
     let mut fields: Vec<(String, String)> = Vec::new();
+    let mut uses_request_struct = false;
     for arg in args {
         match arg.arg_type.as_str() {
-            "handle" => engine_var = arg.name.clone(),
-            "mock_url" => fields.push(("url".to_string(), arg.name.clone())),
-            "mock_url_list" => fields.push(("urls".to_string(), arg.name.clone())),
+            "handle" => recv_var = arg.name.clone(),
+            "mock_url" => {
+                uses_request_struct = true;
+                fields.push(("url".to_string(), arg.name.clone()));
+            }
+            "mock_url_list" => {
+                uses_request_struct = true;
+                fields.push(("urls".to_string(), arg.name.clone()));
+            }
             other => {
                 // Fallback: pass the arg value through as a field of the same name.
                 fields.push((arg.name.clone(), arg.name.clone()));
@@ -524,10 +623,14 @@ fn streaming_request_parts(fixture: &Fixture, call_config: &CallConfig) -> (Stri
             }
         }
     }
-    if engine_var.is_empty() {
-        engine_var = "engine".to_string();
+    if recv_var.is_empty() {
+        recv_var = if client_factory.is_some() {
+            "__client".to_string()
+        } else {
+            "engine".to_string()
+        };
     }
-    (engine_var, fields)
+    (recv_var, fields, uses_request_struct)
 }
 
 fn build_args_and_setup(
@@ -835,11 +938,23 @@ fn render_assertion_with_aliases(
     field_aliases: &std::collections::HashMap<String, String>,
     enum_fields: &std::collections::HashSet<String>,
     result_fields: &std::collections::HashSet<String>,
+    binary_result: bool,
+    display_as_text: &std::collections::HashSet<String>,
 ) -> String {
     // Resolve field aliases (e.g. `metadata.title` → `metadata.document.title`).
     let raw_field = a.field.as_deref();
     let resolved_field = raw_field.and_then(|f| field_aliases.get(f)).map(|s| s.as_str());
     let effective_field = strip_wrapper_namespace(resolved_field.or(raw_field));
+    // Binary-content methods (speech, file_content) return raw `Bytes`; fixture
+    // assertions on the payload field (`audio`/`content`) target the result itself.
+    if binary_result {
+        if let Some(f) = effective_field {
+            if BINARY_RESULT_FIELDS.contains(&f) {
+                let a2 = crate::e2e::fixture::Assertion { field: None, ..a.clone() };
+                return render_assertion_with_aliases(&a2, result_var, module_name, field_aliases, enum_fields, result_fields, binary_result, display_as_text);
+            }
+        }
+    }
     // Enum-typed fields (from `fields_enum` config) compare by wire string value,
     // which is lowercase; Crystal's `.to_s` is PascalCase, so downcase the accessor.
     let is_enum_field = effective_field.is_some_and(|f| enum_fields.contains(f));
@@ -884,6 +999,8 @@ fn render_assertion_with_aliases(
                 field_aliases,
                 enum_fields,
                 result_fields,
+                binary_result,
+                display_as_text,
             );
         }
     }
@@ -898,7 +1015,7 @@ fn render_assertion_with_aliases(
         }
     }
 
-    let acc = field_accessor_with_module(effective_field, result_var, module_name);
+    let acc = field_accessor_with_module(effective_field, result_var, module_name, display_as_text);
     match a.assertion_type.as_str() {
         "equals" => match &a.value {
             // Strip trailing whitespace for string comparisons, matching the
@@ -908,7 +1025,13 @@ fn render_assertion_with_aliases(
             Some(v @ serde_json::Value::String(_)) => {
                 let val = crystal_lit(v);
                 if is_enum_field {
-                    format!("      {acc}.to_s.downcase.strip.should eq({val})\n")
+                    // Crystal's `Enum#to_json` serializes by underscored member name,
+                    // matching the wire value (e.g. `ToolCalls` → `"tool_calls"`).
+                    // Unwrap the JSON string to compare the bare wire value; a nil
+                    // enum parses as JSON null and compares as "".
+                    format!(
+                        "(JSON.parse({acc}.try(&.to_json) || \"null\").as_s? || \"\").strip.should eq({val})\n"
+                    )
                 } else {
                     format!("      {acc}.to_s.strip.should eq({val})\n")
                 }
@@ -1124,23 +1247,13 @@ fn is_document_subfield(field: &str) -> bool {
         field,
         "structured_output"
             | "extracted_keywords"
-            | "mime_type"
             | "content"
-            | "document"
             | "elements"
             | "summary"
-            | "metadata"
             | "quality_score"
-            | "format"
-            | "pages"
-            | "images"
             | "chunks"
             | "tables"
-            | "ocr"
-            | "audio"
-            | "video"
             | "searchable"
-            | "attachments"
     )
 }
 
@@ -1150,8 +1263,13 @@ fn is_document_subfield(field: &str) -> bool {
 const OPTIONAL_PARENTS: &[&str] = &[
     "document", "metadata", "summary", "nodes", "results", "data", "elements",
     "keywords", "key_words", "extracted_keywords", "structured_output", "markdown",
-    "downloaded_document", "response_meta", "extraction_meta", "screenshot",
+    "downloaded_document", "response_meta", "extraction_meta", "screenshot", "usage",
+    "tool_calls", "segments",
 ];
+
+/// Fields on binary-content results (e.g. `speech.audio`, `file_content.content`):
+/// the binding returns raw `Bytes`, so the field is the result itself.
+const BINARY_RESULT_FIELDS: &[&str] = &["audio", "content"];
 
 /// Discriminant variant names for tagged unions. When a field path goes through
 /// one of these (e.g. `format.excel`), the accessor uses `.as?(ParentType::Variant)`
@@ -1200,14 +1318,26 @@ const ARRAY_FIELDS: &[&str] = &[
 ];
 
 fn field_accessor(field: Option<&str>, result_var: &str) -> String {
-    field_accessor_with_module(field, result_var, "")
+    field_accessor_with_module(field, result_var, "", &std::collections::HashSet::new())
 }
 
-fn field_accessor_with_module(field: Option<&str>, result_var: &str, module_name: &str) -> String {
+fn field_accessor_with_module(
+    field: Option<&str>,
+    result_var: &str,
+    module_name: &str,
+    display_as_text: &std::collections::HashSet<String>,
+) -> String {
     use heck::ToSnakeCase;
     match field {
         None => result_var.to_string(),
         Some(path) => {
+            // Binary-content methods (speech, file_content) return raw `Bytes`;
+            // fixture assertions reference the payload field (`audio`/`content`)
+            // which is the result itself, not a struct field.
+            let root = path.split(['.', '[']).next().unwrap_or(path);
+            if BINARY_RESULT_FIELDS.contains(&root) {
+                return result_var.to_string();
+            }
             let mut acc = result_var.to_string();
             let segments: Vec<&str> = path.split('.').filter(|s| !s.is_empty()).collect();
 
@@ -1350,12 +1480,19 @@ fn field_accessor_with_module(field: Option<&str>, result_var: &str, module_name
                         if let Ok(_) = index_str.parse::<usize>() {
                             if OPTIONAL_PARENTS.contains(&base) {
                                 in_try_chain = true;
+                                // Nil-safe index access on a nilable array.
+                                acc.push('.');
+                                acc.push_str(base);
+                                acc.push_str(".try(&.[");
+                                acc.push_str(index_str);
+                                acc.push_str("])");
+                            } else {
+                                acc.push('.');
+                                acc.push_str(base);
+                                acc.push('[');
+                                acc.push_str(index_str);
+                                acc.push(']');
                             }
-                            acc.push('.');
-                            acc.push_str(base);
-                            acc.push('[');
-                            acc.push_str(index_str);
-                            acc.push(']');
                             continue;
                         }
                     }
@@ -1365,16 +1502,41 @@ fn field_accessor_with_module(field: Option<&str>, result_var: &str, module_name
                     let base = &seg[..underscore];
                     let index_str = &seg[underscore + 1..];
                     if let Ok(_) = index_str.parse::<usize>() {
-                        acc.push('.');
-                        acc.push_str(base);
-                        acc.push('[');
-                        acc.push_str(index_str);
-                        acc.push(']');
+                        if OPTIONAL_PARENTS.contains(&base) {
+                            in_try_chain = true;
+                            // Nil-safe index access on a nilable array.
+                            acc.push('.');
+                            acc.push_str(base);
+                            acc.push_str(".try(&.[");
+                            acc.push_str(index_str);
+                            acc.push_str("])");
+                        } else {
+                            acc.push('.');
+                            acc.push_str(base);
+                            acc.push('[');
+                            acc.push_str(index_str);
+                            acc.push(']');
+                        }
                         continue;
                     }
                 }
                 acc.push('.');
                 acc.push_str(&seg);
+            }
+            // Display-as-text fields carry a discriminated content union rather than
+            // a plain string (e.g. `AssistantContent` with a `Text` variant). Downcast
+            // to the text variant and pull its string value.
+            if !display_as_text.is_empty() && path.split(['.', '[']).next().is_some_and(|r| r != "results")
+                && display_as_text.contains(path) {
+                // Exact field match: append text extraction.
+                let module_prefix = if module_name.is_empty() {
+                    String::new()
+                } else {
+                    format!("{module_name}::")
+                };
+                acc.push_str(&format!(
+                    ".as?({module_prefix}AssistantContent::Text).try(&.value)"
+                ));
             }
             acc
         }

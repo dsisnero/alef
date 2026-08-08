@@ -7,6 +7,7 @@
 //!
 //! plus a `shard.yml` package manifest.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
@@ -283,6 +284,7 @@ impl CrystalBackend {
             streaming,
             async_methods,
             ffi_structs,
+            &module_name,
         ));
 
         for func in &api.functions {
@@ -314,6 +316,7 @@ impl CrystalBackend {
         streaming: &[StreamSpec],
         async_methods: &[AsyncMethodSpec],
         ffi_structs: &HashSet<String>,
+        module_name: &str,
     ) -> String {
         // Build a map of unit-enum type name → first variant name so gen_struct
         // can default non-optional enum fields (matching Rust's Default impl which
@@ -406,7 +409,29 @@ impl CrystalBackend {
             })
             .map(|en| en.name.clone())
             .collect();
+        // Shape-discriminated (untagged) unions match variants by JSON shape via a
+        // custom `def self.new(pull)`; a `{}` default matches no variant, so fields
+        // of these types cannot use an eager `from_json("{}")` default.
+        let untagged_unions: HashSet<String> = api
+            .enums
+            .iter()
+            .filter(|en| !en.binding_excluded && en.serde_untagged)
+            .map(|en| en.name.clone())
+            .collect();
+
         let mut out = String::new();
+        // Emit enums + their JSON converters BEFORE structs so structs that
+        // reference `{Enum}Converter` via `@[JSON::Field(converter: ...)]`
+        // resolve the constant (Crystal attributes need it defined earlier).
+        for en in &api.enums {
+            if en.binding_excluded {
+                continue;
+            }
+            out.push_str(&Self::gen_enum(en, api, module_name));
+            if enum_converters.contains(&en.name) {
+                out.push_str(&Self::gen_enum_converter(en));
+            }
+        }
         for ty in &api.types {
             if ty.binding_excluded || ty.is_trait {
                 continue;
@@ -423,16 +448,7 @@ impl CrystalBackend {
                 ));
                 continue;
             }
-            out.push_str(&Self::gen_struct(ty, opaque, &enum_first_variant, &serde_tagged_enums, &enum_converters, &serde_tagged_defaults, &external_defaults));
-        }
-        for en in &api.enums {
-            if en.binding_excluded {
-                continue;
-            }
-            out.push_str(&Self::gen_enum(en, api));
-            if enum_converters.contains(&en.name) {
-                out.push_str(&Self::gen_enum_converter(en));
-            }
+            out.push_str(&Self::gen_struct(ty, opaque, &enum_first_variant, &serde_tagged_enums, &enum_converters, &serde_tagged_defaults, &external_defaults, module_name, &untagged_unions));
         }
         for err in &api.errors {
             if err.binding_excluded {
@@ -445,7 +461,7 @@ impl CrystalBackend {
 
     /// Emit a Crystal `class` (reference type, so self-referential DTOs are legal)
     /// with `JSON::Serializable` and one getter per field.
-    fn gen_struct(ty: &TypeDef, opaque: &HashSet<String>, enum_first_variant: &HashMap<String, String>, serde_tagged_enums: &HashSet<String>, enum_converters: &HashSet<String>, serde_tagged_defaults: &HashMap<String, String>, external_defaults: &HashMap<String, String>) -> String {
+    fn gen_struct(ty: &TypeDef, opaque: &HashSet<String>, enum_first_variant: &HashMap<String, String>, serde_tagged_enums: &HashSet<String>, enum_converters: &HashSet<String>, serde_tagged_defaults: &HashMap<String, String>, external_defaults: &HashMap<String, String>, module_name: &str, untagged_unions: &HashSet<String>) -> String {
         let name = crystal_type_name(&ty.name);
         let mut out = String::new();
         out.push('\n');
@@ -474,8 +490,11 @@ impl CrystalBackend {
             }
             // Enum fields with custom wire values need a converter annotation so
             // JSON::Serializable maps wire strings (e.g. "og:image") to variants.
+            // Fully-qualify the converter constant: JSON::Serializable expands in a
+            // generic context where a bare reference can resolve from the FFI `lib`
+            // scope (which has no such constant) instead of the wrapper module.
             if let Some(enum_name) = enum_converter_for_type(&field.ty, enum_converters) {
-                out.push_str(&format!("    @[JSON::Field(converter: {enum_name}Converter)]\n"));
+                out.push_str(&format!("    @[JSON::Field(converter: {module_name}::{enum_name}Converter)]\n"));
             }
             // Opaque handle types cannot be round-tripped through JSON; they are
             // constructed from FFI pointers and must be set programmatically.
@@ -506,7 +525,25 @@ impl CrystalBackend {
                     .or_else(|| type_based_default_expr(&field.ty))
                     .or_else(|| enum_default_expr(&field.ty, enum_first_variant))
                     .or_else(|| external_enum_default_expr(&field.ty, external_defaults))
-                    .or_else(|| struct_default_expr(&field.ty, serde_tagged_enums, serde_tagged_defaults));
+                    .or_else(|| {
+                        // Untagged (shape-discriminated) unions can't be defaulted
+                        // with `{}` (no variant matches); emit no eager default.
+                        if matches!(&field.ty, TypeRef::Named(n) if untagged_unions.contains(n)) {
+                            None
+                        } else {
+                            struct_default_expr(&field.ty, serde_tagged_enums, serde_tagged_defaults)
+                        }
+                    });
+                if let Some(crystal_default) = default_expr {
+                    out.push_str(&format!("    getter {field_name} : {field_ty} = {crystal_default}\n"));
+                    continue;
+                }
+                // Untagged unions can't be eagerly defaulted; expose nilable so the
+                // empty `initialize` doesn't fail (JSON input always provides it).
+                if matches!(&field.ty, TypeRef::Named(n) if untagged_unions.contains(n)) {
+                    out.push_str(&format!("    getter {field_name} : {field_ty}?\n"));
+                    continue;
+                }
                 if let Some(crystal_default) = default_expr {
                     out.push_str(&format!("    getter {field_name} : {field_ty} = {crystal_default}\n"));
                     continue;
@@ -743,7 +780,18 @@ impl CrystalBackend {
             .iter()
             .map(|(n, ty)| {
                 let pn = public_host_identifier(Language::Crystal, PublicIdentifierKind::Parameter, n);
-                format!("{pn} : {}", crystal_type(ty))
+                let base_ty = crystal_type(ty);
+                let is_opt = base_ty.ends_with('?');
+                let mut ty_s = base_ty.into_owned();
+                if is_opt && !ty_s.ends_with('?') {
+                    ty_s.push('?');
+                }
+                // Optional params default to nil so callers can omit them.
+                if is_opt {
+                    format!("{pn} : {ty_s} = nil")
+                } else {
+                    format!("{pn} : {ty_s}")
+                }
             })
             .collect::<Vec<_>>()
             .join(", ");
@@ -756,17 +804,27 @@ impl CrystalBackend {
 
         // Build FFI call args: the C `_json` wrapper takes JSON string params.
         // Pass `.to_json` for struct types, and the param directly for strings.
+        // Optional (nilable) struct params pass a real null pointer when nil (the
+        // wrapper treats null as `None`); non-nil values are JSON strings bound to
+        // a local first so the String stays alive for the FFI call.
         let mut args = vec!["@handle".to_string()];
-        let setup = String::new();
+        let mut setup = String::new();
         let teardown = String::new();
         for (n, ty) in &spec.params {
             let pn = public_host_identifier(Language::Crystal, PublicIdentifierKind::Parameter, n);
             if matches!(ty, TypeRef::String) {
                 args.push(pn);
+            } else if crystal_type(ty).ends_with('?') {
+                // Nilable struct: pass the C string when set, null pointer when nil.
+                let json_var = format!("__json_{pn}");
+                setup.push_str(&format!("    {json_var} = {pn}.nil? ? nil : {pn}.not_nil!.to_json\n"));
+                args.push(json_var);
             } else {
                 // The FFI `_json` function deserializes the JSON string internally,
                 // so pass the Crystal object's .to_json() output directly.
-                args.push(format!("{pn}.to_json"));
+                let json_var = format!("__json_{pn}");
+                setup.push_str(&format!("    {json_var} = {pn}.to_json\n"));
+                args.push(json_var);
             }
         }
 
@@ -786,13 +844,25 @@ impl CrystalBackend {
         body.push_str(&format!("    {lib_name}.free_string(__ptr)\n"));
         match &spec.return_type {
             TypeRef::Unit => body.push_str("    nil\n"),
+            // Bytes crosses as a JSON array of integers; Slice has no from_json.
+            // Matches both TypeRef::Bytes and path-qualified Named types that map
+            // to the `Bytes` alias (e.g. `bytes::Bytes`).
+            TypeRef::Bytes => body.push_str(
+                "    __arr = Array(UInt8).from_json(__json)\n    Bytes.new(__arr.size) { |i| __arr[i] }\n",
+            ),
             TypeRef::Optional(_) => {
                 let inner = crystal_type(&spec.return_type);
                 body.push_str(&format!("    {inner}.from_json(__json)\n"));
             }
             _ => {
                 let ty = crystal_type(&spec.return_type);
-                body.push_str(&format!("    {ty}.from_json(__json)\n"));
+                if ty == "Bytes" {
+                    body.push_str(
+                        "    __arr = Array(UInt8).from_json(__json)\n    Bytes.new(__arr.size) { |i| __arr[i] }\n",
+                    );
+                } else {
+                    body.push_str(&format!("    {ty}.from_json(__json)\n"));
+                }
             }
         }
 
@@ -823,7 +893,19 @@ impl CrystalBackend {
             .iter()
             .map(|p| {
                 let name = public_host_identifier(Language::Crystal, PublicIdentifierKind::Parameter, &p.name);
-                format!("{name} : {}", crystal_type(&p.ty))
+                // Nilable at the Crystal type level (Option<T> or flagged optional).
+                let base_ty = crystal_type(&p.ty);
+                let is_opt = p.optional || base_ty.ends_with('?');
+                let mut ty = base_ty.into_owned();
+                if is_opt && !ty.ends_with('?') {
+                    ty.push('?');
+                }
+                // Optional params default to nil so callers can omit them.
+                if is_opt {
+                    format!("{name} : {ty} = nil")
+                } else {
+                    format!("{name} : {ty}")
+                }
             })
             .collect::<Vec<_>>()
             .join(", ");
@@ -836,14 +918,27 @@ impl CrystalBackend {
         let mut teardown = String::new();
         for p in &m.params {
             let pname = public_host_identifier(Language::Crystal, PublicIdentifierKind::Parameter, &p.name);
+            // Nilable at the Crystal type level (Option<T> or flagged optional).
+            let base_ty = crystal_type(&p.ty);
+            let p_opt = p.optional || base_ty.ends_with('?');
             if let TypeRef::Named(type_name) = &p.ty {
                 if is_ffi_struct(type_name, ffi_structs) {
                     let type_snake = public_host_identifier(Language::Crystal, PublicIdentifierKind::Function, type_name);
                     let handle_var = format!("__handle_{pname}");
-                    setup.push_str(&format!(
-                        "    {handle_var} = {lib_name}.{type_snake}_from_json({pname}.to_json)\n"
-                    ));
-                    teardown.push_str(&format!("    {lib_name}.{type_snake}_free({handle_var})\n"));
+                    if p_opt {
+                        // Pass a null pointer for nil so the Rust side uses defaults.
+                        setup.push_str(&format!(
+                            "    {handle_var} = {pname}.nil? ? Pointer({lib_name}::{type_name}).null : {lib_name}.{type_snake}_from_json({pname}.not_nil!.to_json)\n"
+                        ));
+                        teardown.push_str(&format!(
+                            "    {lib_name}.{type_snake}_free({handle_var}) unless {handle_var}.null?\n"
+                        ));
+                    } else {
+                        setup.push_str(&format!(
+                            "    {handle_var} = {lib_name}.{type_snake}_from_json({pname}.to_json)\n"
+                        ));
+                        teardown.push_str(&format!("    {lib_name}.{type_snake}_free({handle_var})\n"));
+                    }
                     args.push(handle_var);
                     continue;
                 }
@@ -900,7 +995,7 @@ impl CrystalBackend {
     ///   (`"Unit"` for unit variants, `{"Variant": payload}` for newtype variants).
     /// - anything else (struct/multi-tuple variants, internally/adjacently-tagged,
     ///   untagged) → skipped with an explanatory note (pending).
-    fn gen_enum(en: &EnumDef, api: &ApiSurface) -> String {
+    fn gen_enum(en: &EnumDef, api: &ApiSurface, module_name: &str) -> String {
         let name = crystal_type_name(&en.name);
         let variants: Vec<&crate::core::ir::EnumVariant> = en.variants.iter().filter(|v| !v.binding_excluded).collect();
 
@@ -924,7 +1019,7 @@ impl CrystalBackend {
             return Self::gen_untagged(en, &name, &variants, is_unit);
         }
         if let Some(tag) = en.serde_tag.as_deref() {
-            return Self::gen_internally_tagged(en, &name, &variants, tag, is_unit, api);
+            return Self::gen_internally_tagged(en, &name, &variants, tag, is_unit, api, module_name);
         }
 
         Self::gen_tagged_union(en, &name, &variants, is_unit)
@@ -972,6 +1067,7 @@ impl CrystalBackend {
         tag: &str,
         is_unit: impl Fn(&crate::core::ir::EnumVariant) -> bool,
         api: &ApiSurface,
+        module_name: &str,
     ) -> String {
         let wire = |v: &crate::core::ir::EnumVariant| {
             wire_variant_value(&v.name, v.serde_rename.as_deref(), en.serde_rename_all.as_deref())
@@ -1045,7 +1141,7 @@ impl CrystalBackend {
                         }
                         let getter = public_host_identifier(Language::Crystal, PublicIdentifierKind::Field, &f.name);
                         let key = wire_field_name(&f.name, f.serde_rename.as_deref(), en.serde_rename_all.as_deref());
-                        let mut ty = crystal_type(&f.ty).into_owned();
+                        let mut ty = variant_field_type(&f.ty, module_name).into_owned();
                         if f.optional && !ty.ends_with('?') {
                             ty.push('?');
                         }
@@ -1452,7 +1548,13 @@ impl CrystalBackend {
                 if p.optional && !ty.ends_with('?') {
                     ty.push('?');
                 }
-                format!("{name} : {ty}")
+                // Optional params default to nil so callers can omit them
+                // (matches Ruby/Python optional-param idioms).
+                if p.optional {
+                    format!("{name} : {ty} = nil")
+                } else {
+                    format!("{name} : {ty}")
+                }
             })
             .collect::<Vec<_>>()
             .join(", ");
@@ -1806,8 +1908,21 @@ fn external_enum_default_expr(ty: &TypeRef, external_defaults: &HashMap<String, 
 
 /// If a type (including its Option/Vec/Map wrappers) references a unit enum that
 /// needs a JSON converter, return the enum's Crystal type name.
-fn enum_converter_for_type(ty: &TypeRef, enum_converters: &HashSet<String>) -> Option<String> {
-    match ty {
+/// Map a variant field type to Crystal, fully-qualifying Named struct types with
+/// the wrapper module. Inside a variant subclass (e.g. `ContentPart::ImageUrl`) a
+/// bare `ImageUrl` reference would resolve to the enclosing class itself; the
+/// module-qualified path always points at the real type.
+fn variant_field_type(ty: &TypeRef, module_name: &str) -> Cow<'static, str> {
+    if let TypeRef::Named(n) = ty {
+        let base = crystal_type_name(n);
+        if base != "String" {
+            return Cow::Owned(format!("{module_name}::{base}"));
+        }
+    }
+    crystal_type(ty)
+}
+
+fn enum_converter_for_type(ty: &TypeRef, enum_converters: &HashSet<String>) -> Option<String> {    match ty {
         TypeRef::Named(n) if enum_converters.contains(n) => Some(crystal_type_name(n)),
         TypeRef::Optional(inner) | TypeRef::Vec(inner) | TypeRef::Map(_, inner) => {
             enum_converter_for_type(inner, enum_converters)

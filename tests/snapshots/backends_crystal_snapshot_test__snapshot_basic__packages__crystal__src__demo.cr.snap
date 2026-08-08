@@ -43,6 +43,12 @@ end
 module Demo
   VERSION = "0.1.0"
 
+  # Processing status.
+  enum Status
+    Active
+    Inactive
+  end
+
   # A demo configuration struct.
   class Config
     include JSON::Serializable
@@ -51,12 +57,6 @@ module Demo
     getter tag : String?
     def initialize
     end
-  end
-
-  # Processing status.
-  enum Status
-    Active
-    Inactive
   end
 
   # Errors emitted by demo operations.

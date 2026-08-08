@@ -402,6 +402,14 @@ fn gen_ffi_body(adapter: &AdapterConfig, config: &ResolvedCrateConfig) -> String
         format!("{}\n    ", conversions.join("\n    "))
     };
 
+    // Bytes results cross as a JSON array of integers (Slice has no JSON
+    // Serialize impl). `returns` is the core Rust type path (e.g. `bytes::Bytes`).
+    let serialize_result = if adapter.returns.as_deref().is_some_and(|r| r.ends_with("Bytes")) {
+        "let json = serde_json::to_string(&result.iter().copied().collect::<Vec<_>>()).unwrap_or_default();\n            "
+    } else {
+        "let json = serde_json::to_string(&result).unwrap_or_default();\n            "
+    };
+
     format!(
         "let client = unsafe {{ &*client }};\n    \
          {conversion_block}\
@@ -414,7 +422,7 @@ fn gen_ffi_body(adapter: &AdapterConfig, config: &ResolvedCrateConfig) -> String
           }};\n    \
           match rt.block_on(async {{ client.{core_path}({call_str}).await }}) {{\n        \
               Ok(result) => {{\n            \
-                  let json = serde_json::to_string(&result).unwrap_or_default();\n            \
+                  {serialize_result}\
                   std::ffi::CString::new(json).unwrap_or_default().into_raw()\n        \
               }}\n        \
               Err(e) => {{\n            \

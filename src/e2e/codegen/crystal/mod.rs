@@ -59,8 +59,9 @@ impl E2eCodegen for CrystalE2eCodegen {
             .unwrap_or_else(|| "../../packages/crystal".to_string());
 
         // Determine if any active fixture needs the mock server (mock_url /
-        // mock_url_list arg types, or an input whose value embeds the `$mock_url`
-        // placeholder). If none do, skip spawning the mock-server binary.
+        // mock_url_list arg types, an input whose value embeds the `$mock_url`
+        // placeholder, or a `mock_response` served from the local server).
+        // If none do, skip spawning the mock-server binary.
         let needs_mock_server = groups.iter().flat_map(|g| g.fixtures.iter()).any(|f| {
             let cc = e2e_config.resolve_call_for_fixture(
                 f.call.as_deref(),
@@ -71,6 +72,7 @@ impl E2eCodegen for CrystalE2eCodegen {
             );
             cc.args.iter().any(|a| a.arg_type == "mock_url" || a.arg_type == "mock_url_list")
                 || super::value_contains_mock_url_placeholder(&f.input)
+                || f.mock_response.is_some()
         });
 
         let mut files = vec![
