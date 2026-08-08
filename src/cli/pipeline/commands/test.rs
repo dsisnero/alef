@@ -11,19 +11,19 @@ pub fn test(config: &ResolvedCrateConfig, languages: &[Language], e2e: bool, cov
     let pdfium_dir = compute_pdfium_dir();
     let mut env_vars: Vec<(&str, String)> = Vec::new();
 
-    if let Some(lib_dir) = pdfium_dir {
+    if let Some(lib_dir) = pdfium_dir.as_ref() {
         #[cfg(target_os = "macos")]
         {
             env_vars.push(("DYLD_FALLBACK_LIBRARY_PATH", lib_dir.clone()));
-            env_vars.push(("DYLD_LIBRARY_PATH", lib_dir));
+            env_vars.push(("DYLD_LIBRARY_PATH", lib_dir.clone()));
         }
         #[cfg(target_os = "linux")]
         {
-            env_vars.push(("LD_LIBRARY_PATH", lib_dir));
+            env_vars.push(("LD_LIBRARY_PATH", lib_dir.clone()));
         }
         #[cfg(target_os = "windows")]
         {
-            env_vars.push(("PATH", lib_dir));
+            env_vars.push(("PATH", lib_dir.clone()));
         }
     }
 
@@ -122,7 +122,20 @@ pub fn test(config: &ResolvedCrateConfig, languages: &[Language], e2e: bool, cov
             }
             if e2e && let Some(e2e_cmd_list) = &lang_test.e2e {
                 for cmd in e2e_cmd_list.commands() {
-                    if let Err(e) = run_command_streamed_with_env(cmd, Some(&label), &env_vars) {
+                    // Crystal specs link against the workspace's native FFI lib; the
+                    // linker needs -L/-rpath (LD_LIBRARY_PATH only affects dlopen at
+                    // runtime). Inject the flags when the lib dir is discoverable.
+                    let effective_cmd = if *lang == Language::Crystal {
+                        if let Some(dir) = pdfium_dir.as_deref() {
+                            let link_flags = format!("-L{dir} -Wl,-rpath,{dir}");
+                            cmd.replace("crystal spec", &format!("crystal spec --link-flags=\"{link_flags}\""))
+                        } else {
+                            cmd.to_string()
+                        }
+                    } else {
+                        cmd.to_string()
+                    };
+                    if let Err(e) = run_command_streamed_with_env(&effective_cmd, Some(&label), &env_vars) {
                         return (*lang, Err(e));
                     }
                 }
