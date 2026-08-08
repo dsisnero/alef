@@ -1,11 +1,22 @@
 # Plan: Crystal backend — remaining work
 
 Status: **26/26 compile tests**, **29/29 gen-bindings tests**, **4/4 snapshot tests**, **192/192
-crystal lib tests**, **4618/4618 total lib tests** pass, **193/193 crawlberg e2e Crystal specs**
-(21 pending = streaming), and **66/66 xberg e2e Crystal specs green (0 failures / 0 errors)**.
-F0–F5 fixed in earlier session; F6, F7, F9–F19 landed this session. **All F-items complete** —
-F8 (run e2e Crystal specs) unblocked by fixing the mock-server lifecycle and e2e
-assertion/codegen gaps; xberg e2e now fully green.
+crystal lib tests**, **4618/4618 total lib tests** pass. **All e2e fixtures run in every
+companion repo — nothing hard-skipped:**
+
+| Repo | Suite | Result |
+|------|-------|--------|
+| crawlberg | `e2e/crystal` | 256 / 0 failures / 0 errors / 1 pending (fixture with no assertions) |
+| xberg | `e2e/crystal` | 71 / 0 failures / 0 errors / 1 pending (LLM runtime skip) |
+| liter-llm | `e2e/crystal` | 166 / 0 failures / 0 errors / 2 pending (local Ollama runtime skips) |
+| html-to-markdown | `e2e/crystal` | 273 / 0 failures / 0 errors / 0 pending |
+| tree-sitter-language-pack | `e2e/crystal` | 522 / 0 failures / 0 errors / 0 pending |
+
+The `crystal-all-fixtures` branches in alef + all five companion repos carry this work;
+all lib/integration/e2e suites are green. F0–F5 fixed in earlier session; F6, F7, F9–F19
+landed in that session; the **all-fixtures expansion** (streaming un-skipped, HTTP fixtures,
+liter-llm/html-to-markdown/tree-sitter-language-pack ports, visitor bridges) landed on
+`crystal-all-fixtures`.
 
 ---
 
@@ -61,12 +72,14 @@ assertion/codegen gaps; xberg e2e now fully green.
 - [x] **F6** Add crystal overrides in crawlberg e2e call configs
   Added `crystal` to `[workspace] languages`, `[crates.output]`, `[crates.e2e.languages]`.
   Added `module = "Crawlberg"` override for all non-streaming calls.
-  Crystal skipped for streaming calls (`crawl_stream`, `batch_crawl_stream`).
+  Streaming calls (`crawl_stream`, `batch_crawl_stream`) were later un-skipped on
+  `crystal-all-fixtures` (streaming e2e via `engine.<fn>(RequestType.from_json(...))`).
 - [x] **F7** Make e2e Crystal specs compile
   `cd e2e/crystal && shards install && crystal build spec/scrape_spec.cr` — compiles successfully.
   Also verified binary links: `crystal build src/crawlberg.cr -o bin/crawlberg` succeeds.
 - [x] **F8** Run e2e Crystal specs
-  `cd e2e/crystal && crystal spec` — **193 examples, 0 failures, 0 errors, 21 pending**.
+  `cd e2e/crystal && crystal spec` — **193 examples, 0 failures, 0 errors, 21 pending** at the
+  time; on `crystal-all-fixtures` all fixtures run (256 examples, 1 pending = no-assertions fixture).
   Blockers fixed this session:
   - Mock server lifecycle: spawning at spec_helper load time left the child dead under
     `crystal spec`; moved to a `Spec.before_suite` `AlefMockServer` singleton holding
@@ -168,21 +181,25 @@ Notable expectation changes:
 
 After re-running the four suites green plus the crawlberg e2e suite, **all F-items are complete**.
 
-## H. F8 verification (crawlberg e2e Crystal specs — green)
+## H. e2e Crystal specs across companion repos (all green — nothing hard-skipped)
 
-Ran `crystal spec` in `crawlberg/e2e/crystal` against the Rust mock server:
-**193 examples, 0 failures, 0 errors, 21 pending** (~46s). The 21 pending are
-streaming/unsupported categories intentionally skipped in `alef.toml`
-(`skip_languages` includes crystal for `crawl_stream`/`batch_crawl_stream`).
+The all-fixtures expansion removed the category skip
+(engine/rate_limit/markdown/filter/strategy/metadata/interaction/download) and the
+`crystal_effectively_skipped` rule from `src/e2e/codegen/crystal/mod.rs`, and un-skipped
+streaming in crawlberg (`crawl_stream`/`batch_crawl_stream`). Every fixture now generates a
+Crystal test; runtime-only skips (documented in fixtures) stay pending when their
+prerequisite service/key is absent. See the status table at the top for per-repo totals.
 
-## I. xberg e2e Crystal specs (green — 66 examples, 0 failures, 0 errors)
+Streaming e2e: `engine.<fn>(RequestType.from_json(...))` instance calls, Channel consumed
+via `receive?`, summary exposes `chunks`/`stream_content` (chat) or `stream.*` flags
+(crawlberg). client_factory base_url points at `MOCK_SERVER_URL/fixtures/{id}`; the mock
+server is spawned by `AlefMockServer` when any fixture has `mock_response`.
 
-`crystal spec` in `xberg/e2e/crystal`: **66 examples, 0 failures, 0 errors, 0 pending**.
-The former 3 failures (LLM-API-key, in-band-error fixture) are now skipped via the
-Crystal-only `crystal_effectively_skipped` rule: fixtures whose `skip.languages` covers
-a large majority of the other configured languages (legacy slugs like `kotlin`/`r`
-included) are treated as skipped for Crystal too — the author intended "skip everywhere"
-and the list predates Crystal.
+## I. Runtime-only skips (intentional, fixture-documented)
+
+- **xberg** LLM fixtures (tagged `llm`) → `pending!` when no `XBERG_LLM_API_KEY`.
+- **liter-llm / smoke** local-provider fixtures (ollama/llamacpp/vllm model prefixes with no
+  `mock_response`) → `pending!` when the local port is unreachable.
 
 Crystal codegen mirroring of other language idioms (per aspect, best match):
 | Aspect | Matched language | Crystal implementation |
@@ -196,3 +213,25 @@ Crystal codegen mirroring of other language idioms (per aspect, best match):
 | Error surfacing | Ruby RuntimeError / C# exception | FFI `last_error_context` raised |
 | Enum-field assertions | Ruby/Dart `fields_enum` | `.to_s.downcase` equals (wire value) |
 | FFI feature enabling | hand-maintained Cargo.toml | `summarization` passthrough added |
+
+## J. Binding/codegen capabilities landed on `crystal-all-fixtures`
+
+| Change | Why |
+|--------|-----|
+| Enum + JSON converter modules emitted **before** structs | `@[JSON::Field(converter: …)]` needs the constant defined earlier (liter-llm `FilePurposeConverter`). |
+| Optional params default `= nil`; nilable struct params pass a real null pointer | A `"null"` JSON string breaks the C ABI; `0_u64` timeouts fail the HTTP client. |
+| `bytes::Bytes` return → `Bytes` (not `BytesBytes`); deserialize via `Array(UInt8).from_json` | `Slice` has no `from_json`; path-qualified named types now use the last `::` segment. |
+| Untagged (shape-discriminated) union fields are nilable | No eager `from_json("{}")` default matches a variant. |
+| Internally-tagged variant field types fully-qualified (`LiterLlm::ImageUrl`) | A bare name resolves to the enclosing variant class. |
+| `CrystalConfig.borrowed_handles` | Opaque handles that are borrowed/shared (e.g. `Language`) get no freeing `finalize` — prevents double-free. |
+| Visitor bridge `&[String]` callback params (`visit_table_row`) | Emits a C string-array pointer + count twin so the callbacks struct layout matches the Rust FFI vtable. |
+| `custom_template` visitor actions → `#{param}` interpolation | Expands `{text}` placeholders instead of emitting a `Continue` stub. |
+| Streaming supports field-based (crawlberg) and `json_object` (liter-llm) requests | Item type from `streaming_item_type()`; summary exposes `chunks`/`stream_content`/`stream.*`. |
+| `display_as_text` fields extract the Text-variant value | `choices[0].message.content` is a discriminated union, not a String. |
+| Enum-field assertions compare via `to_json` wire value | `.to_s.downcase` loses underscores (`ToolCalls` → `toolcalls`). |
+| `is_document_subfield` narrowed to real wrapper fields | `content`/`tables` are flat on `ConversionResult` (html-to-markdown). |
+| `metadata.open_graph[title]` Hash-bracket access | Aliased field paths render as `.open_graph["title"]`. |
+| Binary fields (`audio`/`content`) map to the result only under `binary_result` | `file_content` returns `Bytes`; html-to-markdown's `content` is a real field. |
+| Unit-return + `error_type` wrappers call the Void FFI fun without assigning | Status-only functions like `clean_cache` (`-> i32` with `set_last_error`). |
+| Builtin types not module-qualified in array args | `Array(String)` (not `Array(Module::String)`). |
+| Local-provider / LLM fixtures runtime-skip when their service/key is absent | Keeps offline CI green; documented in fixtures. |
