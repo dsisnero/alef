@@ -349,3 +349,29 @@ Pattern per repo:
 - xberg.cr additionally links the `libonnxruntime.so.1` bundled in the FFI release archive
   (`-l:libonnxruntime.so.1` + `LD_LIBRARY_PATH`) since xberg's FFI needs ONNX Runtime.
 - Consumer: `shards install` + `./scripts/download_ffi.sh` + `--link-flags` (documented in each README).
+
+### L4. Crystal examples/guides generation flow (DONE — mirrors other languages)
+
+DeepWiki research (crawlberg + liter-llm): the other languages ship examples/guides via
+(1) a generated package `README.md` and (2) a docs-site with API reference + usage tabs.
+Snippets live in `docs-site/src/snippets/<lang>/...`; `alef readme` renders them into the
+package README (Jinja template + `[crates.readme.languages.<lang>]` config), and `alef docs`
+emits the API reference (`api-<lang>.md`). docs-site usage pages import the same snippets.
+
+Crystal now follows this exactly (all 5 forks):
+
+| Repo | `alef readme --lang crystal` | `alef docs --lang crystal` | docs-site tab added |
+|------|------------------------------|----------------------------|---------------------|
+| crawlberg | `packages/crystal/README.md` ✓ | `api-crystal.md` ✓ | Basic Usage tab |
+| html-to-markdown | `packages/crystal/README.md` ✓ | `api-crystal.md` ✓ | usage.mdx tab |
+| liter-llm | `packages/crystal/README.md` ✓ | `api-crystal.md` ✓ | chat.mdx tab |
+| xberg | `packages/crystal/README.md` ✓ | `api-crystal.md` ✓ | extraction.mdx tab |
+| tree-sitter-language-pack | `packages/crystal/README.md` ✓ | `api-crystal.md` ✓ | quickstart install tab |
+
+Flow (identical to Python/Go/etc.):
+- `[crates.readme.languages.crystal]` config: name/template/output_path/package_manager(=`shards`)/description/snippets.
+- `docs-site/src/snippets/crystal/getting-started/basic_usage.md` (or basic_chat / api/extract.md per repo)
+  holds the Crystal "hello world" with the `download_ffi.sh` + `--link-flags` steps.
+- `alef readme --lang crystal` → package README (installed in the `.cr` shard + published long_description analog).
+- `alef docs --lang crystal` → docs-site API reference, tabbed alongside the other languages.
+- README/docs generation is idempotent (`Generated 0 README files` on re-run).
