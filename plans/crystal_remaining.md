@@ -303,3 +303,25 @@ releases (like the Go `.tar.gz` archives) and the Crystal shard's `spec_helper` 
 small `download_ffi` helper) would fetch + place it on the link path. The
 `downloaded_languages()`/parser-bundle story (tslp) mirrors this same
 release-artifact approach.
+
+### L2. The exact Go `download_ffi` mechanism (DeepWiki)
+
+Go's distribution (the model the Crystal shards mirror):
+
+1. **`//go:generate`**: `packages/go/generate.go` holds `//go:generate go run ./cmd/download_ffi`. Consumer runs `go generate` before `go build`/`go test`.
+2. **`cmd/download_ffi/main.go`**:
+   - `determinePaths` maps `runtime.GOOS`/`GOARCH` → asset names (`darwin`→`macos`, `amd64`→`x86_64`, `arm64`→`aarch64` except darwin keeps `arm64`).
+   - `downloadAndExtractLibrary` builds URL `https://github.com/<repo>/releases/download/v<ver>/crawlberg-go-<os>-<arch>.tar.gz` (`moduleVersion` constant → release tag), downloads, extracts to `moduleRoot/.lib/<os>-<arch>`, copies the `.so`/`.dylib`/`.dll` to `bindingLibDir`.
+   - A shared cache dir is used (extract once, copy out), so repeated `go generate` runs are cheap.
+3. **cgo wiring**: `binding.go`/`ffi.go` declare
+   `CGO_CFLAGS: -I${SRCDIR}/include` and
+   `CGO_LDFLAGS: -L${SRCDIR}/.lib/macos-arm64 -Wl,-rpath,${SRCDIR}/.lib/macos-arm64 -lcrawlberg_ffi`
+   (`${SRCDIR}` = dir of the Go source file). No consumer build flags needed.
+4. **Tag handling**: publish pushes `packages/go/vX.Y.Z` subdirectory tags so the Go module proxy resolves the version.
+5. Smoke test (`test_apps/go`): `go mod download` → invoke `download_ffi` → `go test`.
+
+**Crystal mirror (implemented in the `.cr` shards):** no `//go:generate` or `${SRCDIR}` — Crystal's `@[Link(ldflags:)]` is static and linker search paths are fixed. So the shards ship:
+- `scripts/download_ffi.sh` (same platform→asset mapping, fetches the release `.tar.gz`, stages into `.lib/`),
+- `make spec` / `scripts/spec.sh` wrapping `crystal spec --link-flags="-L$PWD/.lib -Wl,-rpath,$PWD/.lib"`,
+- README documenting the `--link-flags` requirement (the Crystal-native equivalent of Go's `${SRCDIR}` cgo flags).
+Verified green in CI on `dsisnero/crawlberg.cr`.
