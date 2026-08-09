@@ -325,3 +325,27 @@ Go's distribution (the model the Crystal shards mirror):
 - `make spec` / `scripts/spec.sh` wrapping `crystal spec --link-flags="-L$PWD/.lib -Wl,-rpath,$PWD/.lib"`,
 - README documenting the `--link-flags` requirement (the Crystal-native equivalent of Go's `${SRCDIR}` cgo flags).
 Verified green in CI on `dsisnero/crawlberg.cr`.
+
+### L3. Crystal shard distribution — DONE (5 repos, CI green)
+
+Created one Crystal shard repo per package under `dsisnero/`, each shipping the
+alef-generated binding + a Go-style `download_ffi.sh` (Crystal has no prebuilt-native
+shard registry). Each repo's CI downloads the FFI release artifact and runs the spec.
+
+| Shard repo | shard name | version | CI |
+|------------|-----------|---------|----|
+| `dsisnero/crawlberg.cr` | `crawlberg` | 1.1.4 | success (ubuntu + macos) |
+| `dsisnero/xberg.cr` | `xberg` | 1.1.0 | success (bundles onnxruntime from release archive) |
+| `dsisnero/liter-llm.cr` | `liter_llm` | 1.16.0 | success |
+| `dsisnero/html-to-markdown.cr` | `html_to_markdown_rs` | 3.10.6 | success |
+| `dsisnero/tree-sitter-language-pack.cr` | `tree_sitter_language_pack` | 1.14.3 | success |
+
+Pattern per repo:
+- `shard.yml` (name/version/description/crystal>=1.0.0/targets) + `src/*.cr` (binding) + `spec/`.
+- `scripts/download_ffi.sh`: maps platform → upstream release asset (`*-ffi-v<ver>-<target>.tar.gz`),
+  downloads + extracts into `.lib/`, copies the `.so`/`.dylib`/`.dll`.
+- `scripts/spec.sh` / `make spec`: `crystal spec --link-flags="-L$PWD/.lib -Wl,-rpath,$PWD/.lib"` —
+  the Crystal-native equivalent of Go's `${SRCDIR}` cgo flags (Crystal's `@[Link]` is static).
+- xberg.cr additionally links the `libonnxruntime.so.1` bundled in the FFI release archive
+  (`-l:libonnxruntime.so.1` + `LD_LIBRARY_PATH`) since xberg's FFI needs ONNX Runtime.
+- Consumer: `shards install` + `./scripts/download_ffi.sh` + `--link-flags` (documented in each README).
