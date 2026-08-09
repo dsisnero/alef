@@ -268,3 +268,38 @@ Dispatched the fork CI E2E workflows and verified the crystal jobs pass:
 The tslp parser-availability rescue (pending on "not available for download")
 keeps static-link local runs fully green while making CI bundle-only runs skip
 the two all-group languages.
+
+## L. How the other languages package & distribute (DeepWiki research)
+
+The publish pipeline (`publish.yaml`) follows **prepare → build → publish → finalize**:
+build the Rust core + `*-ffi` shared library once per target, then package that
+same native lib into each language artifact.
+
+| Language | Registry | How the native FFI is bundled |
+|----------|----------|-------------------------------|
+| Go | Go modules (GitHub) | `download_ffi` tool (`//go:generate`) fetches `crawlberg-go-<platform>.tar.gz` from GitHub releases → extracts to `.lib/<platform>/`; cgo links via `${SRCDIR}/.lib/` |
+| C# / .NET | NuGet (`XbergIo.Crawlberg`) | prebuilt natives staged into `runtimes/<rid>/native/`; P/Invoke `[DllImport]`; `dotnet pack` → `.nupkg` → `publish-nuget` |
+| Ruby | RubyGems | precompiled native gems via `rb_sys` + `rake-compiler` (x86_64/aarch64 linux/darwin, x64-mingw-ucrt); `extconf.rb` builds Rust ext; platform gems; `publish-rubygems` |
+| Python | PyPI | wheels via PyO3/maturin (one wheel per platform incl. musl) |
+| Node | npm | napi-rs native modules, platform sub-packages |
+| Rust | crates.io | `cargo publish` the crates |
+| Java | Maven Central | natives per classifier (`linux-x86_64`, `macos-arm64`, …) |
+| Kotlin Android | Maven Central (AAR) | per-ABI JNI libs |
+| Elixir | Hex.pm | NIF archives via rustler |
+| PHP | Packagist | PIE extension archives via ext-php-rs |
+| Dart | pub.dev | natives via flutter_rust_bridge |
+| Swift | SwiftPM | artifact bundle `.binaryTarget` → GitHub release URL + checksum |
+| WASM | npm | static-subset wasm module |
+| Zig | (packages) | C ABI wrapper |
+| Homebrew | brew | CLI bottle DSLs |
+
+### Crystal distribution gap (documented, not yet implemented)
+Crystal has **no upstream registry for prebuilt native shards** — `shards` (Crystal's
+package manager) installs from source/Git, and there is no `runtimes/` or platform-gem
+mechanism. The current fork CI builds alef + the FFI lib locally (via the
+`setup-alef` fork action) and runs `crystal spec` with `--link-flags`. To distribute
+Crystal like the others, the FFI `.so`/`.dylib`/`.dll` would be uploaded to GitHub
+releases (like the Go `.tar.gz` archives) and the Crystal shard's `spec_helper` (or a
+small `download_ffi` helper) would fetch + place it on the link path. The
+`downloaded_languages()`/parser-bundle story (tslp) mirrors this same
+release-artifact approach.
