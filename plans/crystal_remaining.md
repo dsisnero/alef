@@ -375,3 +375,24 @@ Flow (identical to Python/Go/etc.):
 - `alef readme --lang crystal` → package README (installed in the `.cr` shard + published long_description analog).
 - `alef docs --lang crystal` → docs-site API reference, tabbed alongside the other languages.
 - README/docs generation is idempotent (`Generated 0 README files` on re-run).
+
+### L5. Consumer install path fix + first consumer app (crawler)
+
+`shards install` clones a shard into `lib/<name>/`, so the shard's `scripts/` and
+staged FFI land at `lib/<name>/scripts/` and `lib/<name>/.lib/` — NOT the consumer's
+repo root. Fixed the READMEs in all 5 shard repos to document the consumer-correct
+paths (the `download_ffi.sh` script itself was already consumer-safe: it resolves its
+own dir, so it stages into the shard's own `.lib/` from anywhere):
+
+```
+shards install
+lib/crawlberg/scripts/download_ffi.sh            # stages lib/crawlberg/.lib/
+crystal build --link-flags="-L$PWD/lib/crawlberg/.lib -Wl,-rpath,$PWD/lib/crawlberg/.lib" src/app.cr
+```
+
+`make spec` / `scripts/spec.sh` remain the shard-internal (self-test) path.
+
+Verified with a real consumer: **dsisnero/crawler** (new repo) depends on
+crawlberg.cr, has `scripts/build.sh`/`scripts/spec.sh` that resolve the FFI from
+`lib/crawlberg/.lib`, and runs end-to-end:
+`./bin/crawler https://example.com/` → title "Example Domain", status 200, 1 link.
