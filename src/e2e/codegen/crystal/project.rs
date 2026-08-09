@@ -357,6 +357,12 @@ pub(super) fn render_category_spec(
             }
         }
 
+        // tree-sitter-language-pack style fixtures: `process` raises a download
+        // error when the parser isn't bundled (CI e2e bundle ships a subset; the
+        // "all" group download is large/networked). Statically-linked parsers load
+        // fine, so only skip when the call actually fails to load — handled by a
+        // rescue around the generated call (see render_category_spec).
+
         let fixture_expects_error = fixture.assertions.iter().any(|a| a.assertion_type == "error");
         if !fixture_expects_error {
             for line in &setup_lines {
@@ -529,7 +535,25 @@ pub(super) fn render_category_spec(
                 out.push_str(&render_void_assertion(a));
             }
         } else {
-            out.push_str(&format!("      {result_var} = {call}\n"));
+            // tree-sitter-language-pack style: `process` raises a download error
+            // when a parser isn't bundled (CI e2e bundle ships a subset; the "all"
+            // group is large/networked). Statically-linked parsers load fine, so
+            // only skip at runtime when the call actually fails to load.
+            let tslp_guard = fixture
+                .input
+                .get("config")
+                .and_then(|c| c.get("language"))
+                .and_then(|v| v.as_str())
+                .map(|lang| lang.replace('\\', "\\\\").replace('"', "\\\""));
+            if let Some(lang) = tslp_guard {
+                out.push_str("      begin\n");
+                out.push_str(&format!("        {result_var} = {call}\n"));
+                out.push_str(&format!(
+                    "      rescue e : Exception\n        if e.message.try(&.includes?(\"not available for download\"))\n          pending! \"parser for \\\"{lang}\\\" not downloaded\"\n        else\n          raise e\n        end\n      end\n"
+                ));
+            } else {
+                out.push_str(&format!("      {result_var} = {call}\n"));
+            }
             for a in &fixture.assertions {
                 out.push_str(&render_assertion_with_aliases(a, result_var, module_name, &field_aliases, &enum_fields, &result_fields, binary_result, display_as_text));
             }
