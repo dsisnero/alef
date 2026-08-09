@@ -396,3 +396,24 @@ Verified with a real consumer: **dsisnero/crawler** (new repo) depends on
 crawlberg.cr, has `scripts/build.sh`/`scripts/spec.sh` that resolve the FFI from
 `lib/crawlberg/.lib`, and runs end-to-end:
 `./bin/crawler https://example.com/` → title "Example Domain", status 200, 1 link.
+
+### M. Keyword-args constructors (DONE — all forks green, gates pass)
+
+`gen_struct` now emits a keyword-args `initialize` for JSON-serializable structs so
+users write `Config.new(max_concurrent: 2, max_pages: 5)` instead of
+`Config.from_json(...)`. Every field becomes a named arg defaulting to its getter
+default (nilable → `nil`, non-nilable → type/struct/enum default). Mirrors Go's
+`Config{}` / Ruby's `Default::default()`. `from_json` still handles partial/full
+input (the JSON::Serializable overload coexists with the keyword ctor).
+
+- Codegen unit test added (`gen_struct_emits_keyword_args_initialize`).
+- Snapshots updated for the new constructor.
+- Verified with the real consumer `dsisnero/crawler`:
+  `CrawlConfig.new(max_concurrent: 2, max_pages: max_pages, max_depth: 1)`.
+- All 5 shard repos' bindings regenerated + republished.
+- Root README badge templates updated (`_badges.md` / `badges.html`) so `alef
+  readme` regeneration keeps the Crystal badge (was being dropped).
+
+Gate results: lib 4619/4619; compile 26, gen_bindings 29, snapshot 4, adapters 30.
+E2e suites (regenerated bindings): crawlberg 256, xberg 71, liter-llm 166,
+html-to-markdown 273, tslp 522 — all 0 failures.
