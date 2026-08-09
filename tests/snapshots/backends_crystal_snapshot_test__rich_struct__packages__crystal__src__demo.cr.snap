@@ -57,7 +57,11 @@ module Demo
     getter value : Int32 = 0
     getter label : String = ""
     getter tag : String?
-    def initialize
+    def initialize(
+      @value : Int32 = 0,
+      @label : String = "",
+      @tag : String? = nil
+    )
     end
   end
 
@@ -66,7 +70,10 @@ module Demo
     include JSON::Serializable
     getter verbose : Bool = false
     getter max_retries : UInt32 = 0
-    def initialize
+    def initialize(
+      @verbose : Bool = false,
+      @max_retries : UInt32 = 0
+    )
     end
   end
 

@@ -55,7 +55,11 @@ module Demo
     getter value : Int32 = 0
     getter label : String = ""
     getter tag : String?
-    def initialize
+    def initialize(
+      @value : Int32 = 0,
+      @label : String = "",
+      @tag : String? = nil
+    )
     end
   end
 

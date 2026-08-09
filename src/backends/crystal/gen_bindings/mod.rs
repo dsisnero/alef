@@ -18,7 +18,7 @@ use crate::codegen::naming::{
 };
 use crate::core::backend::{Backend, BuildConfig, BuildDependency, Capabilities, GeneratedFile};
 use crate::core::config::{Language, ResolvedCrateConfig, resolve_output_dir};
-use crate::core::ir::{ApiSurface, DefaultValue, EnumDef, ErrorDef, FunctionDef, PrimitiveType, TypeDef, TypeRef};
+use crate::core::ir::{ApiSurface, DefaultValue, EnumDef, ErrorDef, FieldDef, FunctionDef, PrimitiveType, TypeDef, TypeRef};
 
 use super::template_env::render;
 use super::type_map::{crystal_c_type, crystal_type, crystal_type_name};
@@ -555,22 +555,69 @@ impl CrystalBackend {
             }
             out.push_str(&format!("    getter {field_name} : {field_ty}\n"));
         }
-        // Zero-arg constructor: `Config.new` yields all getter-defaults and
-        // serializes to Rust's default shape (mirrors Go's `Config{}`, Python's
-        // `.default()`, Ruby's `Default::default()`). `from_json` still handles
-        // partial/full input. Only emitted when every non-nilable field has a
-        // safe getter default (see F4 + enum default fixes).
+        // Keyword-args constructor: `Config.new(max_concurrent: 2)` yields a value
+        // with the given fields set and the rest at their getter defaults
+        // (mirrors Go's `Config{}`, Python's `.default()`, Ruby's
+        // `Default::default()`). Every field becomes a named arg with its default
+        // expression; nilable fields default to nil. `from_json` still handles
+        // partial/full input.
         if !ty.is_opaque {
-            let all_defaultable = ty.fields.iter().filter(|f| !f.binding_excluded).all(|f| {
-                f.optional
-                    || crystal_default_expr(&f.typed_default, &f.default).is_some()
-                    || type_based_default_expr(&f.ty).is_some()
-                    || enum_default_expr(&f.ty, enum_first_variant).is_some()
-                    || external_enum_default_expr(&f.ty, external_defaults).is_some()
-                    || struct_default_expr(&f.ty, serde_tagged_enums, serde_tagged_defaults).is_some()
-            });
-            if all_defaultable {
-                out.push_str("    def initialize\n    end\n");
+            let mut init_params: Vec<String> = Vec::new();
+            let mut all_defaultable = true;
+            for field in ty.fields.iter().filter(|f| !f.binding_excluded) {
+                let field_name =
+                    public_host_identifier(Language::Crystal, PublicIdentifierKind::Field, &field.name);
+                let mut field_ty = crystal_type(&field.ty).into_owned();
+                if field.optional && !field_ty.ends_with('?') {
+                    field_ty.push('?');
+                }
+                let is_opaque_field = matches!(&field.ty, TypeRef::Named(n) if opaque.contains(n));
+                let is_bytes = field_type_contains_bytes(&field.ty);
+                let is_untagged_union =
+                    matches!(&field.ty, TypeRef::Named(n) if untagged_unions.contains(n));
+                let default_expr = if field.optional {
+                    Some("nil".to_string())
+                } else if is_bytes {
+                    Some("[] of UInt8".to_string())
+                } else if is_opaque_field || is_untagged_union {
+                    // Opaque handles and untagged unions can't be eagerly defaulted;
+                    // expose the arg as nilable so construction still type-checks.
+                    if !field_ty.ends_with('?') {
+                        field_ty.push('?');
+                    }
+                    Some("nil".to_string())
+                } else {
+                    crystal_default_expr(&field.typed_default, &field.default)
+                        .or_else(|| type_based_default_expr(&field.ty))
+                        .or_else(|| enum_default_expr(&field.ty, enum_first_variant))
+                        .or_else(|| external_enum_default_expr(&field.ty, external_defaults))
+                        .or_else(|| {
+                            struct_default_expr(&field.ty, serde_tagged_enums, serde_tagged_defaults)
+                        })
+                };
+                if let Some(default_expr) = default_expr {
+                    init_params.push(format!("@{} : {field_ty} = {default_expr}", field_name));
+                } else {
+                    // No safe default (e.g. a required nested struct with no
+                    // default): make it nilable so `new` still works; callers pass
+                    // the value explicitly.
+                    if !field_ty.ends_with('?') {
+                        field_ty.push('?');
+                    }
+                    init_params.push(format!("@{} : {field_ty} = nil", field_name));
+                    all_defaultable = false;
+                }
+            }
+            if all_defaultable || !init_params.is_empty() {
+                out.push_str("    def initialize");
+                if init_params.is_empty() {
+                    out.push_str("\n    end\n");
+                } else {
+                    out.push_str(&format!(
+                        "(\n      {}\n    )\n    end\n",
+                        init_params.join(",\n      ")
+                    ));
+                }
             }
         }
         out.push_str("  end\n");
@@ -2706,5 +2753,64 @@ mod tests {
         let ffi: HashSet<String> = ["Config"].into_iter().map(|s| s.to_string()).collect();
         assert!(is_ffi_struct("Config", &ffi));
         assert!(!is_ffi_struct("Handle", &ffi));
+    }
+
+    // ── Keyword-args constructor ──────────────────────────────────────────
+
+    #[test]
+    fn gen_struct_emits_keyword_args_initialize() {
+        let ty = TypeDef {
+            name: "Config".into(),
+            has_serde: true,
+            fields: vec![
+                FieldDef {
+                    name: "max_concurrent".into(),
+                    ty: TypeRef::Primitive(PrimitiveType::U64),
+                    optional: true,
+                    ..FieldDef::default()
+                },
+                FieldDef {
+                    name: "retry_count".into(),
+                    ty: TypeRef::Primitive(PrimitiveType::U64),
+                    optional: false,
+                    default: Some("0".into()),
+                    ..FieldDef::default()
+                },
+                FieldDef {
+                    name: "user_agent".into(),
+                    ty: TypeRef::String,
+                    optional: true,
+                    ..FieldDef::default()
+                },
+            ],
+            ..TypeDef::default()
+        };
+        let out = CrystalBackend::gen_struct(
+            &ty,
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            "Demo",
+            &HashSet::new(),
+        );
+        assert!(
+            out.contains("def initialize("),
+            "expected keyword-args constructor, got:\n{out}"
+        );
+        assert!(
+            out.contains("@max_concurrent : UInt64? = nil"),
+            "optional field should default to nil:\n{out}"
+        );
+        assert!(
+            out.contains("@retry_count : UInt64 = 0"),
+            "non-optional field should keep its default:\n{out}"
+        );
+        assert!(
+            out.contains("@user_agent : String? = nil"),
+            "nilable field should default to nil:\n{out}"
+        );
     }
 }
