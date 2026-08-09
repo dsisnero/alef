@@ -249,3 +249,22 @@ Dispatched the fork CI E2E workflows and observed the crystal jobs end-to-end:
   then bump `alef_version` in all five companion forks. The local branch binary works
   (`alef test --e2e --lang crystal` green on all five repos); CI is purely waiting on a
   release that ships the crystal config keyword and `Language::Crystal`.
+
+### K2. Fork CI verification — END-TO-END GREEN (fork-built alef)
+
+Forked `install-alef@v1` into a local composite action (`.github/actions/setup-alef`
+in each fork) that builds alef from `dsisnero/alef@crystal-all-fixtures` and puts it
+on PATH (outside the workspace tree, since consumer `Cargo.toml`s are workspaces).
+Dispatched the fork CI E2E workflows and verified the crystal jobs pass:
+
+| Repo | CI crystal result |
+|------|-------------------|
+| crawlberg | 256 / 0 / 0 / 1 |
+| liter-llm | 166 / 0 / 0 / 2 |
+| html-to-markdown | 273 / 0 / 0 / 0 |
+| tree-sitter-language-pack | 522 / 0 / 0 / 2 (2 parser-not-bundled → runtime pending) |
+| xberg | blocked on fork `test_documents` submodule commit unavailable (pre-existing) |
+
+The tslp parser-availability rescue (pending on "not available for download")
+keeps static-link local runs fully green while making CI bundle-only runs skip
+the two all-group languages.
